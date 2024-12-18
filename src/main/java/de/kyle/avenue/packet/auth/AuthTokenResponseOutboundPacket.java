@@ -1,17 +1,15 @@
 package de.kyle.avenue.packet.auth;
 
-import de.kyle.avenue.handler.packet.PacketHandler;
-import de.kyle.avenue.handler.packet.auth.AuthTokenRequestInboundPacketHandler;
-import de.kyle.avenue.packet.InboundPacket;
+import de.kyle.avenue.packet.OutboundPacket;
 import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
 
-public class AuthTokenRequestInboundPacket implements InboundPacket {
-    private final String secret;
+public class AuthTokenResponseOutboundPacket implements OutboundPacket {
+    private final String token;
 
-    public AuthTokenRequestInboundPacket(String secret) {
-        this.secret = secret;
+    public AuthTokenResponseOutboundPacket(String token) {
+        this.token = token;
     }
 
     @Override
@@ -28,16 +26,11 @@ public class AuthTokenRequestInboundPacket implements InboundPacket {
     @Override
     public byte[] getBody() {
         JSONObject jsonObject = new JSONObject();
-        jsonObject.put("secret", this.secret);
+        jsonObject.put("token", this.token);
         String jsonString = jsonObject.toString();
         if (jsonString == null) {
             throw new RuntimeException("The provided secret is formatted badly");
         }
         return jsonString.getBytes(StandardCharsets.UTF_8);
-    }
-
-    @Override
-    public Class<? extends PacketHandler> getHandler() {
-        return AuthTokenRequestInboundPacketHandler.class;
     }
 }

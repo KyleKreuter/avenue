@@ -1,5 +1,5 @@
 package de.kyle.avenue.registry;
 
-public class PacketRegistry {
+public class InboundPacketRegistry {
 
 }
