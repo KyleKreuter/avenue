@@ -9,16 +9,21 @@ import java.util.regex.Pattern;
 
 public class PacketDeserializer {
     private final Pattern PATTERN = Pattern.compile("_H_(.*?)_H__B_(.*?)_B_");
+    private final AvenueConfig avenueConfig;
+
+    public PacketDeserializer(AvenueConfig avenueConfig){
+        this.avenueConfig = avenueConfig;
+    }
 
     public JSONObject deserialize(byte[] packet) throws IllegalArgumentException {
         if (packet == null) {
             throw new IllegalArgumentException("Packet cannot be null");
         }
 
-        if (packet.length > AvenueConfig.PACKET_SIZE) {
+        if (packet.length > avenueConfig.getPacketSize()) {
             throw new IllegalArgumentException(
                     String.format("Packet is too large (%d bytes), exceeding maximum size of %d bytes",
-                            packet.length, AvenueConfig.PACKET_SIZE));
+                            packet.length, avenueConfig.getPacketSize()));
         }
 
         String packetString = new String(packet, StandardCharsets.UTF_8);

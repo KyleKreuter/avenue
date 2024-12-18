@@ -9,6 +9,12 @@ import java.nio.charset.StandardCharsets;
 public class PacketSerializer {
     private final byte[] HEADER = "_H_".getBytes(StandardCharsets.UTF_8);
     private final byte[] BODY = "_B_".getBytes(StandardCharsets.UTF_8);
+    private final AvenueConfig avenueConfig;
+
+    public PacketSerializer(AvenueConfig avenueConfig) {
+        this.avenueConfig = avenueConfig;
+    }
+
 
     public byte[] serialize(Packet packet) throws IllegalArgumentException {
         if (packet == null || packet.getHeader() == null || packet.getBody() == null) {
@@ -21,10 +27,10 @@ public class PacketSerializer {
 
         int totalLength = packetHeader.length + packetBody.length + overhead;
 
-        if (totalLength > AvenueConfig.PACKET_SIZE) {
+        if (totalLength > avenueConfig.getPacketSize()) {
             throw new IllegalArgumentException(
                     String.format("Packet is too large (%d bytes), exceeding maximum size of %d bytes",
-                            totalLength, AvenueConfig.PACKET_SIZE));
+                            totalLength, avenueConfig.getPacketSize()));
         }
 
         ByteBuffer buffer = ByteBuffer.allocate(totalLength);
