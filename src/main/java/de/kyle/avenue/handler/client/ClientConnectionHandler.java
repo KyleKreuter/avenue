@@ -1,6 +1,8 @@
 package de.kyle.avenue.handler.client;
 
+import de.kyle.avenue.handler.packet.PacketHandler;
 import de.kyle.avenue.packet.OutboundPacket;
+import de.kyle.avenue.registry.InboundPacketRegistry;
 import de.kyle.avenue.serialization.PacketDeserializer;
 import de.kyle.avenue.serialization.PacketSerializer;
 import org.json.JSONObject;
@@ -21,15 +23,22 @@ public class ClientConnectionHandler implements Runnable {
     private final OutputStream outputStream;
     private final PacketDeserializer packetDeserializer;
     private final PacketSerializer packetSerializer;
+    private final InboundPacketRegistry inboundPacketRegistry;
     private boolean running;
 
-    public ClientConnectionHandler(Socket client, PacketDeserializer packetDeserializer, PacketSerializer packetSerializer) throws IOException {
+    public ClientConnectionHandler(
+            Socket client,
+            PacketDeserializer packetDeserializer,
+            PacketSerializer packetSerializer,
+            InboundPacketRegistry inboundPacketRegistry
+    ) throws IOException {
         this.client = client;
         this.inputStream = client.getInputStream();
         this.outputStream = client.getOutputStream();
         this.running = true;
         this.packetSerializer = packetSerializer;
         this.packetDeserializer = packetDeserializer;
+        this.inboundPacketRegistry = inboundPacketRegistry;
     }
 
     public Socket getClient() {
@@ -45,7 +54,19 @@ public class ClientConnectionHandler implements Runnable {
             while (this.running) {
                 byte[] packetBytes = dataInputStream.readAllBytes();
                 JSONObject packet = packetDeserializer.deserialize(packetBytes);
-
+                if (!packet.has("header")) {
+                    throw new IOException("Packet received does not contain a header field");
+                }
+                Object headerO = packet.get("header");
+                if (!(headerO instanceof JSONObject header)) {
+                    throw new IOException("Packet has header field but was not parsed correctly");
+                }
+                if (!header.has("name")) {
+                    throw new IOException("Packet has no name field in the header");
+                }
+                String packetName = header.getString("name");
+                PacketHandler packetHandler = inboundPacketRegistry.getPacketHandler(packetName);
+                packetHandler.handle(packet, this);
             }
         } finally {
             shutdown();
