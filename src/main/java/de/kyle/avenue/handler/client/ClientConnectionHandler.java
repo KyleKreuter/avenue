@@ -14,8 +14,8 @@ import java.io.OutputStream;
 import java.net.Socket;
 import java.util.List;
 
-public class DefaultClientConnectionHandler implements Runnable {
-    private static final Logger log = LoggerFactory.getLogger(DefaultClientConnectionHandler.class);
+public class ClientConnectionHandler implements Runnable {
+    private static final Logger log = LoggerFactory.getLogger(ClientConnectionHandler.class);
     private final Socket client;
     private final InputStream inputStream;
     private final OutputStream outputStream;
@@ -23,7 +23,7 @@ public class DefaultClientConnectionHandler implements Runnable {
     private final PacketSerializer packetSerializer;
     private boolean running;
 
-    public DefaultClientConnectionHandler(Socket client, PacketDeserializer packetDeserializer, PacketSerializer packetSerializer) throws IOException {
+    public ClientConnectionHandler(Socket client, PacketDeserializer packetDeserializer, PacketSerializer packetSerializer) throws IOException {
         this.client = client;
         this.inputStream = client.getInputStream();
         this.outputStream = client.getOutputStream();
