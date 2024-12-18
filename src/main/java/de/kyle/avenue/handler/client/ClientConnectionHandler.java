@@ -1,7 +1,7 @@
 package de.kyle.avenue.handler.client;
 
+import de.kyle.avenue.packet.OutboundPacket;
 import de.kyle.avenue.serialization.PacketDeserializer;
-import de.kyle.avenue.packet.InboundPacket;
 import de.kyle.avenue.serialization.PacketSerializer;
 import org.json.JSONObject;
 import org.slf4j.Logger;
@@ -52,7 +52,10 @@ public class ClientConnectionHandler implements Runnable {
         }
     }
 
-    public void send(InboundPacket packet) {
+    public void send(OutboundPacket packet) throws IOException {
+        byte[] serializedPacket = packetSerializer.serialize(packet);
+        outputStream.write(serializedPacket);
+        outputStream.flush();
     }
 
     public void shutdown() {
