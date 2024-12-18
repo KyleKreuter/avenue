@@ -1,5 +1,6 @@
 package de.kyle.avenue.handler.client;
 
+import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.packet.PacketHandler;
 import de.kyle.avenue.packet.OutboundPacket;
 import de.kyle.avenue.registry.InboundPacketRegistry;
@@ -24,13 +25,15 @@ public class ClientConnectionHandler implements Runnable {
     private final PacketDeserializer packetDeserializer;
     private final PacketSerializer packetSerializer;
     private final InboundPacketRegistry inboundPacketRegistry;
+    private final AvenueConfig avenueConfig;
     private boolean running;
 
     public ClientConnectionHandler(
             Socket client,
             PacketDeserializer packetDeserializer,
             PacketSerializer packetSerializer,
-            InboundPacketRegistry inboundPacketRegistry
+            InboundPacketRegistry inboundPacketRegistry,
+            AvenueConfig avenueConfig
     ) throws IOException {
         this.client = client;
         this.inputStream = client.getInputStream();
@@ -39,6 +42,7 @@ public class ClientConnectionHandler implements Runnable {
         this.packetSerializer = packetSerializer;
         this.packetDeserializer = packetDeserializer;
         this.inboundPacketRegistry = inboundPacketRegistry;
+        this.avenueConfig = avenueConfig;
     }
 
     public Socket getClient() {
@@ -65,8 +69,16 @@ public class ClientConnectionHandler implements Runnable {
                     throw new IOException("Packet has no name field in the header");
                 }
                 String packetName = header.getString("name");
-                PacketHandler packetHandler = inboundPacketRegistry.getPacketHandler(packetName);
-                packetHandler.handle(packet, this);
+                try {
+                    PacketHandler packetHandler = inboundPacketRegistry.getPacketHandler(packetName);
+                    packetHandler.handle(packet, this);
+                } catch (IllegalArgumentException e) {
+                    if (avenueConfig.isDropUnknownPackets()) {
+                        throw new RuntimeException(e);
+                    } else {
+                        log.warn("Unknown packet was received but 'drop-unknown' is turned off. Client is still allowed to send packets");
+                    }
+                }
             }
         } finally {
             shutdown();

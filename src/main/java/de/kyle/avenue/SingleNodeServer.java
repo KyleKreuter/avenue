@@ -48,7 +48,8 @@ public class SingleNodeServer {
                             client,
                             packetDeserializer,
                             packetSerializer,
-                            inboundPacketRegistry
+                            inboundPacketRegistry,
+                            avenueConfig
                     );
                     this.executorService.execute(clientConnectionHandler);
                 } catch (IOException e) {

@@ -8,6 +8,8 @@ import java.util.Properties;
 public class AvenueConfig {
     private final int packetSize;
 
+    private final boolean dropUnknownPackets;
+
     public AvenueConfig() throws IOException {
         Properties properties = new Properties();
         File specificationFolder = new File("config");
@@ -23,9 +25,14 @@ public class AvenueConfig {
         }
 
         packetSize = Integer.parseInt(properties.getProperty("server.packet.max-size"));
+        dropUnknownPackets = Boolean.parseBoolean(properties.getProperty("server.packet.drop-unknown"));
     }
 
     public int getPacketSize() {
         return packetSize;
+    }
+
+    public boolean isDropUnknownPackets() {
+        return dropUnknownPackets;
     }
 }
