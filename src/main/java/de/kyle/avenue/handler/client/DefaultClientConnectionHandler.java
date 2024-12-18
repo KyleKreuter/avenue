@@ -1,7 +1,7 @@
 package de.kyle.avenue.handler.client;
 
 import de.kyle.avenue.serialization.PacketDeserializer;
-import de.kyle.avenue.packet.Packet;
+import de.kyle.avenue.packet.InboundPacket;
 import de.kyle.avenue.serialization.PacketSerializer;
 import org.json.JSONObject;
 import org.slf4j.Logger;
@@ -52,7 +52,7 @@ public class DefaultClientConnectionHandler implements Runnable {
         }
     }
 
-    public void send(Packet packet) {
+    public void send(InboundPacket packet) {
     }
 
     public void shutdown() {
