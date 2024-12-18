@@ -7,7 +7,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class InboundPacketRegistry {
-    private Map<String, PacketHandler> packethandlerMap = new ConcurrentHashMap<>();
+    private final Map<String, PacketHandler> packethandlerMap = new ConcurrentHashMap<>();
 
     public InboundPacketRegistry() {
         this.packethandlerMap.put("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler());
