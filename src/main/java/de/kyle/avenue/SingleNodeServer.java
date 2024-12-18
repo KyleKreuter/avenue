@@ -38,7 +38,7 @@ public class SingleNodeServer {
     }
 
     public void start(int port) {
-        log.info("Starting server...");
+        log.info("Starting server on port {}", port);
         this.running = true;
         try (ServerSocket server = new ServerSocket(port)) {
             while (running) {
@@ -64,7 +64,7 @@ public class SingleNodeServer {
     }
 
     public void stop() {
-        log.info("Stopping server...");
+        log.info("Stopping server");
         this.running = false;
         this.executorService.shutdown();
     }
