@@ -43,9 +43,11 @@ public class SingleNodeServer {
                 topicSubscriptionHandler,
                 executorService
         );
+        Runtime.getRuntime().addShutdownHook(new Thread(this::stop));
+        start(avenueConfig.getPort());
     }
 
-    public void start(int port) {
+    private void start(int port) {
         log.info("Starting server on port {}", port);
         this.running = true;
         try (ServerSocket server = new ServerSocket(port)) {

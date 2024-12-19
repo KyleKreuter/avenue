@@ -12,6 +12,8 @@ public class AvenueConfig {
 
     private final String authenticationToken;
 
+    private final int port;
+
 
     public AvenueConfig() throws IOException {
         Properties properties = new Properties();
@@ -31,6 +33,7 @@ public class AvenueConfig {
         dropUnknownPackets = Boolean.parseBoolean(properties.getProperty("server.packet.drop-unknown"));
         authenticationSecret = properties.getProperty("server.authentication.secret");
         authenticationToken = properties.getProperty("server.authentication.token");
+        port = Integer.parseInt(properties.getProperty("server.port"));
     }
 
     public int getPacketSize() {
@@ -47,5 +50,9 @@ public class AvenueConfig {
 
     public String getAuthenticationToken() {
         return authenticationToken;
+    }
+
+    public int getPort() {
+        return port;
     }
 }
