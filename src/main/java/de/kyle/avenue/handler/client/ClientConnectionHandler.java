@@ -1,7 +1,6 @@
 package de.kyle.avenue.handler.client;
 
 import de.kyle.avenue.config.AvenueConfig;
-import de.kyle.avenue.handler.packet.PacketHandler;
 import de.kyle.avenue.packet.OutboundPacket;
 import de.kyle.avenue.registry.InboundPacketRegistry;
 import de.kyle.avenue.serialization.PacketDeserializer;
@@ -59,26 +58,14 @@ public class ClientConnectionHandler implements Runnable {
             while (this.running) {
                 byte[] packetBytes = dataInputStream.readAllBytes();
                 JSONObject packet = packetDeserializer.deserialize(packetBytes);
-                if (!packet.has("header")) {
-                    throw new IOException("Packet received does not contain a header field");
-                }
-                Object headerO = packet.get("header");
-                if (!(headerO instanceof JSONObject header)) {
-                    throw new IOException("Packet has header field but was not parsed correctly");
-                }
-                if (!header.has("name")) {
-                    throw new IOException("Packet has no name field in the header");
-                }
-                String packetName = header.getString("name");
                 try {
-                    PacketHandler packetHandler = inboundPacketRegistry.getPacketHandler(packetName);
-                    packetHandler.handle(packet, this);
-                } catch (IllegalArgumentException | JSONException e) {
+                    inboundPacketRegistry.handleInboundPacket(packet, this);
+                } catch (IllegalArgumentException | JSONException | NoSuchMethodException e) {
                     if (avenueConfig.isDropUnknownPackets()) {
                         log.error("Unknown or malformed packet was received, dropping client", e);
                         throw new RuntimeException(e);
                     } else {
-                        log.warn("Unknown packet was received but 'drop-unknown' is turned off. Client is still allowed to send packets", e);
+                        log.warn("Unknown or malformed packet was received but 'drop-unknown' is turned off. Client is still allowed to send packets", e);
                     }
                 }
             }

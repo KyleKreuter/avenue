@@ -36,7 +36,7 @@ public class SingleNodeServer {
         this.executorService = Executors.newVirtualThreadPerTaskExecutor();
         this.packetDeserializer = new PacketDeserializer(this.avenueConfig);
         this.packetSerializer = new PacketSerializer(this.avenueConfig);
-        this.inboundPacketRegistry = new InboundPacketRegistry(authenticationTokenHandler);
+        this.inboundPacketRegistry = new InboundPacketRegistry(authenticationTokenHandler, this.avenueConfig);
 
     }
 
