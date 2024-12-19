@@ -41,4 +41,15 @@ public class TopicSubscriptionHandler {
         clientConnectionHandlers.add(clientConnectionHandler);
         topicSubscriptions.put(topic, clientConnectionHandlers);
     }
+
+    public void unsubscribeFromAllTopics(ClientConnectionHandler clientConnectionHandler) {
+        for (Map.Entry<String, List<ClientConnectionHandler>> topics : topicSubscriptions.entrySet()) {
+            if (!topics.getValue().contains(clientConnectionHandler)) {
+                continue;
+            }
+            List<ClientConnectionHandler> clients = topics.getValue();
+            clients.remove(clientConnectionHandler);
+            topics.setValue(clients);
+        }
+    }
 }

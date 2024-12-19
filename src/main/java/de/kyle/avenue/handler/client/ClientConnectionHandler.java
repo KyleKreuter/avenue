@@ -2,6 +2,7 @@ package de.kyle.avenue.handler.client;
 
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.packet.InboundPacketHandler;
+import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.packet.OutboundPacket;
 import de.kyle.avenue.serialization.PacketDeserializer;
 import de.kyle.avenue.serialization.PacketSerializer;
@@ -24,6 +25,7 @@ public class ClientConnectionHandler implements Runnable {
     private final PacketDeserializer packetDeserializer;
     private final PacketSerializer packetSerializer;
     private final InboundPacketHandler inboundPacketHandler;
+    private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final AvenueConfig avenueConfig;
     private boolean running;
 
@@ -32,7 +34,8 @@ public class ClientConnectionHandler implements Runnable {
             PacketDeserializer packetDeserializer,
             PacketSerializer packetSerializer,
             InboundPacketHandler inboundPacketHandler,
-            AvenueConfig avenueConfig
+            AvenueConfig avenueConfig,
+            TopicSubscriptionHandler topicSubscriptionHandler
     ) throws IOException {
         this.client = client;
         this.inputStream = client.getInputStream();
@@ -42,6 +45,7 @@ public class ClientConnectionHandler implements Runnable {
         this.packetDeserializer = packetDeserializer;
         this.inboundPacketHandler = inboundPacketHandler;
         this.avenueConfig = avenueConfig;
+        this.topicSubscriptionHandler = topicSubscriptionHandler;
     }
 
     private void listen() throws IOException {
@@ -78,6 +82,7 @@ public class ClientConnectionHandler implements Runnable {
             this.inputStream.close();
             this.outputStream.close();
             this.client.close();
+            this.topicSubscriptionHandler.unsubscribeFromAllTopics(this);
         } catch (IOException e) {
             log.warn("An error occurred while closing connection", e);
         }

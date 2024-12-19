@@ -22,6 +22,7 @@ public class SingleNodeServer {
     private final PacketSerializer packetSerializer;
     private final InboundPacketHandler inboundPacketHandler;
     private final ExecutorService executorService;
+    private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final AvenueConfig avenueConfig;
     private boolean running;
 
@@ -33,8 +34,7 @@ public class SingleNodeServer {
             throw new RuntimeException(e);
         }
         AuthenticationTokenHandler authenticationTokenHandler = new AuthenticationTokenHandler(this.avenueConfig);
-        TopicSubscriptionHandler topicSubscriptionHandler = new TopicSubscriptionHandler();
-
+        this.topicSubscriptionHandler = new TopicSubscriptionHandler();
         this.executorService = Executors.newVirtualThreadPerTaskExecutor();
         this.packetDeserializer = new PacketDeserializer(this.avenueConfig);
         this.packetSerializer = new PacketSerializer(this.avenueConfig);
@@ -57,7 +57,8 @@ public class SingleNodeServer {
                             packetDeserializer,
                             packetSerializer,
                             inboundPacketHandler,
-                            avenueConfig
+                            avenueConfig,
+                            topicSubscriptionHandler
                     );
                     this.executorService.execute(clientConnectionHandler);
                 } catch (IOException e) {
