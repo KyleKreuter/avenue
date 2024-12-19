@@ -20,12 +20,14 @@ import java.util.concurrent.ConcurrentHashMap;
 public class InboundPacketHandler {
     private final Map<String, PacketHandler> packethandlerMap = new ConcurrentHashMap<>();
     private final AvenueConfig avenueConfig;
+    private final AuthenticationTokenHandler authenticationTokenHandler;
 
     public InboundPacketHandler(
             AuthenticationTokenHandler authenticationTokenHandler,
             AvenueConfig avenueConfig,
             TopicSubscriptionHandler topicSubscriptionHandler
     ) {
+        this.authenticationTokenHandler = authenticationTokenHandler;
         this.avenueConfig = avenueConfig;
         this.packethandlerMap.put("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler));
         this.packethandlerMap.put("PublishMessageInboundPacket", new PublishMessageInboundPacketHandler(topicSubscriptionHandler));
@@ -65,7 +67,7 @@ public class InboundPacketHandler {
                 throw new IllegalArgumentException("Packet does not contain a token");
             }
             String clientToken = header.getString("token");
-            if (!this.avenueConfig.getAuthenticationToken().equals(clientToken)) {
+            if (!this.authenticationTokenHandler.isValidToken(clientToken)) {
                 throw new IllegalArgumentException("Provided token mismatched local token");
             }
         }
