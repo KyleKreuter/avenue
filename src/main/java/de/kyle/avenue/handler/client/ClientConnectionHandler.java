@@ -101,6 +101,8 @@ public class ClientConnectionHandler implements Runnable {
         try {
             listen();
         } catch (IOException e) {
+            log.error("An error occurred", e);
+        }finally {
             shutdown();
         }
     }
