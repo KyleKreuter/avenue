@@ -1,5 +1,6 @@
 package de.kyle.avenue.registry;
 
+import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
 import de.kyle.avenue.handler.packet.PacketHandler;
 import de.kyle.avenue.handler.packet.auth.AuthTokenRequestInboundPacketHandler;
 
@@ -9,8 +10,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public class InboundPacketRegistry {
     private final Map<String, PacketHandler> packethandlerMap = new ConcurrentHashMap<>();
 
-    public InboundPacketRegistry() {
-        this.packethandlerMap.put("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler());
+    public InboundPacketRegistry(AuthenticationTokenHandler authenticationTokenHandler) {
+        this.packethandlerMap.put("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler));
     }
 
     public PacketHandler getPacketHandler(String packetName) {

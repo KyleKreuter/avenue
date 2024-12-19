@@ -1,6 +1,7 @@
 package de.kyle.avenue;
 
 import de.kyle.avenue.config.AvenueConfig;
+import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.registry.InboundPacketRegistry;
 import de.kyle.avenue.serialization.PacketDeserializer;
@@ -30,10 +31,12 @@ public class SingleNodeServer {
             log.error("Could not load configuration file", e);
             throw new RuntimeException(e);
         }
+        AuthenticationTokenHandler authenticationTokenHandler = new AuthenticationTokenHandler(this.avenueConfig);
+
         this.executorService = Executors.newVirtualThreadPerTaskExecutor();
         this.packetDeserializer = new PacketDeserializer(this.avenueConfig);
         this.packetSerializer = new PacketSerializer(this.avenueConfig);
-        this.inboundPacketRegistry = new InboundPacketRegistry();
+        this.inboundPacketRegistry = new InboundPacketRegistry(authenticationTokenHandler);
 
     }
 

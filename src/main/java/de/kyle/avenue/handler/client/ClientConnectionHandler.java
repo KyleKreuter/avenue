@@ -6,6 +6,7 @@ import de.kyle.avenue.packet.OutboundPacket;
 import de.kyle.avenue.registry.InboundPacketRegistry;
 import de.kyle.avenue.serialization.PacketDeserializer;
 import de.kyle.avenue.serialization.PacketSerializer;
+import org.json.JSONException;
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -72,11 +73,12 @@ public class ClientConnectionHandler implements Runnable {
                 try {
                     PacketHandler packetHandler = inboundPacketRegistry.getPacketHandler(packetName);
                     packetHandler.handle(packet, this);
-                } catch (IllegalArgumentException e) {
+                } catch (IllegalArgumentException | JSONException e) {
                     if (avenueConfig.isDropUnknownPackets()) {
+                        log.error("Unknown or malformed packet was received, dropping client", e);
                         throw new RuntimeException(e);
                     } else {
-                        log.warn("Unknown packet was received but 'drop-unknown' is turned off. Client is still allowed to send packets");
+                        log.warn("Unknown packet was received but 'drop-unknown' is turned off. Client is still allowed to send packets", e);
                     }
                 }
             }

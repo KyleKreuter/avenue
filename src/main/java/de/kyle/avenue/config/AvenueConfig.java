@@ -7,8 +7,11 @@ import java.util.Properties;
 
 public class AvenueConfig {
     private final int packetSize;
-
     private final boolean dropUnknownPackets;
+    private final String authenticationSecret;
+
+    private final String authenticationToken;
+
 
     public AvenueConfig() throws IOException {
         Properties properties = new Properties();
@@ -26,6 +29,8 @@ public class AvenueConfig {
 
         packetSize = Integer.parseInt(properties.getProperty("server.packet.max-size"));
         dropUnknownPackets = Boolean.parseBoolean(properties.getProperty("server.packet.drop-unknown"));
+        authenticationSecret = properties.getProperty("server.authentication.secret");
+        authenticationToken = properties.getProperty("server.authentication.token");
     }
 
     public int getPacketSize() {
@@ -34,5 +39,13 @@ public class AvenueConfig {
 
     public boolean isDropUnknownPackets() {
         return dropUnknownPackets;
+    }
+
+    public String getAuthenticationSecret() {
+        return authenticationSecret;
+    }
+
+    public String getAuthenticationToken() {
+        return authenticationToken;
     }
 }
