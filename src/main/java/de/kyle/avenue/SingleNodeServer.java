@@ -40,7 +40,6 @@ public class SingleNodeServer {
         this.packetSerializer = new PacketSerializer(this.avenueConfig);
         this.inboundPacketHandler = new InboundPacketHandler(
                 authenticationTokenHandler,
-                this.avenueConfig,
                 topicSubscriptionHandler
         );
     }

@@ -19,16 +19,13 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class InboundPacketHandler {
     private final Map<String, PacketHandler> packethandlerMap = new ConcurrentHashMap<>();
-    private final AvenueConfig avenueConfig;
     private final AuthenticationTokenHandler authenticationTokenHandler;
 
     public InboundPacketHandler(
             AuthenticationTokenHandler authenticationTokenHandler,
-            AvenueConfig avenueConfig,
             TopicSubscriptionHandler topicSubscriptionHandler
     ) {
         this.authenticationTokenHandler = authenticationTokenHandler;
-        this.avenueConfig = avenueConfig;
         this.packethandlerMap.put("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler));
         this.packethandlerMap.put("PublishMessageInboundPacket", new PublishMessageInboundPacketHandler(topicSubscriptionHandler));
         this.packethandlerMap.put("SubscribeInboundPacket", new SubscribeInboundPacketHandler(topicSubscriptionHandler));
