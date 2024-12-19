@@ -2,7 +2,6 @@ package de.kyle.avenue.handler.packet;
 
 import de.kyle.avenue.annotation.Secured;
 import de.kyle.avenue.annotation.TopicHandler;
-import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.handler.packet.auth.AuthTokenRequestInboundPacketHandler;
@@ -16,6 +15,7 @@ import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 
 public class InboundPacketHandler {
     private final Map<String, PacketHandler> packethandlerMap = new ConcurrentHashMap<>();
@@ -23,11 +23,12 @@ public class InboundPacketHandler {
 
     public InboundPacketHandler(
             AuthenticationTokenHandler authenticationTokenHandler,
-            TopicSubscriptionHandler topicSubscriptionHandler
+            TopicSubscriptionHandler topicSubscriptionHandler,
+            ExecutorService executorService
     ) {
         this.authenticationTokenHandler = authenticationTokenHandler;
         this.packethandlerMap.put("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler));
-        this.packethandlerMap.put("PublishMessageInboundPacket", new PublishMessageInboundPacketHandler(topicSubscriptionHandler));
+        this.packethandlerMap.put("PublishMessageInboundPacket", new PublishMessageInboundPacketHandler(topicSubscriptionHandler, executorService));
         this.packethandlerMap.put("SubscribeInboundPacket", new SubscribeInboundPacketHandler(topicSubscriptionHandler));
     }
 

@@ -8,11 +8,18 @@ import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.packet.publish.PublishMessageOutboundPacket;
 import org.json.JSONObject;
 
+import java.util.concurrent.ExecutorService;
+
 public class PublishMessageInboundPacketHandler implements PacketHandler {
     private final TopicSubscriptionHandler topicSubscriptionHandler;
+    private final ExecutorService executorService;
 
-    public PublishMessageInboundPacketHandler(TopicSubscriptionHandler topicSubscriptionHandler) {
+    public PublishMessageInboundPacketHandler(
+            TopicSubscriptionHandler topicSubscriptionHandler,
+            ExecutorService executorService
+    ) {
         this.topicSubscriptionHandler = topicSubscriptionHandler;
+        this.executorService = executorService;
     }
 
     @Override
@@ -27,6 +34,6 @@ public class PublishMessageInboundPacketHandler implements PacketHandler {
         String data = body.getString("data");
 
         PublishMessageOutboundPacket outboundPacket = new PublishMessageOutboundPacket(topic, data, source);
-        topicSubscriptionHandler.deliverPacketToSubscribers(topic, outboundPacket);
+        executorService.submit(() -> topicSubscriptionHandler.deliverPacketToSubscribers(topic, outboundPacket));
     }
 }
