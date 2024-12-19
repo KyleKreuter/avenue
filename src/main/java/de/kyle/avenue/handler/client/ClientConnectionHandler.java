@@ -1,8 +1,8 @@
 package de.kyle.avenue.handler.client;
 
 import de.kyle.avenue.config.AvenueConfig;
+import de.kyle.avenue.handler.packet.InboundPacketHandler;
 import de.kyle.avenue.packet.OutboundPacket;
-import de.kyle.avenue.registry.InboundPacketRegistry;
 import de.kyle.avenue.serialization.PacketDeserializer;
 import de.kyle.avenue.serialization.PacketSerializer;
 import org.json.JSONException;
@@ -15,7 +15,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
-import java.util.List;
 
 public class ClientConnectionHandler implements Runnable {
     private static final Logger log = LoggerFactory.getLogger(ClientConnectionHandler.class);
@@ -24,7 +23,7 @@ public class ClientConnectionHandler implements Runnable {
     private final OutputStream outputStream;
     private final PacketDeserializer packetDeserializer;
     private final PacketSerializer packetSerializer;
-    private final InboundPacketRegistry inboundPacketRegistry;
+    private final InboundPacketHandler inboundPacketHandler;
     private final AvenueConfig avenueConfig;
     private boolean running;
 
@@ -32,7 +31,7 @@ public class ClientConnectionHandler implements Runnable {
             Socket client,
             PacketDeserializer packetDeserializer,
             PacketSerializer packetSerializer,
-            InboundPacketRegistry inboundPacketRegistry,
+            InboundPacketHandler inboundPacketHandler,
             AvenueConfig avenueConfig
     ) throws IOException {
         this.client = client;
@@ -41,25 +40,17 @@ public class ClientConnectionHandler implements Runnable {
         this.running = true;
         this.packetSerializer = packetSerializer;
         this.packetDeserializer = packetDeserializer;
-        this.inboundPacketRegistry = inboundPacketRegistry;
+        this.inboundPacketHandler = inboundPacketHandler;
         this.avenueConfig = avenueConfig;
     }
 
-    public Socket getClient() {
-        return this.client;
-    }
-
-    public List<String> getTopics() {
-        return List.of();
-    }
-
-    public void listen() throws IOException {
+    private void listen() throws IOException {
         try (DataInputStream dataInputStream = new DataInputStream(this.inputStream)) {
             while (this.running) {
                 byte[] packetBytes = dataInputStream.readAllBytes();
                 JSONObject packet = packetDeserializer.deserialize(packetBytes);
                 try {
-                    inboundPacketRegistry.handleInboundPacket(packet, this);
+                    inboundPacketHandler.handleInboundPacket(packet, this);
                 } catch (IllegalArgumentException | JSONException | NoSuchMethodException e) {
                     if (avenueConfig.isDropUnknownPackets()) {
                         log.error("Unknown or malformed packet was received, dropping client", e);
@@ -91,7 +82,6 @@ public class ClientConnectionHandler implements Runnable {
             log.warn("An error occurred while closing connection", e);
         }
     }
-
 
     @Override
     public void run() {

@@ -1,11 +1,13 @@
-package de.kyle.avenue.registry;
+package de.kyle.avenue.handler.packet;
 
+import de.kyle.avenue.annotation.Secured;
+import de.kyle.avenue.annotation.TopicHandler;
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
-import de.kyle.avenue.handler.authentication.Secured;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
-import de.kyle.avenue.handler.packet.PacketHandler;
 import de.kyle.avenue.handler.packet.auth.AuthTokenRequestInboundPacketHandler;
+import de.kyle.avenue.handler.packet.publish.PublishMessageInboundPacketHandler;
+import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import org.json.JSONObject;
 
 import java.io.IOException;
@@ -14,16 +16,18 @@ import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-public class InboundPacketRegistry {
+public class InboundPacketHandler {
     private final Map<String, PacketHandler> packethandlerMap = new ConcurrentHashMap<>();
     private final AvenueConfig avenueConfig;
 
-    public InboundPacketRegistry(
+    public InboundPacketHandler(
             AuthenticationTokenHandler authenticationTokenHandler,
-            AvenueConfig avenueConfig
+            AvenueConfig avenueConfig,
+            TopicSubscriptionHandler topicSubscriptionHandler
     ) {
         this.avenueConfig = avenueConfig;
         this.packethandlerMap.put("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler));
+        this.packethandlerMap.put("PublishMessageInboundPacket", new PublishMessageInboundPacketHandler(topicSubscriptionHandler));
     }
 
     public void handleInboundPacket(JSONObject packet, ClientConnectionHandler clientConnectionHandler) throws IOException, NoSuchMethodException {
@@ -42,8 +46,18 @@ public class InboundPacketRegistry {
             throw new IllegalArgumentException("Packet with the provided name not found");
         }
         PacketHandler packetHandler = packethandlerMap.get(packetName);
-        Method handleMethod = packetHandler.getClass().getDeclaredMethod("handle", JSONObject.class, ClientConnectionHandler.class);
-        //Prüfen ob der Handler secured ist
+        Method handle = packetHandler.getClass().getDeclaredMethod("handle", JSONObject.class, ClientConnectionHandler.class);
+
+        //Prüfen ob der handler secured ist
+        handleSecuredPacketHandler(header, handle);
+
+        //Prüfen ob der packet handler ein topic handler ist
+        handleTopicPacketHandler(header, handle);
+
+        packetHandler.handle(packet, clientConnectionHandler);
+    }
+
+    private void handleSecuredPacketHandler(JSONObject header, Method handleMethod) {
         if (Arrays.stream(handleMethod.getAnnotations()).anyMatch(annotation -> annotation.annotationType().equals(Secured.class))) {
             if (!header.has("token")) {
                 throw new IllegalArgumentException("Packet does not contain a token");
@@ -53,6 +67,13 @@ public class InboundPacketRegistry {
                 throw new IllegalArgumentException("Provided token mismatched local token");
             }
         }
-        packetHandler.handle(packet, clientConnectionHandler);
+    }
+
+    private void handleTopicPacketHandler(JSONObject header, Method handleMethod) {
+        if (Arrays.stream(handleMethod.getAnnotations()).anyMatch(annotation -> annotation.annotationType().equals(TopicHandler.class))) {
+            if (!header.has("topic")) {
+                throw new IllegalArgumentException("Packet does not contain a topic");
+            }
+        }
     }
 }

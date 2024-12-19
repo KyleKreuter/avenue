@@ -20,7 +20,7 @@ public class AuthTokenRequestInboundPacket implements InboundPacket {
         jsonObject.put("name", this.getClass().getName().getBytes(StandardCharsets.UTF_8));
         String jsonString = jsonObject.toString();
         if (jsonString == null) {
-            throw new RuntimeException("The provided secret is formatted badly");
+            throw new RuntimeException("An error occurred while trying to format the header");
         }
         return jsonString.getBytes(StandardCharsets.UTF_8);
     }
@@ -31,7 +31,7 @@ public class AuthTokenRequestInboundPacket implements InboundPacket {
         jsonObject.put("secret", this.secret);
         String jsonString = jsonObject.toString();
         if (jsonString == null) {
-            throw new RuntimeException("The provided secret is formatted badly");
+            throw new RuntimeException("An error occurred while trying to format the body");
         }
         return jsonString.getBytes(StandardCharsets.UTF_8);
     }
