@@ -16,6 +16,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class ClientConnectionHandler implements Runnable {
     private static final Logger log = LoggerFactory.getLogger(ClientConnectionHandler.class);
@@ -27,6 +29,7 @@ public class ClientConnectionHandler implements Runnable {
     private final InboundPacketHandler inboundPacketHandler;
     private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final AvenueConfig avenueConfig;
+    private final Lock sendPacketLock = new ReentrantLock();
     private boolean running;
 
     public ClientConnectionHandler(
@@ -70,9 +73,14 @@ public class ClientConnectionHandler implements Runnable {
     }
 
     public void send(OutboundPacket packet) throws IOException {
-        byte[] serializedPacket = packetSerializer.serialize(packet);
-        outputStream.write(serializedPacket);
-        outputStream.flush();
+        sendPacketLock.lock();
+        try {
+            byte[] serializedPacket = packetSerializer.serialize(packet);
+            outputStream.write(serializedPacket);
+            outputStream.flush();
+        } finally {
+            sendPacketLock.unlock();
+        }
     }
 
     public void shutdown() {
