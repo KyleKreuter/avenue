@@ -7,6 +7,7 @@ import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.handler.packet.auth.AuthTokenRequestInboundPacketHandler;
 import de.kyle.avenue.handler.packet.publish.PublishMessageInboundPacketHandler;
+import de.kyle.avenue.handler.packet.subscribe.SubscribeInboundPacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import org.json.JSONObject;
 
@@ -28,6 +29,7 @@ public class InboundPacketHandler {
         this.avenueConfig = avenueConfig;
         this.packethandlerMap.put("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler));
         this.packethandlerMap.put("PublishMessageInboundPacket", new PublishMessageInboundPacketHandler(topicSubscriptionHandler));
+        this.packethandlerMap.put("SubscribeInboundPacket", new SubscribeInboundPacketHandler(topicSubscriptionHandler));
     }
 
     public void handleInboundPacket(JSONObject packet, ClientConnectionHandler clientConnectionHandler) throws IOException, NoSuchMethodException {
