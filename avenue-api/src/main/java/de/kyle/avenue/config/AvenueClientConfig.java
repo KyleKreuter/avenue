@@ -1,5 +1,7 @@
 package de.kyle.avenue.config;
 
+import io.github.cdimascio.dotenv.Dotenv;
+
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -9,12 +11,12 @@ public class AvenueClientConfig {
     private final String authenticationSecret;
     private final int port;
     private final String hostName;
-
     private final String clientName;
-
     private final int packetSize;
 
     public AvenueClientConfig() throws IOException {
+        Dotenv dotenv = Dotenv.configure().ignoreIfMissing().load();
+
         Properties properties = new Properties();
         File specificationFolder = new File("config");
         if (specificationFolder.mkdir()) {
@@ -28,12 +30,25 @@ public class AvenueClientConfig {
             }
         }
 
-        authenticationSecret = properties.getProperty("client.authentication.secret");
-        port = Integer.parseInt(properties.getProperty("server.port"));
-        packetSize = Integer.parseInt(properties.getProperty("server.packet.max-size"));
-        hostName = properties.getProperty("server.hostname");
-        clientName = properties.getProperty("client.name");
+        authenticationSecret = dotenv.get("CLIENT_AUTHENTICATION_SECRET",
+                properties.getProperty("client.authentication.secret", "defaultSecret"));
 
+        port = parseInt(dotenv.get("SERVER_PORT", properties.getProperty("server.port")), 8080);
+
+        packetSize = parseInt(dotenv.get("SERVER_PACKET_MAX_SIZE",
+                properties.getProperty("server.packet.max-size")), 512);
+
+        hostName = dotenv.get("SERVER_HOSTNAME", properties.getProperty("server.hostname", "localhost"));
+
+        clientName = dotenv.get("CLIENT_NAME", properties.getProperty("client.name", "DefaultClient"));
+    }
+
+    private int parseInt(String value, int defaultValue) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
     }
 
     public String getAuthenticationSecret() {

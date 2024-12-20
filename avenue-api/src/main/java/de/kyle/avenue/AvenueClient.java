@@ -28,8 +28,8 @@ import java.util.concurrent.locks.ReentrantLock;
 public class AvenueClient {
     private static final Logger log = LoggerFactory.getLogger(AvenueClient.class);
     private final Socket socket;
-    private final InputStream inputStream;
-    private final OutputStream outputStream;
+    private InputStream inputStream;
+    private OutputStream outputStream;
     private final PacketDeserializer packetDeserializer;
     private final PacketSerializer packetSerializer;
     private final Map<String, TopicListener> topicListenerMap;
@@ -39,11 +39,9 @@ public class AvenueClient {
     private static AvenueClient avenueClient;
     private static final Lock constructorLock = new ReentrantLock();
 
-    private AvenueClient() throws IOException {
+    private AvenueClient() throws IOException, InterruptedException {
         AvenueClientConfig config = new AvenueClientConfig();
         this.socket = new Socket();
-        this.inputStream = this.socket.getInputStream();
-        this.outputStream = this.socket.getOutputStream();
         this.running = true;
         this.packetDeserializer = new PacketDeserializer(config.getPacketSize());
         this.packetSerializer = new PacketSerializer(config.getPacketSize());
@@ -52,6 +50,8 @@ public class AvenueClient {
         Thread.ofVirtual().start(() -> {
             try {
                 socket.connect(new InetSocketAddress(config.getHostName(), config.getPort()));
+                this.inputStream = this.socket.getInputStream();
+                this.outputStream = this.socket.getOutputStream();
                 AuthTokenRequestInboundPacket authTokenRequestInboundPacket = new AuthTokenRequestInboundPacket(config.getAuthenticationSecret());
                 byte[] serialized = packetSerializer.serialize(authTokenRequestInboundPacket);
                 outputStream.write(serialized);
@@ -64,7 +64,7 @@ public class AvenueClient {
         });
     }
 
-    public static AvenueClient getInstance() throws IOException {
+    public static AvenueClient getInstance() throws IOException, InterruptedException {
         constructorLock.lock();
         try {
             if (avenueClient == null) {

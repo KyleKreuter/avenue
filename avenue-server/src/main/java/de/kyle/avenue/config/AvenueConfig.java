@@ -1,5 +1,7 @@
 package de.kyle.avenue.config;
 
+import io.github.cdimascio.dotenv.Dotenv;
+
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -9,13 +11,12 @@ public class AvenueConfig {
     private final int packetSize;
     private final boolean dropUnknownPackets;
     private final String authenticationSecret;
-
     private final String authenticationToken;
-
     private final int port;
 
-
     public AvenueConfig() throws IOException {
+        Dotenv dotenv = Dotenv.configure().ignoreIfMissing().load();
+
         Properties properties = new Properties();
         File specificationFolder = new File("config");
         if (specificationFolder.mkdir()) {
@@ -29,11 +30,21 @@ public class AvenueConfig {
             }
         }
 
-        packetSize = Integer.parseInt(properties.getProperty("server.packet.max-size"));
-        dropUnknownPackets = Boolean.parseBoolean(properties.getProperty("server.packet.drop-unknown"));
-        authenticationSecret = properties.getProperty("server.authentication.secret");
-        authenticationToken = properties.getProperty("server.authentication.token");
-        port = Integer.parseInt(properties.getProperty("server.port"));
+        packetSize = Integer.parseInt(
+                dotenv.get("SERVER_PACKET_MAX_SIZE", properties.getProperty("server.packet.max-size"))
+        );
+        dropUnknownPackets = Boolean.parseBoolean(
+                dotenv.get("SERVER_PACKET_DROP_UNKNOWN", properties.getProperty("server.packet.drop-unknown"))
+        );
+        authenticationSecret = dotenv.get(
+                "AUTHENTICATION_SECRET", properties.getProperty("server.authentication.secret")
+        );
+        authenticationToken = dotenv.get(
+                "AUTHENTICATION_TOKEN", properties.getProperty("server.authentication.token")
+        );
+        port = Integer.parseInt(
+                dotenv.get("SERVER_PORT", properties.getProperty("server.port"))
+        );
     }
 
     public int getPacketSize() {
