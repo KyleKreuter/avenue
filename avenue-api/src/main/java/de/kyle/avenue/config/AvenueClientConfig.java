@@ -30,10 +30,10 @@ public class AvenueClientConfig {
             }
         }
 
-        authenticationSecret = dotenv.get("CLIENT_AUTHENTICATION_SECRET",
-                properties.getProperty("client.authentication.secret", "defaultSecret"));
+        authenticationSecret = dotenv.get("AUTHENTICATION_SECRET",
+                properties.getProperty("client.authentication.secret"));
 
-        port = parseInt(dotenv.get("SERVER_PORT", properties.getProperty("server.port")), 8080);
+        port = parseInt(dotenv.get("SERVER_PORT", properties.getProperty("server.port")), 4180);
 
         packetSize = parseInt(dotenv.get("SERVER_PACKET_MAX_SIZE",
                 properties.getProperty("server.packet.max-size")), 512);
