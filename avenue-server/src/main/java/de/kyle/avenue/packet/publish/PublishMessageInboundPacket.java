@@ -11,11 +11,13 @@ public class PublishMessageInboundPacket implements InboundPacket {
     private final String topic;
     private final String data;
     private final String source;
+    private final String token;
 
-    public PublishMessageInboundPacket(String topic, String data, String source) {
+    public PublishMessageInboundPacket(String topic, String data, String source, String token) {
         this.data = data;
         this.topic = topic;
         this.source = source;
+        this.token = token;
     }
 
     @Override
@@ -29,6 +31,7 @@ public class PublishMessageInboundPacket implements InboundPacket {
         jsonObject.put("name", this.getClass().getName().getBytes(StandardCharsets.UTF_8));
         jsonObject.put("topic", this.topic);
         jsonObject.put("source", this.source);
+        jsonObject.put("token", this.token);
         String jsonString = jsonObject.toString();
         if (jsonString == null) {
             throw new RuntimeException("An error occurred while trying to format the header");
