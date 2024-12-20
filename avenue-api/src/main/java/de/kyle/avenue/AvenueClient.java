@@ -22,6 +22,8 @@ import java.net.Socket;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class AvenueClient {
     private static final Logger log = LoggerFactory.getLogger(AvenueClient.class);
@@ -34,6 +36,8 @@ public class AvenueClient {
     private final String clientName;
     private boolean running;
     private String authToken;
+    private static AvenueClient avenueClient;
+    private static final Lock constructorLock = new ReentrantLock();
 
     private AvenueClient() throws IOException {
         AvenueClientConfig config = new AvenueClientConfig();
@@ -58,6 +62,18 @@ public class AvenueClient {
                 throw new RuntimeException(e);
             }
         });
+    }
+
+    public static AvenueClient getInstance() throws IOException {
+        constructorLock.lock();
+        try {
+            if (avenueClient == null) {
+                avenueClient = new AvenueClient();
+            }
+            return avenueClient;
+        } finally {
+            constructorLock.unlock();
+        }
     }
 
     private void listen() throws IOException {
