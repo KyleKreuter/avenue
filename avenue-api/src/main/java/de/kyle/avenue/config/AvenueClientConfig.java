@@ -10,6 +10,9 @@ public class AvenueClientConfig {
     private final int port;
     private final String hostName;
 
+    private final String clientName;
+
+    private final int packetSize;
 
     public AvenueClientConfig() throws IOException {
         Properties properties = new Properties();
@@ -27,7 +30,10 @@ public class AvenueClientConfig {
 
         authenticationSecret = properties.getProperty("client.authentication.secret");
         port = Integer.parseInt(properties.getProperty("server.port"));
+        packetSize = Integer.parseInt(properties.getProperty("server.packet.max-size"));
         hostName = properties.getProperty("server.hostname");
+        clientName = properties.getProperty("client.name");
+
     }
 
     public String getAuthenticationSecret() {
@@ -40,5 +46,13 @@ public class AvenueClientConfig {
 
     public String getHostName() {
         return hostName;
+    }
+
+    public int getPacketSize() {
+        return packetSize;
+    }
+
+    public String getClientName() {
+        return clientName;
     }
 }

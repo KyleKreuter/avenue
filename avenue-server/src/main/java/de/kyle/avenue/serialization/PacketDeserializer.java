@@ -9,10 +9,14 @@ import java.util.regex.Pattern;
 
 public class PacketDeserializer {
     private final Pattern PATTERN = Pattern.compile("_H_(.*?)_H__B_(.*?)_B_");
-    private final AvenueConfig avenueConfig;
+    private final int packetSize;
 
-    public PacketDeserializer(AvenueConfig avenueConfig){
-        this.avenueConfig = avenueConfig;
+    public PacketDeserializer(AvenueConfig avenueConfig) {
+        this.packetSize = avenueConfig.getPacketSize();
+    }
+
+    public PacketDeserializer(int packetSize) {
+        this.packetSize = packetSize;
     }
 
     public JSONObject deserialize(byte[] packet) throws IllegalArgumentException {
@@ -20,10 +24,10 @@ public class PacketDeserializer {
             throw new IllegalArgumentException("Packet cannot be null");
         }
 
-        if (packet.length > avenueConfig.getPacketSize()) {
+        if (packet.length > packetSize) {
             throw new IllegalArgumentException(
                     String.format("Packet is too large (%d bytes), exceeding maximum size of %d bytes",
-                            packet.length, avenueConfig.getPacketSize()));
+                            packet.length, packetSize));
         }
 
         String packetString = new String(packet, StandardCharsets.UTF_8);
