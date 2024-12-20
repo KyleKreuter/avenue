@@ -44,8 +44,8 @@ public class PacketDeserializer {
         String bodyString = new String(body, StandardCharsets.UTF_8);
 
         JSONObject deserializedObject = new JSONObject();
-        deserializedObject.put("header", headerString);
-        deserializedObject.put("body", bodyString);
+        deserializedObject.put("header", new JSONObject(headerString));
+        deserializedObject.put("body", new JSONObject(bodyString));
         return deserializedObject;
     }
 }
