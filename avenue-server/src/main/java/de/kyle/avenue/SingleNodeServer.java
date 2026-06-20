@@ -158,6 +158,10 @@ public class SingleNodeServer {
             while (running) {
                 try {
                     Socket client = server.accept();
+                    if (avenueConfig.isServerTcpNoDelay()) {
+                        // Latency over throughput for interactive pub/sub: flush small frames now.
+                        client.setTcpNoDelay(true);
+                    }
                     if (!admit(client)) {
                         continue;
                     }

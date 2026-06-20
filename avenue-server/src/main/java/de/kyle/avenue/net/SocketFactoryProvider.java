@@ -31,7 +31,7 @@ import java.security.KeyStore;
  * and then reused. TLS instances eagerly initialize an {@link SSLContext} from the configured
  * keystore (server side) and/or truststore (client side), failing fast on a misconfiguration.
  */
-public final class SocketFactoryProvider {
+public final class SocketFactoryProvider implements de.kyle.avenue.cluster.ClusterSocketFactory {
 
     private static final String TLS_PROTOCOL = "TLS";
 
@@ -113,10 +113,15 @@ public final class SocketFactoryProvider {
      */
     public Socket createSocket(String host, int port) throws IOException {
         if (!tlsEnabled) {
-            return SocketFactory.getDefault().createSocket(host, port);
+            Socket socket = SocketFactory.getDefault().createSocket(host, port);
+            // Cluster links are latency-sensitive request/response style traffic, not bulk
+            // transfer: disable Nagle so small publish/heartbeat frames flush immediately.
+            socket.setTcpNoDelay(true);
+            return socket;
         }
         SSLSocketFactory factory = sslContext.getSocketFactory();
         SSLSocket socket = (SSLSocket) factory.createSocket(host, port);
+        socket.setTcpNoDelay(true);
         // Trigger the handshake now so handshake/trust failures are reported at connect time.
         socket.startHandshake();
         return socket;
