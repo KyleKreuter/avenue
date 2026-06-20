@@ -123,6 +123,7 @@ Arbeitspunkt (`rate=120000`), und die abgeleiteten ns/Nachricht (= 1e9 / Saettig
 | 0 — Baseline | 253 556 | ~3944 | 0.114 |
 | 1 — Mechanische Hot-Path-Wins | 246 400 | ~4058 | 0.115 |
 | 1.5 — `data` als `bytes` (opaker Passthrough) | 246 000 – 261 000 (Streuband) | ~3900 | 0.134 |
+| 4a — Outbound-Encode ohne Builder (JFR: Alloc-Win) | ~290 000 (Paare, flach) | n/a | ~0.13 |
 | 2 — Protokoll-Pipelining / Batched Publish | | | |
 | 3 — Event-Loop-IO-Rewrite | | | |
 | 4 — Allokations-/GC-Disziplin | | | |
