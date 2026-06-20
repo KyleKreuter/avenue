@@ -56,7 +56,16 @@ final class TestClient implements Closeable {
     private volatile boolean running = true;
 
     TestClient(String host, int port, int maxPacketSize) throws IOException {
-        this.socket = new Socket(host, port);
+        this(new Socket(host, port), maxPacketSize);
+    }
+
+    /**
+     * Constructs a client around an already-connected socket. Used by the TLS test, which
+     * supplies an {@link javax.net.ssl.SSLSocket} so the exact same wire protocol runs over
+     * an encrypted transport.
+     */
+    TestClient(Socket socket, int maxPacketSize) throws IOException {
+        this.socket = socket;
         this.out = new DataOutputStream(socket.getOutputStream());
         this.in = new DataInputStream(socket.getInputStream());
         this.maxPacketSize = maxPacketSize;
