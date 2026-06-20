@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "de.kyle.avenue.proto";
+
+// Client <-> server message types. Each message mirrors the fields of one existing
+// JSON packet class (header + body fields merged into a flat message). The oneof
+// envelope replaces today's header.name-based dispatch: the set oneof case is the type.
+
+// Mirrors AuthTokenRequestInboundPacket (body: secret).
+message AuthTokenRequest {
+  string secret = 1;
+}
+
+// Mirrors AuthTokenResponseOutboundPacket (body: token).
+message AuthTokenResponse {
+  string token = 1;
+}
+
+// Mirrors SubscribeInboundPacket (header: token; body: topic).
+message Subscribe {
+  string topic = 1;
+  string token = 2;
+}
+
+// Mirrors SubscribeAckOutboundPacket (body: topic).
+message SubscribeAck {
+  string topic = 1;
+}
+
+// Mirrors PublishMessageInboundPacket (header: topic, source, token; body: data).
+// `data` is `bytes` (not `string`): the server treats the payload as an opaque blob and never
+// transcodes it. On the wire it is the same UTF-8 bytes a string field would carry; only the
+// field type changed (field numbers are unchanged). This eliminates the per-message
+// bytes<->String UTF-8 transcoding (String.charAt / StringLatin1.charAt) that dominated the
+// server hot path under load.
+message PublishInbound {
+  string topic = 1;
+  string source = 2;
+  string token = 3;
+  bytes data = 4;
+}
+
+// Mirrors PublishMessageOutboundPacket (header: topic, source; body: data).
+// `data` is `bytes` — see PublishInbound.data. The opaque ByteString parsed from PublishInbound
+// is set here unchanged, so the payload flows through the server without ever becoming a String.
+message PublishOutbound {
+  string topic = 1;
+  string source = 2;
+  bytes data = 3;
+}
+
+// Top-level client-plane envelope: exactly one message per frame.
+message ClientEnvelope {
+  oneof msg {
+    AuthTokenRequest auth_request = 1;
+    AuthTokenResponse auth_response = 2;
+    Subscribe subscribe = 3;
+    SubscribeAck subscribe_ack = 4;
+    PublishInbound publish_inbound = 5;
+    PublishOutbound publish_outbound = 6;
+  }
+}

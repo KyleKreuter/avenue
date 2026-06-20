@@ -1,13 +1,17 @@
 package de.kyle.avenue.handler.packet.auth;
 
 import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
-import de.kyle.avenue.handler.client.ClientConnectionHandler;
+import de.kyle.avenue.handler.client.ClientConnection;
 import de.kyle.avenue.handler.packet.PacketHandler;
-import de.kyle.avenue.packet.auth.AuthTokenResponseOutboundPacket;
-import org.json.JSONObject;
+import de.kyle.avenue.proto.AuthTokenRequest;
+import de.kyle.avenue.proto.ClientEnvelope;
+import de.kyle.avenue.serialization.ClientEnvelopes;
 
-import java.io.IOException;
-
+/**
+ * Handles an {@link AuthTokenRequest} from a client: exchanges the provided secret for a token
+ * and answers with an {@link AuthTokenResponse} envelope. This message is unsecured (no token
+ * is required to authenticate), mirroring the pre-protobuf behaviour.
+ */
 public class AuthTokenRequestInboundPacketHandler implements PacketHandler {
     private final AuthenticationTokenHandler authenticationTokenHandler;
 
@@ -18,16 +22,12 @@ public class AuthTokenRequestInboundPacketHandler implements PacketHandler {
     }
 
     @Override
-    public void handle(JSONObject packet, ClientConnectionHandler clientConnectionHandler) {
-        if (!packet.getJSONObject("body").has("secret")) {
-            throw new IllegalArgumentException("AuthTokenRequestInboundPacket does not contain a secret");
-        }
-        String secret = packet.getJSONObject("body").getString("secret");
-        String token = authenticationTokenHandler.getToken(secret);
-        try {
-            clientConnectionHandler.send(new AuthTokenResponseOutboundPacket(token));
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+    public void handle(ClientEnvelope envelope, ClientConnection clientConnection) {
+        AuthTokenRequest request = envelope.getAuthRequest();
+        // proto3 defaults an unset string to "", which is exactly the empty-secret case; the
+        // token handler validates the secret and yields the configured token (or an error token).
+        String token = authenticationTokenHandler.getToken(request.getSecret());
+        // Asynchronous enqueue; the dedicated writer thread performs the actual socket write.
+        clientConnection.send(ClientEnvelopes.authResponse(token));
     }
 }
