@@ -43,6 +43,13 @@ import de.kyle.avenue.cluster.ReplayBuffer;
  *                              empty = auto-detect the local IP)
  * @param clusterPacketMaxSize  max frame size for cluster links, larger than the client packet size
  *                              to fit JoinAck member lists ({@code cluster.packet.max-size})
+ * @param batchMaxFrames        max frames the cluster writer coalesces into one flush
+ *                              ({@code cluster.batch.max-frames}); {@code 1} reproduces the legacy
+ *                              per-frame flush behaviour. Write-batching is opportunistic: at low
+ *                              load a batch is a single frame, so there is no added latency.
+ * @param batchMaxDelayMicros   optional linger window (microseconds) the cluster writer may park to
+ *                              accumulate more frames before flushing ({@code cluster.batch.max-delay-micros});
+ *                              {@code 0} (default) means purely opportunistic — no artificial wait.
  */
 public record ClusterTuning(
         int replayCapacity,
@@ -60,7 +67,9 @@ public record ClusterTuning(
         int swimGossipFanout,
         long swimDeadMemberTimeoutMs,
         String advertisedHost,
-        int clusterPacketMaxSize
+        int clusterPacketMaxSize,
+        int batchMaxFrames,
+        long batchMaxDelayMicros
 ) {
 
     public static final int DEFAULT_REPLAY_CAPACITY = 65_536;
@@ -81,6 +90,11 @@ public record ClusterTuning(
     public static final String DEFAULT_ADVERTISED_HOST = "";
     public static final int DEFAULT_CLUSTER_PACKET_MAX_SIZE = 1_048_576;
 
+    // Write-batching (write-coalescing) defaults. Batching is opportunistic and default-on:
+    // max-frames=64 caps a batch, max-delay-micros=0 means no linger (no added latency).
+    public static final int DEFAULT_BATCH_MAX_FRAMES = 64;
+    public static final long DEFAULT_BATCH_MAX_DELAY_MICROS = 0L;
+
     /**
      * Compact canonical constructor: applies the SWIM defaults if a caller (a legacy short
      * constructor or {@code defaults()}) leaves the Phase E knobs at sentinel values, and normalizes
@@ -96,6 +110,11 @@ public record ClusterTuning(
         if (swimDeadMemberTimeoutMs <= 0) swimDeadMemberTimeoutMs = DEFAULT_SWIM_DEAD_MEMBER_TIMEOUT_MS;
         if (advertisedHost == null) advertisedHost = DEFAULT_ADVERTISED_HOST;
         if (clusterPacketMaxSize <= 0) clusterPacketMaxSize = DEFAULT_CLUSTER_PACKET_MAX_SIZE;
+        // Coerce a non-positive batch cap to the default so a partially-specified tuning (e.g. a
+        // legacy short constructor that leaves the field at its sentinel 0) is always usable. A
+        // caller wanting the legacy per-frame flush passes batchMaxFrames=1 explicitly.
+        if (batchMaxFrames <= 0) batchMaxFrames = DEFAULT_BATCH_MAX_FRAMES;
+        if (batchMaxDelayMicros < 0) batchMaxDelayMicros = DEFAULT_BATCH_MAX_DELAY_MICROS;
     }
 
     /**
@@ -135,7 +154,39 @@ public record ClusterTuning(
                 DEFAULT_SWIM_PROBE_INTERVAL_MS, DEFAULT_SWIM_PROBE_TIMEOUT_MS,
                 DEFAULT_SWIM_INDIRECT_PROBE_COUNT, DEFAULT_SWIM_SUSPICION_TIMEOUT_MS,
                 DEFAULT_SWIM_GOSSIP_FANOUT, DEFAULT_SWIM_DEAD_MEMBER_TIMEOUT_MS,
-                DEFAULT_ADVERTISED_HOST, DEFAULT_CLUSTER_PACKET_MAX_SIZE);
+                DEFAULT_ADVERTISED_HOST, DEFAULT_CLUSTER_PACKET_MAX_SIZE,
+                DEFAULT_BATCH_MAX_FRAMES, DEFAULT_BATCH_MAX_DELAY_MICROS);
+    }
+
+    /**
+     * Backwards-compatible 16-argument constructor (pre-write-batching). Applies the write-batching
+     * defaults so every caller that already pinned the Phase C/D/E knobs through to the cluster
+     * packet size — notably the cluster integration/chaos tests — stays source-compatible.
+     */
+    public ClusterTuning(
+            int replayCapacity,
+            ReplayBuffer.BackpressurePolicy backpressurePolicy,
+            long replayOfferTimeoutMs,
+            long ackIntervalMs,
+            boolean strictOrdering,
+            long originExpiryMs,
+            long interestSyncIntervalMs,
+            long interestBroadcastGraceMs,
+            long swimProbeIntervalMs,
+            long swimProbeTimeoutMs,
+            int swimIndirectProbeCount,
+            long swimSuspicionTimeoutMs,
+            int swimGossipFanout,
+            long swimDeadMemberTimeoutMs,
+            String advertisedHost,
+            int clusterPacketMaxSize
+    ) {
+        this(replayCapacity, backpressurePolicy, replayOfferTimeoutMs, ackIntervalMs,
+                strictOrdering, originExpiryMs, interestSyncIntervalMs, interestBroadcastGraceMs,
+                swimProbeIntervalMs, swimProbeTimeoutMs, swimIndirectProbeCount,
+                swimSuspicionTimeoutMs, swimGossipFanout, swimDeadMemberTimeoutMs,
+                advertisedHost, clusterPacketMaxSize,
+                DEFAULT_BATCH_MAX_FRAMES, DEFAULT_BATCH_MAX_DELAY_MICROS);
     }
 
     /** Production-safe defaults used by every non-file constructor of {@link AvenueConfig}. */

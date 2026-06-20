@@ -25,15 +25,46 @@ public final class PacketFraming {
     }
 
     /**
-     * Writes a single framed message: the 4-byte length prefix followed by the payload.
+     * Writes a single framed message: the 4-byte length prefix followed by the payload, then
+     * {@code flush()}es immediately. This is the right call for one-off, latency-critical sends
+     * that are not part of a batch — notably the cluster HMAC handshake.
      *
      * @param out     the target stream
      * @param payload the bare payload bytes (already serialized, no prefix)
      * @throws IOException if writing fails
      */
     public static void writeFrame(DataOutputStream out, byte[] payload) throws IOException {
+        writeFrameNoFlush(out, payload);
+        out.flush();
+    }
+
+    /**
+     * Writes a single framed message (4-byte length prefix + payload) <em>without</em> flushing.
+     * <p>
+     * This is the write-coalescing primitive: a writer loop calls this for every frame in a batch
+     * and then issues exactly one {@link #flush(DataOutputStream)} at the end. When the underlying
+     * {@code out} is layered over a {@link java.io.BufferedOutputStream}, the per-frame bytes
+     * accumulate in the buffer and a single flush at the batch boundary turns many small frames into
+     * one (or few) write syscalls / TCP segments. At low load a "batch" is just one frame, so the
+     * behaviour is identical to {@link #writeFrame} (no added latency).
+     *
+     * @param out     the target stream (should be buffered for coalescing to pay off)
+     * @param payload the bare payload bytes (already serialized, no prefix)
+     * @throws IOException if writing fails
+     */
+    public static void writeFrameNoFlush(DataOutputStream out, byte[] payload) throws IOException {
         out.writeInt(payload.length);
         out.write(payload);
+    }
+
+    /**
+     * Flushes any frames buffered by {@link #writeFrameNoFlush}. Call exactly once at the end of a
+     * write batch so the coalesced bytes are pushed to the socket in a single syscall.
+     *
+     * @param out the target stream
+     * @throws IOException if flushing fails
+     */
+    public static void flush(DataOutputStream out) throws IOException {
         out.flush();
     }
 

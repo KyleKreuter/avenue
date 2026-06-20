@@ -917,6 +917,8 @@ public class ClusterManager implements ClusterForwarder {
                 config.getClusterHeartbeatIntervalMs(),
                 tuning.ackIntervalMs(),
                 tuning.strictOrdering(),
+                tuning.batchMaxFrames(),
+                tuning.batchMaxDelayMicros(),
                 topicSubscriptionHandler,
                 receiver,
                 target.buffer,

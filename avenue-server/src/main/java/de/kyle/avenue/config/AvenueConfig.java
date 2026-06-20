@@ -38,6 +38,18 @@ public class AvenueConfig {
      */
     private final boolean serverTcpNoDelay;
 
+    /**
+     * Max frames the per-client outbound writer coalesces into a single buffered flush
+     * (write-batching). Defaults to {@value ClusterTuning#DEFAULT_BATCH_MAX_FRAMES}; {@code 1}
+     * reproduces the legacy per-frame flush. Opportunistic: at low load a batch is a single frame,
+     * so there is no added latency. Direct-value (test) constructors use the default; only the
+     * file/{@code .env} constructor reads {@code server.batch.max-frames}.
+     */
+    private final int serverBatchMaxFrames;
+
+    /** Default for {@link #serverBatchMaxFrames}, mirroring the cluster writer's batch cap. */
+    public static final int DEFAULT_SERVER_BATCH_MAX_FRAMES = 64;
+
     // -------------------------------------------------------------------------
     // Cluster fields (all optional; cluster is disabled by default)
     // -------------------------------------------------------------------------
@@ -311,8 +323,9 @@ public class AvenueConfig {
         this.outboundQueueCapacity = outboundQueueCapacity;
         this.outboundQueueOfferTimeoutMillis = outboundQueueOfferTimeoutMillis;
         // Direct-value (test) callers get the production default; the file/.env constructor sets
-        // this field itself from the server.tcp-nodelay property.
+        // these fields itself from the server.tcp-nodelay / server.batch.max-frames properties.
         this.serverTcpNoDelay = true;
+        this.serverBatchMaxFrames = DEFAULT_SERVER_BATCH_MAX_FRAMES;
         this.clusterEnabled = clusterEnabled;
         this.nodeId = nodeId;
         this.clusterPort = clusterPort;
@@ -367,6 +380,14 @@ public class AvenueConfig {
                 dotenv.get("SERVER_TCP_NODELAY",
                         properties.getProperty("server.tcp-nodelay", "true"))
         );
+        // Write-batching: how many frames the per-client outbound writer coalesces into one flush.
+        int parsedServerBatchMaxFrames = Integer.parseInt(
+                dotenv.get("SERVER_BATCH_MAX_FRAMES",
+                        properties.getProperty("server.batch.max-frames",
+                                Integer.toString(DEFAULT_SERVER_BATCH_MAX_FRAMES)))
+        );
+        serverBatchMaxFrames = parsedServerBatchMaxFrames > 0
+                ? parsedServerBatchMaxFrames : DEFAULT_SERVER_BATCH_MAX_FRAMES;
 
         // Cluster settings — all optional, clustering is off by default.
         clusterEnabled = Boolean.parseBoolean(
@@ -474,13 +495,25 @@ public class AvenueConfig {
                         properties.getProperty("cluster.packet.max-size",
                                 Integer.toString(ClusterTuning.DEFAULT_CLUSTER_PACKET_MAX_SIZE)))
         );
+        // Write-batching: cluster writer coalescing cap + optional linger window.
+        int batchMaxFrames = Integer.parseInt(
+                dotenv.get("CLUSTER_BATCH_MAX_FRAMES",
+                        properties.getProperty("cluster.batch.max-frames",
+                                Integer.toString(ClusterTuning.DEFAULT_BATCH_MAX_FRAMES)))
+        );
+        long batchMaxDelayMicros = Long.parseLong(
+                dotenv.get("CLUSTER_BATCH_MAX_DELAY_MICROS",
+                        properties.getProperty("cluster.batch.max-delay-micros",
+                                Long.toString(ClusterTuning.DEFAULT_BATCH_MAX_DELAY_MICROS)))
+        );
         clusterTuning = new ClusterTuning(
                 replayCapacity, replayPolicy, replayOfferTimeoutMs,
                 ackIntervalMs, strictOrdering, originExpiryMs,
                 interestSyncIntervalMs, interestBroadcastGraceMs,
                 swimProbeIntervalMs, swimProbeTimeoutMs, swimIndirectProbeCount,
                 swimSuspicionTimeoutMs, swimGossipFanout, swimDeadMemberTimeoutMs,
-                advertisedHost, clusterPacketMaxSize);
+                advertisedHost, clusterPacketMaxSize,
+                batchMaxFrames, batchMaxDelayMicros);
 
         // Phase F — admin HTTP introspection (read-only). Disabled by default, loopback bind.
         boolean adminEnabled = Boolean.parseBoolean(
@@ -632,6 +665,15 @@ public class AvenueConfig {
      */
     public boolean isServerTcpNoDelay() {
         return serverTcpNoDelay;
+    }
+
+    /**
+     * Max frames the per-client outbound writer coalesces into a single buffered flush
+     * (write-batching). Defaults to {@value #DEFAULT_SERVER_BATCH_MAX_FRAMES}; {@code 1} reproduces
+     * the legacy per-frame flush.
+     */
+    public int getServerBatchMaxFrames() {
+        return serverBatchMaxFrames;
     }
 
     // -------------------------------------------------------------------------

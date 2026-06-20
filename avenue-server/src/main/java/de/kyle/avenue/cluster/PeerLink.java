@@ -24,6 +24,7 @@ import de.kyle.avenue.serialization.WireCodec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
@@ -84,6 +85,13 @@ public class PeerLink {
     private static final Logger log = LoggerFactory.getLogger(PeerLink.class);
 
     private static final int CONTROL_QUEUE_CAPACITY = 1024;
+
+    /**
+     * Size of the {@link BufferedOutputStream} the writer flushes once per batch. Large enough that a
+     * full coalesced batch of small publish/control frames accumulates without an intermediate
+     * auto-flush, so the batch turns into one (or few) write syscalls / TCP segments.
+     */
+    private static final int OUTPUT_BUFFER_BYTES = 64 * 1024;
 
     /**
      * Idle ingest-poll budget for the writer loop. Kept small so a control frame the reader enqueues
@@ -151,6 +159,10 @@ public class PeerLink {
     private final long heartbeatIntervalMs;
     private final long ackIntervalMs;
     private final boolean strictOrdering;
+    /** Max frames the writer coalesces into one flush (write-batching). 1 = legacy per-frame flush. */
+    private final int batchMaxFrames;
+    /** Optional linger window (micros) the writer parks to accumulate more frames. 0 = opportunistic. */
+    private final long batchMaxDelayMicros;
     private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final ReceiverContext receiver;
     private final ReplayBuffer replayBuffer;
@@ -207,6 +219,8 @@ public class PeerLink {
             long heartbeatIntervalMs,
             long ackIntervalMs,
             boolean strictOrdering,
+            int batchMaxFrames,
+            long batchMaxDelayMicros,
             TopicSubscriptionHandler topicSubscriptionHandler,
             ReceiverContext receiver,
             ReplayBuffer replayBuffer,
@@ -218,7 +232,11 @@ public class PeerLink {
     ) throws IOException {
         this.socket = socket;
         this.in = new DataInputStream(socket.getInputStream());
-        this.out = new DataOutputStream(socket.getOutputStream());
+        // Write-batching: layer a BufferedOutputStream UNDER the DataOutputStream so the writer can
+        // accumulate many frames (writeFrameNoFlush) and push them with a single flush() per batch.
+        // The HMAC handshake already completed on the raw socket streams before this link was built,
+        // so the buffer cannot swallow any handshake frame.
+        this.out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), OUTPUT_BUFFER_BYTES));
         this.remoteNodeId = remoteNodeId;
         this.localNodeId = localNodeId;
         this.localEpoch = localEpoch;
@@ -226,6 +244,8 @@ public class PeerLink {
         this.heartbeatIntervalMs = heartbeatIntervalMs;
         this.ackIntervalMs = ackIntervalMs;
         this.strictOrdering = strictOrdering;
+        this.batchMaxFrames = batchMaxFrames > 0 ? batchMaxFrames : 1;
+        this.batchMaxDelayMicros = Math.max(0L, batchMaxDelayMicros);
         this.topicSubscriptionHandler = topicSubscriptionHandler;
         this.receiver = receiver;
         this.replayBuffer = replayBuffer;
@@ -608,37 +628,66 @@ public class PeerLink {
     private void writerLoop() {
         try {
             while (running.get()) {
+                int framesWritten = 0;
+
                 // Control / backfill frames first (low rate, includes ordering-critical replays).
+                // Drain everything currently queued — batchMaxFrames caps how many we coalesce before
+                // forcing a flush, so a huge backfill burst still flushes in bounded chunks.
                 OutboundItem control;
-                boolean didWork = false;
-                while ((control = controlQueue.poll()) != null) {
-                    writeItem(control);
-                    didWork = true;
+                while (framesWritten < batchMaxFrames && (control = controlQueue.poll()) != null) {
+                    writeFrameNoFlush(control);
+                    framesWritten++;
                 }
-                // Then one live publish: append to the replay buffer (may block under backpressure
-                // — this is the ONLY place blocking is allowed) and send if it was buffered. The
-                // entry's seq() is the per-link linkSeq assigned by the sender for THIS target.
+                boolean didWork = framesWritten > 0;
+
+                // Then live publishes: append to the replay buffer (may block under backpressure —
+                // this is the ONLY place blocking is allowed) and write if buffered. The entry's
+                // seq() is the per-link linkSeq assigned by the sender for THIS target.
                 //
-                // Idle wait budget: keep it short (CONTROL_IDLE_POLL_MS) so a control frame enqueued
-                // by the reader thread — most importantly a time-sensitive SWIM ack — is flushed
-                // promptly rather than waiting out a long ingest poll. This bounds SWIM probe RTT well
-                // under the probe timeout without spinning (a virtual thread parking briefly is cheap).
-                ReplayBuffer.Entry entry = ingestQueue.poll(didWork ? 0 : CONTROL_IDLE_POLL_MS, TimeUnit.MILLISECONDS);
+                // Idle wait budget: keep the FIRST poll short (CONTROL_IDLE_POLL_MS) so a control
+                // frame enqueued by the reader thread — most importantly a time-sensitive SWIM ack —
+                // is flushed promptly rather than waiting out a long ingest poll. This bounds SWIM
+                // probe RTT well under the probe timeout without spinning.
+                ReplayBuffer.Entry entry =
+                        ingestQueue.poll(didWork ? 0 : CONTROL_IDLE_POLL_MS, TimeUnit.MILLISECONDS);
                 if (entry != null) {
-                    if (replayBuffer.append(entry.seq(), entry.payload())) {
-                        writeItem(new OutboundItem.PreSerializedFrame(entry.payload()));
-                    } else {
-                        // Dropped under backpressure: tell the receiver to resync its contiguous
-                        // link frontier forward past the lost linkSeq so it keeps ACKing.
-                        writeItem(new OutboundItem.ControlFrame(ClusterEnvelopes.gap(
-                                localNodeId, localNodeId, localEpoch, entry.seq() + 1)));
+                    // First publish of the batch: this is the ONLY append allowed to BLOCK (ring full
+                    // under backpressure). Control frames were just drained above, so if we block here
+                    // they have already been written and will be flushed when the block resolves —
+                    // crucially the writer does NOT stay blocked across multiple appends, so heartbeats
+                    // and ACKs enqueued during a backpressure burst still get a turn each loop.
+                    if (framesWritten > 0 && replayBuffer.isFull()) {
+                        // Flush the control frames we hold before blocking, so the peer sees our
+                        // heartbeat/ACK (and any backfill) instead of it sitting in the buffer.
+                        flushOut();
+                        framesWritten = 0;
                     }
+                    framesWritten += writeAppend(entry);
+                    // Opportunistic coalescing: pull more publishes ONLY while the ring has headroom
+                    // (non-blocking appends), so we never monopolize the writer across a blocking
+                    // append. At low load this adds a few frames per flush; under backpressure it
+                    // degrades to one publish per loop, exactly the legacy ACK-tight cadence.
+                    framesWritten = drainPublishBatch(framesWritten);
+                }
+
+                // Exactly one flush per batch: at low load the batch is a single frame (identical to
+                // the legacy per-frame flush, no added latency); under load one flush amortizes many
+                // frames. An empty iteration (idle poll timed out) leaves the buffer empty, so a lone
+                // heartbeat/ack enqueued next iteration still goes out promptly.
+                if (framesWritten > 0) {
+                    flushOut();
                 }
             }
-            // Drain any remaining control frames after stop is signalled.
+            // Drain any remaining control frames after stop is signalled, then flush so nothing is
+            // left buffered on shutdown.
+            int tail = 0;
             OutboundItem remaining;
             while ((remaining = controlQueue.poll()) != null) {
-                writeItem(remaining);
+                writeFrameNoFlush(remaining);
+                tail++;
+            }
+            if (tail > 0) {
+                flushOut();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -651,13 +700,74 @@ public class PeerLink {
         }
     }
 
-    private void writeItem(OutboundItem item) throws IOException {
+    /**
+     * Opportunistically coalesces additional publishes into the current batch, but ONLY while the
+     * replay ring has headroom so every append here is non-blocking. The moment the ring is full (the
+     * next append would block) it stops, so the writer returns to the top of the loop to drain control
+     * frames (heartbeats / ACKs) and perform the single blocking append there. This is what keeps a
+     * sustained backpressure burst from starving heartbeats — under backpressure the batch is just one
+     * publish per loop (the legacy cadence); with ring headroom it sweeps up to {@link #batchMaxFrames}
+     * already-queued frames into one flush. FIFO order and the replay-buffer/linkSeq bookkeeping are
+     * preserved exactly. With a positive {@link #batchMaxDelayMicros} linger it parks briefly for a few
+     * more frames; the default {@code 0} sweeps only what is already present (no added latency).
+     */
+    private int drainPublishBatch(int framesWritten) throws InterruptedException, IOException {
+        long lingerDeadlineNanos = batchMaxDelayMicros > 0
+                ? System.nanoTime() + batchMaxDelayMicros * 1_000L : 0L;
+        while (framesWritten < batchMaxFrames && !replayBuffer.isFull()) {
+            ReplayBuffer.Entry next = ingestQueue.poll();
+            if (next == null) {
+                if (lingerDeadlineNanos == 0L) {
+                    break; // opportunistic: nothing else immediately available
+                }
+                long remaining = lingerDeadlineNanos - System.nanoTime();
+                if (remaining <= 0) {
+                    break;
+                }
+                java.util.concurrent.locks.LockSupport.parkNanos(remaining);
+                next = ingestQueue.poll();
+                if (next == null) {
+                    break;
+                }
+            }
+            framesWritten += writeAppend(next);
+        }
+        return framesWritten;
+    }
+
+    /**
+     * Appends a publish entry to the replay buffer and writes its frame (no flush), returning the
+     * number of frames written (always 1). {@link ReplayBuffer#append} may BLOCK when the ring is full
+     * — callers must therefore only invoke this when they have already flushed any pending control
+     * frames (so a heartbeat/ACK is not held behind the block) and are prepared for the writer to
+     * park. On a backpressure drop it writes a gap control frame so the receiver resyncs its contiguous
+     * link frontier past the lost linkSeq — identical bookkeeping to the pre-batching path.
+     */
+    private int writeAppend(ReplayBuffer.Entry entry) throws IOException {
+        if (replayBuffer.append(entry.seq(), entry.payload())) {
+            writeFrameNoFlush(new OutboundItem.PreSerializedFrame(entry.payload()));
+        } else {
+            writeFrameNoFlush(new OutboundItem.ControlFrame(ClusterEnvelopes.gap(
+                    localNodeId, localNodeId, localEpoch, entry.seq() + 1)));
+        }
+        return 1;
+    }
+
+    /** Writes a single framed item into the buffered stream WITHOUT flushing (write-batching). */
+    private void writeFrameNoFlush(OutboundItem item) throws IOException {
         byte[] payload = switch (item) {
             case OutboundItem.PreSerializedFrame frame -> frame.payload();
             case OutboundItem.ControlFrame control -> serializeEnvelope(control.envelope());
         };
         synchronized (out) {
-            PacketFraming.writeFrame(out, payload);
+            PacketFraming.writeFrameNoFlush(out, payload);
+        }
+    }
+
+    /** Flushes the buffered output stream once at a batch boundary. */
+    private void flushOut() throws IOException {
+        synchronized (out) {
+            PacketFraming.flush(out);
         }
     }
 

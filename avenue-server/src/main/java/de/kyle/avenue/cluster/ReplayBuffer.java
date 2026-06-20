@@ -249,6 +249,23 @@ public final class ReplayBuffer {
         }
     }
 
+    /**
+     * Returns {@code true} if the ring is currently full, i.e. the next {@link #append} under the
+     * BLOCK policy would block waiting for an ACK to free the head. The cluster writer probes this
+     * BEFORE appending so it can flush its coalesced output buffer first (making in-flight frames
+     * visible so the peer can ACK and drain the ring) instead of blocking with frames stuck unflushed.
+     * Non-blocking snapshot; the result may change immediately after return, which is fine — the
+     * append itself still applies the authoritative full check under the lock.
+     */
+    public boolean isFull() {
+        lock.lock();
+        try {
+            return isFullLocked();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** Current number of buffered (un-acked) entries. Visible for tests and the depth gauge. */
     public int size() {
         lock.lock();

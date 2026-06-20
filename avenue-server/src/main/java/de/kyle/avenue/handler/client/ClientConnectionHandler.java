@@ -10,6 +10,7 @@ import de.kyle.avenue.serialization.WireCodec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -17,6 +18,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -47,6 +50,12 @@ import java.util.concurrent.TimeUnit;
 public class ClientConnectionHandler implements Runnable {
     private static final Logger log = LoggerFactory.getLogger(ClientConnectionHandler.class);
 
+    /**
+     * Size of the {@link BufferedOutputStream} the writer flushes once per batch. Large enough that a
+     * full coalesced batch of small fan-out frames accumulates without an intermediate auto-flush.
+     */
+    private static final int OUTPUT_BUFFER_BYTES = 64 * 1024;
+
     private final Socket client;
     private final InputStream inputStream;
     private final OutputStream outputStream;
@@ -62,6 +71,8 @@ public class ClientConnectionHandler implements Runnable {
     private final long offerTimeoutMillis;
     private final BackpressurePolicy backpressurePolicy;
     private final long idleTimeoutMillis;
+    /** Max frames the writer coalesces into one buffered flush (write-batching). 1 = legacy flush-per-frame. */
+    private final int batchMaxFrames;
     private Thread writerThread;
 
     private volatile boolean running;
@@ -95,7 +106,11 @@ public class ClientConnectionHandler implements Runnable {
         this.client = client;
         this.inputStream = client.getInputStream();
         this.outputStream = client.getOutputStream();
-        this.dataOutputStream = new DataOutputStream(this.outputStream);
+        // Write-batching: layer a BufferedOutputStream UNDER the DataOutputStream so the writer can
+        // accumulate many fan-out frames (writeFrameNoFlush) and push them with a single flush() per
+        // batch — far fewer write syscalls / TCP segments under load.
+        this.dataOutputStream =
+                new DataOutputStream(new BufferedOutputStream(this.outputStream, OUTPUT_BUFFER_BYTES));
         this.running = true;
         this.inboundPacketHandler = inboundPacketHandler;
         this.avenueConfig = avenueConfig;
@@ -106,6 +121,7 @@ public class ClientConnectionHandler implements Runnable {
         this.offerTimeoutMillis = avenueConfig.getOutboundQueueOfferTimeoutMillis();
         this.backpressurePolicy = avenueConfig.getBackpressurePolicy();
         this.idleTimeoutMillis = avenueConfig.getClientIdleTimeoutMillis();
+        this.batchMaxFrames = Math.max(1, avenueConfig.getServerBatchMaxFrames());
     }
 
     private void listen() throws IOException {
@@ -152,15 +168,31 @@ public class ClientConnectionHandler implements Runnable {
      * first write error.
      */
     private void writerLoop() {
+        // Reused per-batch scratch list so a single iteration coalesces every already-queued frame
+        // into one buffered flush (write-batching). batchMaxFrames - 1 because the blocking poll
+        // already took the first frame of the batch.
+        List<ClientEnvelope> batch = new ArrayList<>(batchMaxFrames);
         try {
             while (this.running || !outboundQueue.isEmpty()) {
-                ClientEnvelope envelope = outboundQueue.poll(200, TimeUnit.MILLISECONDS);
-                if (envelope == null) {
+                ClientEnvelope first = outboundQueue.poll(200, TimeUnit.MILLISECONDS);
+                if (first == null) {
                     continue;
                 }
-                // Serialize the protobuf envelope, then prepend the 4-byte length prefix.
-                byte[] payload = WireCodec.encodeClient(envelope, avenueConfig.getPacketSize());
-                PacketFraming.writeFrame(dataOutputStream, payload);
+                // Opportunistically grab everything ALREADY waiting (FIFO, no artificial wait) so one
+                // flush amortizes the whole burst. At low load drainTo adds nothing and the batch is
+                // a single frame — identical to the legacy per-frame flush, no added latency.
+                writeFrameNoFlush(first);
+                if (batchMaxFrames > 1) {
+                    batch.clear();
+                    outboundQueue.drainTo(batch, batchMaxFrames - 1);
+                    for (ClientEnvelope envelope : batch) {
+                        writeFrameNoFlush(envelope);
+                    }
+                }
+                // Exactly one flush per batch pushes the coalesced bytes in a single syscall. When the
+                // queue is empty the buffer ends up empty, so the next lone frame still goes out
+                // promptly.
+                PacketFraming.flush(dataOutputStream);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -169,6 +201,12 @@ public class ClientConnectionHandler implements Runnable {
         } finally {
             shutdown();
         }
+    }
+
+    /** Serializes one envelope and writes its framed bytes into the buffered stream WITHOUT flushing. */
+    private void writeFrameNoFlush(ClientEnvelope envelope) throws IOException {
+        byte[] payload = WireCodec.encodeClient(envelope, avenueConfig.getPacketSize());
+        PacketFraming.writeFrameNoFlush(dataOutputStream, payload);
     }
 
     /**
