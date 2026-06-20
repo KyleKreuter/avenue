@@ -145,6 +145,16 @@ public class AvenueClient {
                     continue;
                 }
 
+                if (name.equals("SubscribeAckOutboundPacket")) {
+                    // Server confirmed a subscription is now active. Treat it as a positive
+                    // signal: clear the topic from the pending set so it is not re-sent on the
+                    // next flush. This must never break the listen loop.
+                    String topic = normalizeTopic(body.getString("topic"));
+                    pendingSubscriptions.remove(topic);
+                    log.debug("Subscription for topic '{}' acknowledged by server", topic);
+                    continue;
+                }
+
                 if (name.equals("PublishMessageOutboundPacket")) {
                     String topic = normalizeTopic(header.getString("topic"));
                     TopicListener topicListener = topicListenerMap.get(topic);

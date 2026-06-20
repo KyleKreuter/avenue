@@ -27,8 +27,12 @@ public class TopicSubscriptionHandler {
     /**
      * Single source of truth for topic-key normalization. Must be used by every method that
      * reads or writes {@link #topicSubscriptions} so that keys never diverge.
+     * <p>
+     * Exposed publicly so that callers (e.g. the subscribe acknowledgment) can echo back the
+     * exact normalized key the subscription was registered under, keeping client and server
+     * in agreement on the topic name.
      */
-    private String normalize(String topic) {
+    public String normalize(String topic) {
         return topic.toLowerCase(Locale.ROOT).strip();
     }
 

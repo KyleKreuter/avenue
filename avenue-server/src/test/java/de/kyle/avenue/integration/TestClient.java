@@ -14,7 +14,11 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
@@ -28,8 +32,12 @@ import java.util.concurrent.TimeUnit;
  * singleton it cannot represent two independent clients in the same JVM, which the fan-out
  * tests require.
  * <p>
- * A background reader thread drains inbound frames into a {@link BlockingQueue} so tests can
- * await delivery with a timeout instead of sleeping.
+ * A background reader thread drains inbound frames. It routes packets by {@code header.name}:
+ * {@code SubscribeAckOutboundPacket}s are turned into per-topic signals (so {@link #subscribe}
+ * can block until the server confirms the subscription is registered), while every other
+ * packet goes into a {@link BlockingQueue} that tests can await with a timeout instead of
+ * sleeping. This makes the subscribe-then-publish path deterministic: a publish only happens
+ * after the subscription is acknowledged.
  */
 final class TestClient implements Closeable {
 
@@ -38,6 +46,12 @@ final class TestClient implements Closeable {
     private final DataInputStream in;
     private final int maxPacketSize;
     private final BlockingQueue<JSONObject> inbound = new LinkedBlockingQueue<>();
+    /**
+     * One latch per (normalized) topic that the client has subscribed to. The reader counts
+     * the latch down when the matching {@code SubscribeAckOutboundPacket} arrives, releasing a
+     * {@link #subscribe} call that is blocking on it.
+     */
+    private final Map<String, CountDownLatch> subscribeAckLatches = new ConcurrentHashMap<>();
     private final Thread readerThread;
     private volatile boolean running = true;
 
@@ -56,11 +70,30 @@ final class TestClient implements Closeable {
             while (running) {
                 byte[] frame = PacketFraming.readFrame(in, maxPacketSize);
                 JSONObject envelope = new JSONObject(new String(frame, StandardCharsets.UTF_8));
+                String name = envelope.getJSONObject("header").optString("name");
+                if ("SubscribeAckOutboundPacket".equals(name)) {
+                    // Route subscribe acks to their per-topic latch instead of the generic
+                    // queue, so they can release a blocking subscribe() without being consumed
+                    // by an unrelated awaitPacket() call.
+                    String topic = normalize(envelope.getJSONObject("body").getString("topic"));
+                    signalSubscribeAck(topic);
+                    continue;
+                }
                 inbound.offer(envelope);
             }
         } catch (IOException e) {
             // Expected on socket close / server shutdown; stop reading silently.
         }
+    }
+
+    /** Counts down (creating if necessary) the latch for the given normalized topic. */
+    private void signalSubscribeAck(String topic) {
+        subscribeAckLatches.computeIfAbsent(topic, key -> new CountDownLatch(1)).countDown();
+    }
+
+    /** Normalizes a topic the same way the server does, so ack correlation always agrees. */
+    private static String normalize(String topic) {
+        return topic.toLowerCase(Locale.ROOT).strip();
     }
 
     private void writeFrame(Packet packet) throws IOException {
@@ -87,6 +120,29 @@ final class TestClient implements Closeable {
         return response.getJSONObject("body").getString("token");
     }
 
+    /**
+     * Subscribes to a topic and blocks until the server acknowledges the subscription with a
+     * {@link de.kyle.avenue.packet.subscribe.SubscribeAckOutboundPacket}, or the timeout
+     * elapses. Blocking on the ack guarantees the subscription is registered server-side
+     * before the call returns, so a subsequent publish can never race ahead of it.
+     *
+     * @throws IOException if the ack does not arrive within the timeout
+     */
+    void subscribe(String topic, String token, long timeout, TimeUnit unit) throws IOException, InterruptedException {
+        String normalized = normalize(topic);
+        // Register the latch BEFORE sending so a fast ack cannot arrive before we are ready
+        // to observe it.
+        CountDownLatch latch = subscribeAckLatches.computeIfAbsent(normalized, key -> new CountDownLatch(1));
+        writeFrame(new SubscribeInboundPacket(topic, token));
+        if (!latch.await(timeout, unit)) {
+            throw new IOException("No subscribe acknowledgment received for topic '" + topic + "' within timeout");
+        }
+    }
+
+    /**
+     * Fire-and-forget subscribe used by negative tests that expect the server to drop the
+     * connection (and therefore never send an ack).
+     */
     void subscribe(String topic, String token) throws IOException {
         writeFrame(new SubscribeInboundPacket(topic, token));
     }

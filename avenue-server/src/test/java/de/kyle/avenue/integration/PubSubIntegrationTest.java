@@ -80,7 +80,10 @@ class PubSubIntegrationTest {
         try (TestClient subscriber = connectAuthedClient();
              TestClient publisher = connectAuthedClient()) {
 
-            subscriber.subscribe("news", TOKEN);
+            // Block until the server acknowledges the subscription, then publish. This makes
+            // delivery deterministic: registration happened-before ack-receipt happened-before
+            // publish, so the publish cannot race ahead of the subscription.
+            subscriber.subscribe("news", TOKEN, TIMEOUT, UNIT);
             publisher.publish("news", "hello-world", "publisher-1", TOKEN);
 
             JSONObject received = subscriber.awaitPacket("PublishMessageOutboundPacket", TIMEOUT, UNIT);
@@ -105,7 +108,7 @@ class PubSubIntegrationTest {
 
             // Server is still healthy: a real subscriber on a new topic still works afterwards.
             try (TestClient subscriber = connectAuthedClient()) {
-                subscriber.subscribe("live", TOKEN);
+                subscriber.subscribe("live", TOKEN, TIMEOUT, UNIT);
                 publisher.publish("live", "still-alive", "publisher-1", TOKEN);
                 Assertions.assertNotNull(
                         subscriber.awaitPacket("PublishMessageOutboundPacket", TIMEOUT, UNIT),
@@ -120,7 +123,9 @@ class PubSubIntegrationTest {
              TestClient publisher = connectAuthedClient()) {
 
             // Subscribe with mixed case, publish with lower case -> normalization must match.
-            subscriber.subscribe("News", TOKEN);
+            // The blocking subscribe waits for the ack (whose topic is the normalized key), so
+            // the subscription is guaranteed registered before the publish is sent.
+            subscriber.subscribe("News", TOKEN, TIMEOUT, UNIT);
             publisher.publish("news", "case-test", "publisher-1", TOKEN);
 
             JSONObject received = subscriber.awaitPacket("PublishMessageOutboundPacket", TIMEOUT, UNIT);
@@ -135,8 +140,10 @@ class PubSubIntegrationTest {
              TestClient subscriberB = connectAuthedClient();
              TestClient publisher = connectAuthedClient()) {
 
-            subscriberA.subscribe("sports", TOKEN);
-            subscriberB.subscribe("sports", TOKEN);
+            // Both subscriptions are acknowledged before the publish, so both deliveries are
+            // guaranteed.
+            subscriberA.subscribe("sports", TOKEN, TIMEOUT, UNIT);
+            subscriberB.subscribe("sports", TOKEN, TIMEOUT, UNIT);
             publisher.publish("sports", "goal", "publisher-1", TOKEN);
 
             JSONObject a = subscriberA.awaitPacket("PublishMessageOutboundPacket", TIMEOUT, UNIT);
@@ -153,7 +160,10 @@ class PubSubIntegrationTest {
         try (TestClient subscriber = connectAuthedClient();
              TestClient badPublisher = connectAuthedClient()) {
 
-            subscriber.subscribe("secure", TOKEN);
+            // Subscribe with a valid token and wait for the ack, so the subscription is
+            // definitely registered; the negative assertion then proves the bad publish is
+            // dropped rather than merely racing the subscription.
+            subscriber.subscribe("secure", TOKEN, TIMEOUT, UNIT);
 
             // Wrong token: server's @Secured check throws -> with dropUnknown=true the offending
             // client connection is torn down and the message is never routed.
