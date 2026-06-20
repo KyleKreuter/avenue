@@ -9,6 +9,11 @@ This document describes the design as it stands after Phase F. It covers SWIM me
 at-least-once delivery, interest-based routing, the security handshake, the consistency / ordering
 guarantees, all configuration keys, the admin introspection endpoints, and the known limits.
 
+> **Wire format.** All node-to-node cluster packets (SWIM, publishes, ACK/resume/gap, interest,
+> handshake) are framed as a length-prefixed **Protobuf `ClusterEnvelope`** — see
+> [protocol.md](protocol.md). Field names in this document refer to the corresponding `cluster.proto`
+> messages.
+
 > Clustering is **off by default** (`cluster.enabled=false`). A single node runs exactly as before
 > when clustering is disabled.
 

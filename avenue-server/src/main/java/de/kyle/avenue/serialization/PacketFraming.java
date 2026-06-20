@@ -11,8 +11,10 @@ import java.io.IOException;
  * This is the single, clearly-named place where the 4-byte big-endian length prefix
  * lives. Each message on the wire is laid out as:
  * <pre>
- *   [4 bytes: int32 payload length][payload bytes (UTF-8 JSON envelope)]
+ *   [4 bytes: big-endian int32 payload length][payload bytes (Protobuf envelope)]
  * </pre>
+ * The payload is a serialized {@code ClientEnvelope} / {@code ClusterEnvelope} Protobuf message
+ * produced by {@link WireCodec} (see {@code docs/protocol.md}).
  * The {@code serialize()}/{@code deserialize()} methods deal exclusively with the bare
  * payload; framing is added/removed here so that multiple messages can be read from a
  * single connection in a loop.
