@@ -10,7 +10,6 @@ import de.kyle.avenue.metrics.AvenueMetrics;
 import de.kyle.avenue.packet.publish.PublishMessageOutboundPacket;
 import org.json.JSONObject;
 
-import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 
 /**
@@ -93,15 +92,13 @@ public class PublishMessageInboundPacketHandler implements PacketHandler {
         PublishMessageOutboundPacket outbound = new PublishMessageOutboundPacket(topic, data, source);
         executorService.submit(() -> topicSubscriptionHandler.deliverPacketToSubscribers(topic, outbound));
 
-        // Cluster forward: a unique messageId per message is generated here and passed to
-        // the forwarder so the forwarder can build the ClusterPublishPacket with the correct
-        // originNodeId (which the forwarder holds) and this messageId for dedup.
-        String messageId = UUID.randomUUID().toString();
+        // Cluster forward: the forwarder builds the ClusterPublishPacket and assigns the
+        // (originEpoch, seq) identity itself via its OriginSequencer — but only after it confirms
+        // there are peers to forward to, so a single-node deployment never burns sequence numbers.
         clusterForwarder.forward(
                 topicSubscriptionHandler.normalize(topic),
                 source,
-                data,
-                messageId
+                data
         );
     }
 }

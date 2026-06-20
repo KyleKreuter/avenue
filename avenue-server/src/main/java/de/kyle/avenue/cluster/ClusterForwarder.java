@@ -14,16 +14,18 @@ package de.kyle.avenue.cluster;
 public interface ClusterForwarder {
 
     /** No-op forwarder used when clustering is disabled. */
-    ClusterForwarder NOOP = (topic, source, data, messageId) -> { };
+    ClusterForwarder NOOP = (topic, source, data) -> { };
 
     /**
      * Forwards a locally-received publish to all connected cluster peers.
      * Implementations MUST be non-blocking; any queueing or I/O is done asynchronously.
+     * <p>
+     * The {@code (originEpoch, seq)} message identity is assigned internally by the
+     * implementation (via its {@link OriginSequencer}); callers no longer supply a messageId.
      *
-     * @param topic     normalized topic key
-     * @param source    original client-supplied source identifier
-     * @param data      message payload
-     * @param messageId per-message UUID string for deduplication
+     * @param topic  normalized topic key
+     * @param source original client-supplied source identifier
+     * @param data   message payload
      */
-    void forward(String topic, String source, String data, String messageId);
+    void forward(String topic, String source, String data);
 }
