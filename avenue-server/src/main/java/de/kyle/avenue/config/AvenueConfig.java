@@ -371,9 +371,21 @@ public class AvenueConfig {
                         properties.getProperty("cluster.origin.expiry-ms",
                                 Long.toString(ClusterTuning.DEFAULT_ORIGIN_EXPIRY_MS)))
         );
+        // Phase D — interest-based routing tuning.
+        long interestSyncIntervalMs = Long.parseLong(
+                dotenv.get("CLUSTER_INTEREST_SYNC_INTERVAL_MS",
+                        properties.getProperty("cluster.interest.sync-interval-ms",
+                                Long.toString(ClusterTuning.DEFAULT_INTEREST_SYNC_INTERVAL_MS)))
+        );
+        long interestBroadcastGraceMs = Long.parseLong(
+                dotenv.get("CLUSTER_INTEREST_BROADCAST_GRACE_MS",
+                        properties.getProperty("cluster.interest.broadcast-grace-ms",
+                                Long.toString(ClusterTuning.DEFAULT_INTEREST_BROADCAST_GRACE_MS)))
+        );
         clusterTuning = new ClusterTuning(
                 replayCapacity, replayPolicy, replayOfferTimeoutMs,
-                ackIntervalMs, strictOrdering, originExpiryMs);
+                ackIntervalMs, strictOrdering, originExpiryMs,
+                interestSyncIntervalMs, interestBroadcastGraceMs);
 
         // Wave 5 — Security & Ops settings (all optional, safe defaults).
         clientIdleTimeoutMillis = Long.parseLong(

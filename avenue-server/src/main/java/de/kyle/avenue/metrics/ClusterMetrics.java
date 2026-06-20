@@ -27,10 +27,23 @@ public final class ClusterMetrics {
     private final AtomicLong acksSent = new AtomicLong();
     private final AtomicLong acksReceived = new AtomicLong();
 
+    // Phase D — interest-based routing counters.
+    /** Interest deltas + full-syncs this node sent to peers. */
+    private final AtomicLong interestUpdatesSent = new AtomicLong();
+    /** Interest deltas + full-syncs this node received and applied/considered from peers. */
+    private final AtomicLong interestUpdatesReceived = new AtomicLong();
+    /**
+     * Number of (publish, peer) fan-out pairs skipped because the peer was NOT interested in the
+     * topic — i.e. the direct saving from interest-based routing versus the old broadcast.
+     */
+    private final AtomicLong interestRoutedSkipped = new AtomicLong();
+
     // Gauge (current value).
     private final AtomicLong activePeerLinks = new AtomicLong();
     /** Current total depth of all per-target replay buffers (sum of un-acked entries). */
     private final AtomicLong replayBufferDepth = new AtomicLong();
+    /** Current number of topics with at least one interested remote node (routing table size). */
+    private final AtomicLong routingTableTopicCount = new AtomicLong();
 
     // ------------------------------------------------------------------
     // Counter mutations
@@ -112,6 +125,32 @@ public final class ClusterMetrics {
         replayBufferDepth.addAndGet(delta);
     }
 
+    // ------------------------------------------------------------------
+    // Phase D — interest routing mutations
+    // ------------------------------------------------------------------
+
+    /** Records that one interest update (delta or full-sync) was sent towards a peer. */
+    public void incrementInterestUpdatesSent() {
+        interestUpdatesSent.incrementAndGet();
+    }
+
+    /** Records that one interest update (delta or full-sync) was received from a peer. */
+    public void incrementInterestUpdatesReceived() {
+        interestUpdatesReceived.incrementAndGet();
+    }
+
+    /** Adds {@code n} to the interest-routed-skipped counter (publishes not sent to uninterested peers). */
+    public void addInterestRoutedSkipped(long n) {
+        if (n > 0) {
+            interestRoutedSkipped.addAndGet(n);
+        }
+    }
+
+    /** Sets the current routing-table topic-count gauge. */
+    public void setRoutingTableTopicCount(long value) {
+        routingTableTopicCount.set(value);
+    }
+
     /** Increments the active-peer-link gauge (a link was added). */
     public void incrementActivePeerLinks() {
         activePeerLinks.incrementAndGet();
@@ -172,5 +211,21 @@ public final class ClusterMetrics {
 
     public long getReplayBufferDepth() {
         return replayBufferDepth.get();
+    }
+
+    public long getInterestUpdatesSent() {
+        return interestUpdatesSent.get();
+    }
+
+    public long getInterestUpdatesReceived() {
+        return interestUpdatesReceived.get();
+    }
+
+    public long getInterestRoutedSkipped() {
+        return interestRoutedSkipped.get();
+    }
+
+    public long getRoutingTableTopicCount() {
+        return routingTableTopicCount.get();
     }
 }

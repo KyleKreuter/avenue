@@ -131,4 +131,13 @@ public class ClusterNode {
     public de.kyle.avenue.metrics.ClusterMetrics getClusterMetrics() {
         return clusterManager.getClusterMetrics();
     }
+
+    /**
+     * @VisibleForTesting — whether this node has learned (via interest propagation) that
+     * {@code remoteNodeId} is interested in {@code topic}. Used by the Phase D interest-routing
+     * tests to await convergence deterministically.
+     */
+    public boolean knowsInterest(String remoteNodeId, String topic) {
+        return clusterManager.knowsInterest(remoteNodeId, topic);
+    }
 }
