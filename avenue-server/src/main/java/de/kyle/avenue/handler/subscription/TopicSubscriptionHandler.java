@@ -136,8 +136,39 @@ public class TopicSubscriptionHandler {
         // Encode-once: serialize the envelope a single time and share the immutable bytes with every
         // subscriber instead of re-serializing per writer.
         byte[] payload = ClientConnectionHandler.encodeForFanOut(envelope, maxSize);
-        // The concurrent set tolerates concurrent subscribe/unsubscribe during iteration.
-        // Delivery is non-blocking: each handler only enqueues onto its own outbound queue.
+        fanOut(subscribers, payload);
+    }
+
+    /**
+     * Fan-out variant for the publish hot path that takes the <em>already-serialized</em> bare
+     * payload bytes of the {@code PublishOutbound} {@link ClientEnvelope} directly, so the caller can
+     * produce them via {@link de.kyle.avenue.serialization.OutboundEncoder} without ever allocating a
+     * {@code ClientEnvelope}/{@code PublishOutbound} builder or message object.
+     * <p>
+     * Behaviour is otherwise identical to {@link #deliverToSubscribers(String, ClientEnvelope, int)}:
+     * the same immutable {@code byte[]} is shared with every subscriber (encode-once fan-out). The
+     * size guard is enforced by the caller (the encoder produces exactly-sized bytes), so it is not
+     * re-checked here.
+     *
+     * @param normalizedTopic the already-{@link #normalize(String) normalized} topic key
+     * @param payload         the bare protobuf payload bytes of the outbound envelope (no length
+     *                        prefix); must never be mutated after this call as it is shared
+     */
+    public void deliverPreSerializedToSubscribers(String normalizedTopic, byte[] payload) {
+        Set<ClientConnectionHandler> subscribers = topicSubscriptions.get(normalizedTopic);
+        if (subscribers == null || subscribers.isEmpty()) {
+            log.warn("Packet was not delivered to other clients because no subscriptions are registered");
+            return;
+        }
+        fanOut(subscribers, payload);
+    }
+
+    /**
+     * Shared fan-out tail: hand the same immutable bytes to every subscriber. The concurrent set
+     * tolerates concurrent subscribe/unsubscribe during iteration; delivery is non-blocking as each
+     * handler only enqueues onto its own outbound queue.
+     */
+    private static void fanOut(Set<ClientConnectionHandler> subscribers, byte[] payload) {
         for (ClientConnectionHandler clientConnectionHandler : subscribers) {
             clientConnectionHandler.enqueuePreSerialized(payload);
         }
