@@ -9,7 +9,7 @@ import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.AvenueMetrics;
 import de.kyle.avenue.proto.ClientEnvelope;
 import de.kyle.avenue.proto.PublishInbound;
-import de.kyle.avenue.serialization.ClientEnvelopes;
+import de.kyle.avenue.serialization.OutboundEncoder;
 
 import java.util.concurrent.ExecutorService;
 
@@ -139,21 +139,24 @@ public class PublishMessageInboundPacketHandler implements PacketHandler {
         // and once for forward). Saves one toLowerCase+strip String allocation per publish.
         String normalizedTopic = topicSubscriptionHandler.normalize(topic);
 
-        // Local delivery. The outbound envelope carries the RAW topic exactly as before (only the
-        // lookup key is normalized), so the bytes delivered to subscribers are byte-for-byte
-        // identical to the pre-optimization path. It is serialized exactly once inside
-        // deliverToSubscribers (encode-once fan-out) and the same bytes are shared with every
-        // subscriber.
-        ClientEnvelope outbound = ClientEnvelopes.publishOutbound(topic, source, data);
+        // Local delivery. DIRECT ENCODE: produce the bare protobuf payload of the outbound
+        // PublishOutbound envelope straight into a single byte[] via the CodedOutputStream-based
+        // OutboundEncoder — no per-publish ClientEnvelope/PublishOutbound builder or message object is
+        // allocated (that builder/message graph dominated server allocation under load; see JFR). The
+        // outbound frame carries the RAW topic exactly as before (only the lookup key is normalized),
+        // so the bytes delivered to subscribers are byte-for-byte identical to the builder path — the
+        // OutboundEncoderTest guardrail asserts this wire equality. The same immutable byte[] is shared
+        // with every subscriber (encode-once fan-out).
+        byte[] outboundFrame = OutboundEncoder.encodePublishOutbound(topic, source, data);
 
         // Inline delivery: run the fan-out directly on this reader thread for the normal case, saving
         // a task allocation and a thread hop per publish. Only when the subscriber count is large
         // enough to risk monopolizing the reader thread do we hand the fan-out to the executor.
         if (topicSubscriptionHandler.subscriberCount(normalizedTopic) > inlineDeliveryMaxFanout) {
             executorService.submit(() ->
-                    topicSubscriptionHandler.deliverToSubscribers(normalizedTopic, outbound, packetSize));
+                    topicSubscriptionHandler.deliverPreSerializedToSubscribers(normalizedTopic, outboundFrame));
         } else {
-            topicSubscriptionHandler.deliverToSubscribers(normalizedTopic, outbound, packetSize);
+            topicSubscriptionHandler.deliverPreSerializedToSubscribers(normalizedTopic, outboundFrame);
         }
 
         // Cluster forward: the forwarder builds the ClusterPublishPacket and assigns the

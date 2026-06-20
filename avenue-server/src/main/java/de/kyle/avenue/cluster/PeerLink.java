@@ -19,6 +19,7 @@ import de.kyle.avenue.proto.SwimPing;
 import de.kyle.avenue.proto.SwimPingReq;
 import de.kyle.avenue.proto.SwimPingReqAck;
 import de.kyle.avenue.serialization.ClientEnvelopes;
+import de.kyle.avenue.serialization.OutboundEncoder;
 import de.kyle.avenue.serialization.PacketFraming;
 import de.kyle.avenue.serialization.WireCodec;
 import org.slf4j.Logger;
@@ -466,10 +467,15 @@ public class PeerLink {
     private void deliver(ClusterPublish packet) {
         metrics.incrementMessagesReceived();
         // Fan out to local subscribers as a client-plane PublishOutbound envelope (the same wire
-        // message a locally-published message produces).
-        ClientEnvelope outbound = ClientEnvelopes.publishOutbound(
+        // message a locally-published message produces). DIRECT ENCODE: build the bare payload bytes
+        // straight into one byte[] via OutboundEncoder — no per-message ClientEnvelope/PublishOutbound
+        // builder or message object — exactly like the local publish hot path. The bytes are
+        // wire-identical to the builder path (asserted by OutboundEncoderTest) and shared immutably
+        // across all subscribers.
+        byte[] outboundFrame = OutboundEncoder.encodePublishOutbound(
                 packet.getTopic(), packet.getSource(), packet.getData());
-        topicSubscriptionHandler.deliverPacketToSubscribers(packet.getTopic(), outbound, maxPacketSize);
+        topicSubscriptionHandler.deliverPreSerializedToSubscribers(
+                topicSubscriptionHandler.normalize(packet.getTopic()), outboundFrame);
     }
 
     /** Cumulative ACK from the remote: evict everything up to the acked {@code linkSeq} from our ring. */
