@@ -8,8 +8,6 @@ import de.kyle.avenue.handler.packet.InboundPacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.AvenueMetrics;
 import de.kyle.avenue.net.SocketFactoryProvider;
-import de.kyle.avenue.serialization.PacketDeserializer;
-import de.kyle.avenue.serialization.PacketSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,8 +48,6 @@ import java.util.concurrent.Executors;
  */
 public class SingleNodeServer {
     private static final Logger log = LoggerFactory.getLogger(SingleNodeServer.class);
-    private final PacketDeserializer packetDeserializer;
-    private final PacketSerializer packetSerializer;
     private final InboundPacketHandler inboundPacketHandler;
     private final ExecutorService executorService;
     private final TopicSubscriptionHandler topicSubscriptionHandler;
@@ -107,8 +103,6 @@ public class SingleNodeServer {
         this.topicSubscriptionHandler = topicSubscriptionHandler;
         this.topicSubscriptionHandler.setMetrics(this.metrics);
         this.executorService = Executors.newVirtualThreadPerTaskExecutor();
-        this.packetDeserializer = new PacketDeserializer(this.avenueConfig);
-        this.packetSerializer = new PacketSerializer(this.avenueConfig);
         this.inboundPacketHandler = new InboundPacketHandler(
                 authenticationTokenHandler,
                 topicSubscriptionHandler,
@@ -167,8 +161,6 @@ public class SingleNodeServer {
                     }
                     ClientConnectionHandler clientConnectionHandler = new ClientConnectionHandler(
                             client,
-                            packetDeserializer,
-                            packetSerializer,
                             inboundPacketHandler,
                             avenueConfig,
                             topicSubscriptionHandler,

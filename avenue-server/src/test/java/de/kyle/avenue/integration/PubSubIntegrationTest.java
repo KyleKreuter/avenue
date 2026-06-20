@@ -195,6 +195,24 @@ class PubSubIntegrationTest {
     }
 
     @Test
+    void publish_with_empty_topic_is_rejected_and_not_delivered() throws Exception {
+        // After the protobuf cutover a missing topic is represented as the proto3 default empty
+        // string. The typed dispatch gate must treat "" exactly like the old "missing topic" case:
+        // reject the publish (and, with dropUnknown=true, drop the offender) so nothing is routed.
+        try (TestClient subscriber = connectAuthedClient();
+             TestClient badPublisher = connectAuthedClient()) {
+
+            subscriber.subscribe("topicful", TOKEN, TIMEOUT, UNIT);
+            // Valid token, but empty topic -> must be rejected by the @TopicHandler-equivalent gate.
+            badPublisher.publish("", "should-not-arrive", "attacker", TOKEN);
+
+            Assertions.assertTrue(
+                    subscriber.expectNoPacket("PublishMessageOutboundPacket", 1, TimeUnit.SECONDS),
+                    "A publish with an empty topic must not be delivered");
+        }
+    }
+
+    @Test
     void valid_secret_yields_configured_token() throws Exception {
         try (TestClient client = new TestClient(HOST, port, PACKET_SIZE)) {
             String token = client.authenticate(SECRET, TIMEOUT, UNIT);

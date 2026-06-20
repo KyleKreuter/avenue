@@ -3,17 +3,17 @@ package de.kyle.avenue.chaos;
 import de.kyle.avenue.cluster.ClusterNode;
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.config.ClusterTuning;
-import de.kyle.avenue.packet.auth.AuthTokenRequestInboundPacket;
-import de.kyle.avenue.packet.publish.PublishMessageInboundPacket;
-import de.kyle.avenue.packet.subscribe.SubscribeInboundPacket;
+import de.kyle.avenue.proto.AuthTokenRequest;
+import de.kyle.avenue.proto.ClientEnvelope;
+import de.kyle.avenue.proto.PublishInbound;
+import de.kyle.avenue.proto.Subscribe;
 import de.kyle.avenue.serialization.PacketFraming;
-import org.json.JSONObject;
+import de.kyle.avenue.serialization.WireCodec;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
@@ -102,7 +102,7 @@ public final class ClusterChaosSoak {
             try {
                 while (volatileFlag.get()) {
                     long seq = published.getAndIncrement();
-                    writeFrame(pubOut, new PublishMessageInboundPacket(TOPIC, Long.toString(seq), "chaos-pub", TOKEN));
+                    writeFrame(pubOut, publishEnvelope(TOPIC, Long.toString(seq), "chaos-pub", TOKEN));
                     if ((seq & 0x3FF) == 0) {
                         Thread.sleep(1); // gentle pacing so we soak, not flood
                     }
@@ -253,15 +253,21 @@ public final class ClusterChaosSoak {
     }
 
     private static void authenticate(DataOutputStream out, DataInputStream in) throws IOException {
-        writeFrame(out, new AuthTokenRequestInboundPacket(SECRET));
+        writeFrame(out, ClientEnvelope.newBuilder()
+                .setAuthRequest(AuthTokenRequest.newBuilder().setSecret(SECRET).build())
+                .build());
         PacketFraming.readFrame(in, PACKET_SIZE);
     }
 
-    private static void writeFrame(DataOutputStream out, de.kyle.avenue.packet.Packet packet) throws IOException {
-        JSONObject envelope = new JSONObject();
-        envelope.put("header", new JSONObject(new String(packet.getHeader(), StandardCharsets.UTF_8)));
-        envelope.put("body", new JSONObject(new String(packet.getBody(), StandardCharsets.UTF_8)));
-        byte[] payload = envelope.toString().getBytes(StandardCharsets.UTF_8);
+    private static ClientEnvelope publishEnvelope(String topic, String data, String source, String token) {
+        return ClientEnvelope.newBuilder()
+                .setPublishInbound(PublishInbound.newBuilder()
+                        .setTopic(topic).setData(data).setSource(source).setToken(token).build())
+                .build();
+    }
+
+    private static void writeFrame(DataOutputStream out, ClientEnvelope envelope) throws IOException {
+        byte[] payload = WireCodec.encodeClient(envelope, PACKET_SIZE);
         synchronized (out) {
             PacketFraming.writeFrame(out, payload);
         }
@@ -290,7 +296,9 @@ public final class ClusterChaosSoak {
 
         void authenticateAndSubscribe() throws IOException {
             authenticate(out, in);
-            writeFrame(out, new SubscribeInboundPacket(TOPIC, TOKEN));
+            writeFrame(out, ClientEnvelope.newBuilder()
+                    .setSubscribe(Subscribe.newBuilder().setTopic(TOPIC).setToken(TOKEN).build())
+                    .build());
             Thread reader = new Thread(this::readLoop, "chaos-sub-reader");
             reader.setDaemon(true);
             reader.start();
@@ -300,11 +308,11 @@ public final class ClusterChaosSoak {
             try {
                 while (running) {
                     byte[] frame = PacketFraming.readFrame(in, PACKET_SIZE);
-                    JSONObject env = new JSONObject(new String(frame, StandardCharsets.UTF_8));
-                    if (!"PublishMessageOutboundPacket".equals(env.getJSONObject("header").optString("name"))) {
+                    ClientEnvelope env = WireCodec.decodeClient(frame, PACKET_SIZE);
+                    if (env.getMsgCase() != ClientEnvelope.MsgCase.PUBLISH_OUTBOUND) {
                         continue;
                     }
-                    long seq = Long.parseLong(env.getJSONObject("body").optString("data"));
+                    long seq = Long.parseLong(env.getPublishOutbound().getData());
                     if (seen.putIfAbsent(seq, Boolean.TRUE) != null) {
                         duplicates.incrementAndGet();
                     }

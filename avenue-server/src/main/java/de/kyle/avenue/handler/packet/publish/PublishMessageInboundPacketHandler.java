@@ -1,19 +1,18 @@
 package de.kyle.avenue.handler.packet.publish;
 
-import de.kyle.avenue.annotation.Secured;
-import de.kyle.avenue.annotation.TopicHandler;
 import de.kyle.avenue.cluster.ClusterForwarder;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.handler.packet.PacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.AvenueMetrics;
-import de.kyle.avenue.packet.publish.PublishMessageOutboundPacket;
-import org.json.JSONObject;
+import de.kyle.avenue.proto.ClientEnvelope;
+import de.kyle.avenue.proto.PublishInbound;
+import de.kyle.avenue.serialization.ClientEnvelopes;
 
 import java.util.concurrent.ExecutorService;
 
 /**
- * Handles a {@code PublishMessageInboundPacket} from a LOCAL client.
+ * Handles a {@link PublishInbound} message from a LOCAL client.
  * <p>
  * On receipt, this handler:
  * <ol>
@@ -25,6 +24,10 @@ import java.util.concurrent.ExecutorService;
  * </ol>
  * When clustering is disabled the {@link ClusterForwarder#NOOP} is supplied, keeping this
  * handler's hot path free of any conditional branching.
+ * <p>
+ * Security gating — a valid token and a non-empty topic — is performed up front by the
+ * {@link de.kyle.avenue.handler.packet.InboundPacketHandler} before this handler runs, with the
+ * same reject-and-drop outcome as the pre-protobuf {@code @Secured}/{@code @TopicHandler} checks.
  */
 public class PublishMessageInboundPacketHandler implements PacketHandler {
 
@@ -75,21 +78,19 @@ public class PublishMessageInboundPacketHandler implements PacketHandler {
     }
 
     @Override
-    @Secured
-    @TopicHandler
-    public void handle(JSONObject packet, ClientConnectionHandler clientConnectionHandler) {
-        JSONObject header = packet.getJSONObject("header");
-        JSONObject body = packet.getJSONObject("body");
+    public void handle(ClientEnvelope envelope, ClientConnectionHandler clientConnectionHandler) {
+        PublishInbound publish = envelope.getPublishInbound();
 
-        String topic = header.getString("topic");
-        String source = header.getString("source");
-        String data = body.getString("data");
+        String topic = publish.getTopic();
+        String source = publish.getSource();
+        String data = publish.getData();
 
         // Metric: a local client publish was accepted and is about to be fanned out.
         metrics.incrementMessagesPublished();
 
-        // Local delivery (async, as in the pre-clustering implementation).
-        PublishMessageOutboundPacket outbound = new PublishMessageOutboundPacket(topic, data, source);
+        // Local delivery (async, as in the pre-clustering implementation). The outbound queue now
+        // carries a fully-built PublishOutbound envelope instead of a JSON packet POJO.
+        ClientEnvelope outbound = ClientEnvelopes.publishOutbound(topic, source, data);
         executorService.submit(() -> topicSubscriptionHandler.deliverPacketToSubscribers(topic, outbound));
 
         // Cluster forward: the forwarder builds the ClusterPublishPacket and assigns the
