@@ -5,6 +5,7 @@ import de.kyle.avenue.message.Message;
 import de.kyle.avenue.packet.auth.AuthTokenRequestInboundPacket;
 import de.kyle.avenue.packet.publish.PublishMessageInboundPacket;
 import de.kyle.avenue.serialization.PacketDeserializer;
+import de.kyle.avenue.serialization.PacketFraming;
 import de.kyle.avenue.serialization.PacketSerializer;
 import de.kyle.avenue.topic.Topic;
 import de.kyle.avenue.topic.TopicListener;
@@ -13,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -30,8 +32,10 @@ public class AvenueClient {
     private final Socket socket;
     private InputStream inputStream;
     private OutputStream outputStream;
+    private DataOutputStream dataOutputStream;
     private final PacketDeserializer packetDeserializer;
     private final PacketSerializer packetSerializer;
+    private final int packetSize;
     private final Map<String, TopicListener> topicListenerMap;
     private final String clientName;
     private boolean running;
@@ -45,6 +49,7 @@ public class AvenueClient {
         this.running = true;
         this.packetDeserializer = new PacketDeserializer(config.getPacketSize());
         this.packetSerializer = new PacketSerializer(config.getPacketSize());
+        this.packetSize = config.getPacketSize();
         this.topicListenerMap = new HashMap<>();
         this.clientName = config.getClientName();
         Thread.ofVirtual().start(() -> {
@@ -52,10 +57,10 @@ public class AvenueClient {
                 socket.connect(new InetSocketAddress(config.getHostName(), config.getPort()));
                 this.inputStream = this.socket.getInputStream();
                 this.outputStream = this.socket.getOutputStream();
+                this.dataOutputStream = new DataOutputStream(this.outputStream);
                 AuthTokenRequestInboundPacket authTokenRequestInboundPacket = new AuthTokenRequestInboundPacket(config.getAuthenticationSecret());
                 byte[] serialized = packetSerializer.serialize(authTokenRequestInboundPacket);
-                outputStream.write(serialized);
-                outputStream.flush();
+                PacketFraming.writeFrame(dataOutputStream, serialized);
                 listen();
             } catch (IOException e) {
                 log.error("An error occurred while connecting to the server", e);
@@ -78,8 +83,11 @@ public class AvenueClient {
 
     private void listen() throws IOException {
         try (DataInputStream dataInputStream = new DataInputStream(this.inputStream)) {
+            // Length-prefix framing: read one frame per iteration. The early return after
+            // the auth response is intentionally kept (Wave 2B removes it); framing itself
+            // is already loop-capable for follow-up waves.
             while (this.running) {
-                byte[] packetBytes = dataInputStream.readAllBytes();
+                byte[] packetBytes = PacketFraming.readFrame(dataInputStream, packetSize);
                 JSONObject packet = packetDeserializer.deserialize(packetBytes);
                 JSONObject header = packet.getJSONObject("header");
                 JSONObject body = packet.getJSONObject("body");
@@ -99,8 +107,7 @@ public class AvenueClient {
     public void sendMessage(String topic, String data) throws IOException {
         PublishMessageInboundPacket publishMessageInboundPacket = new PublishMessageInboundPacket(topic, data, this.clientName, this.authToken);
         byte[] serialized = packetSerializer.serialize(publishMessageInboundPacket);
-        outputStream.write(serialized);
-        outputStream.flush();
+        PacketFraming.writeFrame(dataOutputStream, serialized);
     }
 
     public void shutdown() {

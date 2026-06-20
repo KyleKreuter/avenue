@@ -29,6 +29,10 @@ public class SerializationTest {
         PacketSerializer packetSerializer = new PacketSerializer(512);
         byte[] serialized = packetSerializer.serialize(packet);
         Assertions.assertTrue(serialized.length < 512);
+        // The wire payload is a single JSON envelope {"header":...,"body":...} (no markers).
+        String payload = new String(serialized, StandardCharsets.UTF_8);
+        Assertions.assertTrue(payload.contains("\"header\""));
+        Assertions.assertTrue(payload.contains("\"body\""));
         PacketDeserializer packetDeserializer = new PacketDeserializer(512);
         JSONObject jsonObject = packetDeserializer.deserialize(serialized);
         Assertions.assertDoesNotThrow(() -> jsonObject.getJSONObject("header"));

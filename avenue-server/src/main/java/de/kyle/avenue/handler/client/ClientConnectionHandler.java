@@ -5,6 +5,7 @@ import de.kyle.avenue.handler.packet.InboundPacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.packet.OutboundPacket;
 import de.kyle.avenue.serialization.PacketDeserializer;
+import de.kyle.avenue.serialization.PacketFraming;
 import de.kyle.avenue.serialization.PacketSerializer;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -12,6 +13,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -24,6 +26,7 @@ public class ClientConnectionHandler implements Runnable {
     private final Socket client;
     private final InputStream inputStream;
     private final OutputStream outputStream;
+    private final DataOutputStream dataOutputStream;
     private final PacketDeserializer packetDeserializer;
     private final PacketSerializer packetSerializer;
     private final InboundPacketHandler inboundPacketHandler;
@@ -43,6 +46,7 @@ public class ClientConnectionHandler implements Runnable {
         this.client = client;
         this.inputStream = client.getInputStream();
         this.outputStream = client.getOutputStream();
+        this.dataOutputStream = new DataOutputStream(this.outputStream);
         this.running = true;
         this.packetSerializer = packetSerializer;
         this.packetDeserializer = packetDeserializer;
@@ -53,8 +57,10 @@ public class ClientConnectionHandler implements Runnable {
 
     private void listen() throws IOException {
         try (DataInputStream dataInputStream = new DataInputStream(this.inputStream)) {
+            // Length-prefix framing: read frames in a loop so a single connection can
+            // carry many messages instead of blocking on readAllBytes() until EOF.
             while (this.running) {
-                byte[] packetBytes = dataInputStream.readAllBytes();
+                byte[] packetBytes = PacketFraming.readFrame(dataInputStream, avenueConfig.getPacketSize());
                 JSONObject packet = packetDeserializer.deserialize(packetBytes);
                 try {
                     inboundPacketHandler.handleInboundPacket(packet, this);
@@ -76,8 +82,8 @@ public class ClientConnectionHandler implements Runnable {
         sendPacketLock.lock();
         try {
             byte[] serializedPacket = packetSerializer.serialize(packet);
-            outputStream.write(serializedPacket);
-            outputStream.flush();
+            // Single, named place that prepends the 4-byte length prefix before the payload.
+            PacketFraming.writeFrame(dataOutputStream, serializedPacket);
         } finally {
             sendPacketLock.unlock();
         }

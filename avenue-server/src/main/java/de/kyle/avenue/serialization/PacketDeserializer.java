@@ -4,11 +4,14 @@ import de.kyle.avenue.config.AvenueConfig;
 import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
+/**
+ * Deserializes a single message payload back into its {@code header}/{@code body} envelope.
+ * <p>
+ * The input is the bare UTF-8 JSON payload {@code {"header":{...},"body":{...}}}; the 4-byte
+ * length prefix has already been consumed by the stream layer (see {@link PacketFraming}).
+ */
 public class PacketDeserializer {
-    private final Pattern PATTERN = Pattern.compile("_H_(.*?)_H__B_(.*?)_B_");
     private final int packetSize;
 
     public PacketDeserializer(AvenueConfig avenueConfig) {
@@ -19,6 +22,13 @@ public class PacketDeserializer {
         this.packetSize = packetSize;
     }
 
+    /**
+     * Parses the payload bytes into a JSON object exposing {@code header} and {@code body}.
+     *
+     * @param packet the UTF-8 JSON payload bytes (without length prefix)
+     * @return a {@link JSONObject} with {@code header} and {@code body} child objects
+     * @throws IllegalArgumentException if the payload is null, too large, or malformed
+     */
     public JSONObject deserialize(byte[] packet) throws IllegalArgumentException {
         if (packet == null) {
             throw new IllegalArgumentException("Packet cannot be null");
@@ -30,22 +40,15 @@ public class PacketDeserializer {
                             packet.length, packetSize));
         }
 
-        String packetString = new String(packet, StandardCharsets.UTF_8);
+        JSONObject envelope = new JSONObject(new String(packet, StandardCharsets.UTF_8));
 
-        Matcher matcher = PATTERN.matcher(packetString);
-
-        if (!matcher.find()) {
-            throw new IllegalArgumentException("Packet mismatches format");
+        if (!envelope.has("header") || !envelope.has("body")) {
+            throw new IllegalArgumentException("Packet mismatches format: missing header or body");
         }
-        byte[] header = matcher.group(1).getBytes(StandardCharsets.UTF_8);
-        byte[] body = matcher.group(2).getBytes(StandardCharsets.UTF_8);
-
-        String headerString = new String(header, StandardCharsets.UTF_8);
-        String bodyString = new String(body, StandardCharsets.UTF_8);
 
         JSONObject deserializedObject = new JSONObject();
-        deserializedObject.put("header", new JSONObject(headerString));
-        deserializedObject.put("body", new JSONObject(bodyString));
+        deserializedObject.put("header", envelope.getJSONObject("header"));
+        deserializedObject.put("body", envelope.getJSONObject("body"));
         return deserializedObject;
     }
 }
