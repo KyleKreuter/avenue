@@ -1,6 +1,7 @@
 package de.kyle.avenue.cluster;
 
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
+import de.kyle.avenue.metrics.ClusterMetrics;
 import de.kyle.avenue.packet.Packet;
 import de.kyle.avenue.packet.cluster.ClusterHeartbeatPacket;
 import de.kyle.avenue.packet.cluster.ClusterPublishPacket;
@@ -26,14 +27,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Manages a single peer-to-peer cluster link over a TCP socket.
  * <p>
  * A {@code PeerLink} is created around an already-authenticated socket (handshake was
- * performed externally by {@link ClusterHandshake}). It owns two virtual threads:
+ * performed externally by {@link ClusterHandshake}). It owns three virtual threads:
  * <ul>
  *   <li><b>Reader</b> – reads incoming frames and dispatches
  *       {@link ClusterPublishPacket} / {@link ClusterHeartbeatPacket}. Monitors a
  *       heartbeat watchdog and closes the link on timeout.</li>
- *   <li><b>Writer</b> – drains a bounded outbound queue and writes frames to the socket.
- *       A heartbeat sender runs as a third virtual thread that periodically enqueues
- *       heartbeat objects into the same queue.</li>
+ *   <li><b>Writer</b> – drains a bounded outbound queue of {@link OutboundItem}s and writes them
+ *       to the socket. {@link OutboundItem.PreSerializedFrame}s are written verbatim (no re-parse,
+ *       no re-serialize); {@link OutboundItem.ControlFrame}s are serialized lazily.</li>
+ *   <li><b>Heartbeat sender</b> – periodically enqueues a heartbeat control frame.</li>
  * </ul>
  * The link signals its own closure via an {@code onClose} {@link Runnable} so the owning
  * {@link ClusterManager} can schedule a reconnect.
@@ -44,6 +46,16 @@ public class PeerLink {
 
     private static final int OUTBOUND_QUEUE_CAPACITY = 1024;
 
+    /**
+     * Decides whether a received cluster publish (identified by its origin key and sequence
+     * number) should be delivered. Implemented by {@link ClusterManager} over its per-origin
+     * {@link OriginSequenceTracker}s; returns {@code false} for duplicates.
+     */
+    @FunctionalInterface
+    public interface OriginAcceptor {
+        boolean accept(String originKey, long seq);
+    }
+
     private final Socket socket;
     private final DataInputStream in;
     private final DataOutputStream out;
@@ -52,23 +64,22 @@ public class PeerLink {
     private final int maxPacketSize;
     private final long heartbeatIntervalMs;
     private final TopicSubscriptionHandler topicSubscriptionHandler;
-    private final MessageDeduplicator deduplicator;
+    private final OriginAcceptor originAcceptor;
+    private final ClusterMetrics metrics;
+    private final Clock clock;
     private final Runnable onClose;
 
-    /**
-     * Bounded per-peer outbound queue. Elements are either {@link ClusterPublishPacket} or
-     * {@link ClusterHeartbeatPacket}. A {@code null} sentinel tells the writer to exit.
-     */
-    private final BlockingQueue<Packet> outboundQueue = new LinkedBlockingQueue<>(OUTBOUND_QUEUE_CAPACITY);
+    /** Bounded per-peer outbound queue carrying pre-serialized data frames and control frames. */
+    private final BlockingQueue<OutboundItem> outboundQueue = new LinkedBlockingQueue<>(OUTBOUND_QUEUE_CAPACITY);
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean closedOnce = new AtomicBoolean(false);
 
-    /** Nanotime of the last received heartbeat; read by reader, written by reader only. */
+    /** Clock-time of the last received heartbeat; read by reader, written by reader only. */
     private long lastHeartbeatNanos;
 
     /**
-     * Creates a {@code PeerLink} around an already-open, authenticated socket.
-     * Call {@link #start()} to begin the reader / writer threads.
+     * Creates a {@code PeerLink} around an already-open, authenticated socket using the system
+     * clock. Call {@link #start()} to begin the reader / writer threads.
      */
     public PeerLink(
             Socket socket,
@@ -77,7 +88,29 @@ public class PeerLink {
             int maxPacketSize,
             long heartbeatIntervalMs,
             TopicSubscriptionHandler topicSubscriptionHandler,
-            MessageDeduplicator deduplicator,
+            OriginAcceptor originAcceptor,
+            ClusterMetrics metrics,
+            Runnable onClose
+    ) throws IOException {
+        this(socket, remoteNodeId, localNodeId, maxPacketSize, heartbeatIntervalMs,
+                topicSubscriptionHandler, originAcceptor, metrics, Clock.SYSTEM, onClose);
+    }
+
+    /**
+     * Full constructor with an injectable {@link Clock} for the heartbeat watchdog. The default
+     * public constructor delegates here with {@link Clock#SYSTEM}; tests use this overload to
+     * drive the watchdog deterministically.
+     */
+    public PeerLink(
+            Socket socket,
+            String remoteNodeId,
+            String localNodeId,
+            int maxPacketSize,
+            long heartbeatIntervalMs,
+            TopicSubscriptionHandler topicSubscriptionHandler,
+            OriginAcceptor originAcceptor,
+            ClusterMetrics metrics,
+            Clock clock,
             Runnable onClose
     ) throws IOException {
         this.socket = socket;
@@ -88,7 +121,9 @@ public class PeerLink {
         this.maxPacketSize = maxPacketSize;
         this.heartbeatIntervalMs = heartbeatIntervalMs;
         this.topicSubscriptionHandler = topicSubscriptionHandler;
-        this.deduplicator = deduplicator;
+        this.originAcceptor = originAcceptor;
+        this.metrics = metrics;
+        this.clock = clock;
         this.onClose = onClose;
     }
 
@@ -99,7 +134,7 @@ public class PeerLink {
         if (!running.compareAndSet(false, true)) {
             return;
         }
-        lastHeartbeatNanos = System.nanoTime();
+        lastHeartbeatNanos = clock.nanoTime();
         Thread.ofVirtual().name("cluster-writer-" + remoteNodeId).start(this::writerLoop);
         Thread.ofVirtual().name("cluster-reader-" + remoteNodeId).start(this::readerLoop);
         Thread.ofVirtual().name("cluster-hb-sender-" + remoteNodeId).start(this::heartbeatSenderLoop);
@@ -116,16 +151,18 @@ public class PeerLink {
     }
 
     /**
-     * Enqueues a {@link ClusterPublishPacket} for async forwarding to the peer.
-     * If the queue is full the packet is silently dropped (at-most-once delivery).
+     * Enqueues a pre-serialized cluster publish frame for async forwarding to the peer. The same
+     * immutable {@link OutboundItem.PreSerializedFrame} instance is safe to hand to many peer
+     * links. If the queue is full the frame is silently dropped (at-most-once delivery) and the
+     * drop is counted.
      */
-    public void forward(ClusterPublishPacket packet) {
+    public void forward(OutboundItem.PreSerializedFrame frame) {
         if (!running.get()) {
             return;
         }
-        if (!outboundQueue.offer(packet)) {
-            log.warn("Cluster outbound queue to {} is full, dropping packet for topic {}",
-                    remoteNodeId, packet.getTopic());
+        if (!outboundQueue.offer(frame)) {
+            metrics.incrementMessagesDropped();
+            log.warn("Cluster outbound queue to {} is full, dropping publish frame", remoteNodeId);
         }
     }
 
@@ -158,7 +195,7 @@ public class PeerLink {
         try {
             while (running.get()) {
                 // Heartbeat watchdog check before blocking read.
-                if (System.nanoTime() - lastHeartbeatNanos > watchdogNanos) {
+                if (clock.nanoTime() - lastHeartbeatNanos > watchdogNanos) {
                     log.warn("Heartbeat timeout from peer {}, closing link", remoteNodeId);
                     break;
                 }
@@ -210,7 +247,7 @@ public class PeerLink {
         String name = header.optString("name", "");
         switch (name) {
             case "ClusterPublishPacket" -> handleClusterPublish(envelope);
-            case "ClusterHeartbeatPacket" -> lastHeartbeatNanos = System.nanoTime();
+            case "ClusterHeartbeatPacket" -> lastHeartbeatNanos = clock.nanoTime();
             default -> log.debug("Unknown cluster packet '{}' from peer {}, ignoring", name, remoteNodeId);
         }
     }
@@ -224,11 +261,17 @@ public class PeerLink {
             return;
         }
 
-        // Safety-net deduplication — catches loops from misconfiguration.
-        if (deduplicator.isDuplicate(packet.getMessageId())) {
-            log.debug("Dropping duplicate messageId={} from peer {}", packet.getMessageId(), remoteNodeId);
+        // Ordered deduplication keyed by (originNodeId, originEpoch). The single-hop full-mesh
+        // rule means each message normally arrives once; this filters loops/replays defensively.
+        String originKey = packet.getOriginNodeId() + ":" + packet.getOriginEpoch();
+        if (!originAcceptor.accept(originKey, packet.getSeq())) {
+            metrics.incrementMessagesDeduped();
+            log.debug("Dropping duplicate origin={} seq={} from peer {}",
+                    originKey, packet.getSeq(), remoteNodeId);
             return;
         }
+
+        metrics.incrementMessagesReceived();
 
         // Deliver locally only; never re-forward (single-hop rule).
         PublishMessageOutboundPacket outbound = new PublishMessageOutboundPacket(
@@ -246,22 +289,22 @@ public class PeerLink {
     private void writerLoop() {
         try {
             while (running.get()) {
-                Packet packet;
+                OutboundItem item;
                 try {
-                    packet = outboundQueue.poll(200, TimeUnit.MILLISECONDS);
+                    item = outboundQueue.poll(200, TimeUnit.MILLISECONDS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
                 }
-                if (packet == null) {
+                if (item == null) {
                     continue;
                 }
-                writePacket(packet);
+                writeItem(item);
             }
-            // Drain remaining queued packets after stop is signalled.
-            Packet remaining;
+            // Drain remaining queued items after stop is signalled.
+            OutboundItem remaining;
             while ((remaining = outboundQueue.poll()) != null) {
-                writePacket(remaining);
+                writeItem(remaining);
             }
         } catch (IOException e) {
             if (running.get()) {
@@ -272,14 +315,26 @@ public class PeerLink {
         }
     }
 
-    private void writePacket(Packet packet) throws IOException {
-        JSONObject envelope = new JSONObject();
-        envelope.put("header", new JSONObject(new String(packet.getHeader(), StandardCharsets.UTF_8)));
-        envelope.put("body", new JSONObject(new String(packet.getBody(), StandardCharsets.UTF_8)));
-        byte[] payload = envelope.toString().getBytes(StandardCharsets.UTF_8);
+    /**
+     * Writes a single outbound item. Pre-serialized data frames are written verbatim; control
+     * frames are serialized to an envelope here (low-rate traffic only).
+     */
+    private void writeItem(OutboundItem item) throws IOException {
+        byte[] payload = switch (item) {
+            case OutboundItem.PreSerializedFrame frame -> frame.payload();
+            case OutboundItem.ControlFrame control -> serializeEnvelope(control.packet());
+        };
         synchronized (out) {
             PacketFraming.writeFrame(out, payload);
         }
+    }
+
+    /** Serializes a {@link Packet} into the {@code {"header":{...},"body":{...}}} envelope bytes. */
+    static byte[] serializeEnvelope(Packet packet) {
+        JSONObject envelope = new JSONObject();
+        envelope.put("header", new JSONObject(new String(packet.getHeader(), StandardCharsets.UTF_8)));
+        envelope.put("body", new JSONObject(new String(packet.getBody(), StandardCharsets.UTF_8)));
+        return envelope.toString().getBytes(StandardCharsets.UTF_8);
     }
 
     // -------------------------------------------------------------------------
@@ -294,7 +349,7 @@ public class PeerLink {
                     break;
                 }
                 ClusterHeartbeatPacket hb = new ClusterHeartbeatPacket(localNodeId);
-                if (!outboundQueue.offer(hb)) {
+                if (!outboundQueue.offer(new OutboundItem.ControlFrame(hb))) {
                     log.warn("Queue to peer {} full, heartbeat dropped", remoteNodeId);
                 }
             }
