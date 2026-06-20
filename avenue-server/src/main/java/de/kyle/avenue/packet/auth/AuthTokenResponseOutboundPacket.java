@@ -15,7 +15,7 @@ public class AuthTokenResponseOutboundPacket implements OutboundPacket {
     @Override
     public byte[] getHeader() {
         JSONObject jsonObject = new JSONObject();
-        jsonObject.put("name", this.getClass().getName().getBytes(StandardCharsets.UTF_8));
+        jsonObject.put("name", this.getClass().getSimpleName());
         String jsonString = jsonObject.toString();
         if (jsonString == null) {
             throw new RuntimeException("An error occurred while trying to format the header");

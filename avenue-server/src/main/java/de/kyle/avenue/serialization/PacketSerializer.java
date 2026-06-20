@@ -2,13 +2,19 @@ package de.kyle.avenue.serialization;
 
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.packet.Packet;
+import org.json.JSONObject;
 
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
+/**
+ * Serializes a {@link Packet} into the wire payload of a single message.
+ * <p>
+ * The wire payload is a single UTF-8 encoded JSON object of the form
+ * {@code {"header":{...},"body":{...}}}. This method returns ONLY the payload
+ * bytes; the 4-byte length prefix that frames a message on the stream is added
+ * by the stream layer (see {@link PacketFraming}).
+ */
 public class PacketSerializer {
-    private final byte[] HEADER = "_H_".getBytes(StandardCharsets.UTF_8);
-    private final byte[] BODY = "_B_".getBytes(StandardCharsets.UTF_8);
     private final int packetSize;
 
     public PacketSerializer(AvenueConfig avenueConfig) {
@@ -19,31 +25,34 @@ public class PacketSerializer {
         this.packetSize = packetSize;
     }
 
-
+    /**
+     * Builds the UTF-8 JSON payload {@code {"header":...,"body":...}} for the given packet.
+     *
+     * @param packet the packet to serialize
+     * @return the UTF-8 encoded payload bytes (without length prefix)
+     * @throws IllegalArgumentException if the packet is invalid or exceeds the configured maximum size
+     */
     public byte[] serialize(Packet packet) throws IllegalArgumentException {
         if (packet == null || packet.getHeader() == null || packet.getBody() == null) {
             throw new IllegalArgumentException("Packet, header, or body cannot be null");
         }
-        byte[] packetHeader = packet.getHeader();
-        byte[] packetBody = packet.getBody();
 
-        int overhead = (HEADER.length + BODY.length) * 2;
+        // Parse the per-packet header/body bytes back into JSON and wrap them into a
+        // single envelope object. This avoids any fragile string markers in the payload.
+        JSONObject header = new JSONObject(new String(packet.getHeader(), StandardCharsets.UTF_8));
+        JSONObject body = new JSONObject(new String(packet.getBody(), StandardCharsets.UTF_8));
 
-        int totalLength = packetHeader.length + packetBody.length + overhead;
+        JSONObject envelope = new JSONObject();
+        envelope.put("header", header);
+        envelope.put("body", body);
 
-        if (totalLength > packetSize) {
+        byte[] payload = envelope.toString().getBytes(StandardCharsets.UTF_8);
+
+        if (payload.length > packetSize) {
             throw new IllegalArgumentException(
                     String.format("Packet is too large (%d bytes), exceeding maximum size of %d bytes",
-                            totalLength, packetSize));
+                            payload.length, packetSize));
         }
-
-        ByteBuffer buffer = ByteBuffer.allocate(totalLength);
-        buffer.put(HEADER);
-        buffer.put(packetHeader);
-        buffer.put(HEADER);
-        buffer.put(BODY);
-        buffer.put(packetBody);
-        buffer.put(BODY);
-        return buffer.array();
+        return payload;
     }
 }

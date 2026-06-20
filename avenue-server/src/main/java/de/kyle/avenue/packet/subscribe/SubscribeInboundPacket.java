@@ -24,7 +24,7 @@ public class SubscribeInboundPacket implements InboundPacket {
     @Override
     public byte[] getHeader() {
         JSONObject jsonObject = new JSONObject();
-        jsonObject.put("name", this.getClass().getName().getBytes(StandardCharsets.UTF_8));
+        jsonObject.put("name", this.getClass().getSimpleName());
         jsonObject.put("token", this.token);
         String jsonString = jsonObject.toString();
         if (jsonString == null) {
