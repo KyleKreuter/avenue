@@ -1,6 +1,7 @@
 package de.kyle.avenue.cluster.membership;
 
 import de.kyle.avenue.cluster.PeerLink;
+import de.kyle.avenue.cluster.events.ClusterEvents;
 import de.kyle.avenue.config.ClusterTuning;
 import de.kyle.avenue.metrics.ClusterMetrics;
 import de.kyle.avenue.packet.cluster.SwimAckPacket;
@@ -245,7 +246,7 @@ public final class SwimMembership implements SwimMessageSink {
             gossipNow(target.getNodeId(), MemberState.SUSPECT, target.getIncarnation(),
                     target.getHost(), target.getClusterPort());
             refreshGauges();
-            log.info("SWIM: member {} -> SUSPECT", target.getNodeId());
+            ClusterEvents.suspect(target.getNodeId(), target.getIncarnation());
         }
     }
 
@@ -272,7 +273,7 @@ public final class SwimMembership implements SwimMessageSink {
                             metrics.incrementDeadEvents();
                             gossipNow(m.getNodeId(), MemberState.DEAD, m.getIncarnation(),
                                     m.getHost(), m.getClusterPort());
-                            log.info("SWIM: member {} SUSPECT -> DEAD", m.getNodeId());
+                            ClusterEvents.dead(m.getNodeId(), m.getIncarnation());
                         }
                     }
                 }
@@ -280,7 +281,7 @@ public final class SwimMembership implements SwimMessageSink {
                 List<String> reaped = registry.reapDead(tuning.swimDeadMemberTimeoutMs(), now);
                 for (String id : reaped) {
                     hotGossip.remove(id);
-                    log.info("SWIM: reaped terminal member {}", id);
+                    ClusterEvents.reaped(id);
                 }
                 refreshGauges();
             }
@@ -407,7 +408,7 @@ public final class SwimMembership implements SwimMessageSink {
             metrics.incrementLeaveEvents();
             gossipNow(fromNodeId, MemberState.LEFT, incarnation, host, port);
             refreshGauges();
-            log.info("SWIM: member {} announced LEFT", fromNodeId);
+            ClusterEvents.leave(fromNodeId, incarnation);
         }
     }
 
@@ -422,7 +423,7 @@ public final class SwimMembership implements SwimMessageSink {
             metrics.incrementJoinEvents();
             gossipNow(nodeId, MemberState.ALIVE, incarnation, host, clusterPort);
             refreshGauges();
-            log.info("SWIM: member {} joined ({}:{})", nodeId, host, clusterPort);
+            ClusterEvents.join(nodeId, incarnation, host, clusterPort);
         }
     }
 
@@ -470,7 +471,7 @@ public final class SwimMembership implements SwimMessageSink {
             long bumped = localIncarnation.updateAndGet(cur -> Math.max(cur, u.incarnation()) + 1);
             metrics.incrementIncarnationConflicts();
             gossipNow(localNodeId, MemberState.ALIVE, bumped, localHost, localClusterPort);
-            log.info("SWIM: refuting {} for self, new incarnation={}", s, bumped);
+            ClusterEvents.refute(s.name(), bumped);
         }
     }
 

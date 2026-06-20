@@ -1,5 +1,9 @@
 package de.kyle.avenue.cluster;
 
+import de.kyle.avenue.admin.dto.MemberRegistrySnapshot;
+import de.kyle.avenue.admin.dto.PeerSnapshot;
+import de.kyle.avenue.admin.dto.RoutingSnapshot;
+import de.kyle.avenue.cluster.events.ClusterEvents;
 import de.kyle.avenue.cluster.membership.GossipUpdate;
 import de.kyle.avenue.cluster.membership.Member;
 import de.kyle.avenue.cluster.membership.MemberRegistry;
@@ -24,6 +28,7 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -496,6 +501,44 @@ public class ClusterManager implements ClusterForwarder {
         return routingTable;
     }
 
+    // -------------------------------------------------------------------------
+    // Phase F — read-only introspection snapshots (admin HTTP)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Immutable, leak-free per-peer link snapshot for admin introspection (Phase F). For every active
+     * {@link PeerLink} it copies out derived scalars only — never the live replay buffer, ingest queue
+     * or tracker references — so the admin layer cannot mutate or alias internal state. Depths are read
+     * from the per-target {@link TargetState} and the receiving-side reliability tracker, which is
+     * exactly the operational data an operator needs (backfill backlog, ingest backlog, sequence
+     * frontiers) without exposing transport internals.
+     */
+    public List<PeerSnapshot> snapshotPeers() {
+        List<PeerSnapshot> result = new ArrayList<>(activePeers.size());
+        for (var entry : activePeers.entrySet()) {
+            String nodeId = entry.getKey();
+            PeerLink link = entry.getValue();
+            TargetState target = targets.get(nodeId);
+            int replayDepth = target != null ? target.buffer.size() : 0;
+            int ingestDepth = target != null ? target.ingest.size() : 0;
+            long outboundLinkSeq = target != null ? target.linkSeq.get() : 0L;
+            long contiguous = contiguousLinkSeq(nodeId);
+            result.add(new PeerSnapshot(
+                    nodeId, link.isRunning(), replayDepth, ingestDepth, outboundLinkSeq, contiguous));
+        }
+        return List.copyOf(result);
+    }
+
+    /** Immutable interest-routing snapshot for admin introspection (Phase F). */
+    public RoutingSnapshot snapshotRouting() {
+        return routingTable.snapshot();
+    }
+
+    /** Immutable membership snapshot for admin introspection (Phase F). Empty when clustering is off. */
+    public MemberRegistrySnapshot snapshotMembers() {
+        return memberRegistry.snapshotDto();
+    }
+
     /**
      * @VisibleForTesting — whether this node's routing table currently records {@code remoteNodeId}
      * as interested in {@code topic}. Lets tests poll for interest convergence deterministically
@@ -627,10 +670,10 @@ public class ClusterManager implements ClusterForwarder {
             // Phase E — learn the remote as ALIVE from its handshake-advertised contact info.
             registerAlive(remoteNodeId, auth.remoteHost(), auth.remoteClusterPort(), auth.remoteIncarnation());
             link.start();
-            log.info("Accepted cluster peer: {}", remoteNodeId);
+            ClusterEvents.peerConnected(remoteNodeId, auth.remoteHost(), auth.remoteClusterPort());
 
         } catch (SecurityException e) {
-            log.warn("Rejected peer {}: wrong cluster secret", peerSocket.getRemoteSocketAddress());
+            ClusterEvents.handshakeAuthFailure(String.valueOf(peerSocket.getRemoteSocketAddress()));
             closeQuietly(peerSocket);
         } catch (Exception e) {
             log.warn("Error in incoming peer handshake: {}", e.getMessage());
@@ -676,7 +719,8 @@ public class ClusterManager implements ClusterForwarder {
                 if (!running) {
                     break;
                 }
-                log.warn("Cannot join via seed {}: {} — retry in {} ms", peerAddress, e.getMessage(), backoffMs);
+                ClusterEvents.reconnect(peerAddress, host, port, backoffMs);
+                log.debug("Cannot join via seed {}: {} — retry in {} ms", peerAddress, e.getMessage(), backoffMs);
                 sleepQuietly(backoffMs);
                 backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
             }
@@ -757,7 +801,7 @@ public class ClusterManager implements ClusterForwarder {
         }
         registerAlive(remoteNodeId, auth.remoteHost(), auth.remoteClusterPort(), auth.remoteIncarnation());
         link.start();
-        log.info("Connected to cluster peer {} at {}:{}", remoteNodeId, host, port);
+        ClusterEvents.peerConnected(remoteNodeId, host, port);
 
         if (sendJoin && swimMembership != null) {
             link.enqueueControl(new SwimJoinPacket(
@@ -902,7 +946,7 @@ public class ClusterManager implements ClusterForwarder {
                         // Instead the interest is reclaimed together with the TargetState in the
                         // expiry sweep (a genuine LEFT), and a real reconnect overwrites it with a
                         // fresh full-state sync anyway.
-                        log.info("Peer {} removed from active set", remoteNodeId);
+                        ClusterEvents.peerDisconnected(remoteNodeId);
                     }
                 }
         );

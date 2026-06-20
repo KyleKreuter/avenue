@@ -1,5 +1,6 @@
 package de.kyle.avenue.cluster;
 
+import de.kyle.avenue.cluster.events.ClusterEvents;
 import de.kyle.avenue.cluster.membership.SwimMessageSink;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.ClusterMetrics;
@@ -299,7 +300,7 @@ public class PeerLink {
         try {
             while (running.get()) {
                 if (clock.nanoTime() - lastHeartbeatNanos > watchdogNanos) {
-                    log.warn("Heartbeat timeout from peer {}, closing link", remoteNodeId);
+                    ClusterEvents.heartbeatTimeout(remoteNodeId);
                     break;
                 }
                 byte[] frame;
@@ -509,8 +510,7 @@ public class PeerLink {
     private void backfill(long lastContiguousLinkSeq) {
         ReplayBuffer.ReplayResult result = replayBuffer.replayFrom(lastContiguousLinkSeq);
         if (result.gap()) {
-            log.info("Replay gap for link {} requested from {}, firstAvailable={} — sending gap",
-                    localNodeId, lastContiguousLinkSeq, result.firstAvailableSeq());
+            ClusterEvents.gap(remoteNodeId, result.firstAvailableSeq());
             metrics.incrementClusterGapEvents();
             controlQueue.offer(new OutboundItem.ControlFrame(new ClusterGapPacket(
                     localNodeId, localNodeId, localEpoch, result.firstAvailableSeq())));
@@ -520,13 +520,12 @@ public class PeerLink {
         if (entries.isEmpty()) {
             return;
         }
-        log.info("Backfilling {} message(s) to peer {} from linkSeq>{}",
-                entries.size(), remoteNodeId, lastContiguousLinkSeq);
         for (ReplayBuffer.Entry e : entries) {
             // Re-send verbatim; the receiver's link tracker drops anything it already accepted.
             controlQueue.offer(new OutboundItem.PreSerializedFrame(e.payload()));
         }
         metrics.addClusterBackfillMessages(entries.size());
+        ClusterEvents.backfillCompleted(remoteNodeId, entries.size(), lastContiguousLinkSeq);
     }
 
     /** Remote signalled that frames we expected are unrecoverable; resync the link frontier forward. */
@@ -539,8 +538,7 @@ public class PeerLink {
             return;
         }
         long newContiguous = gap.getFirstAvailableSeq() - 1;
-        log.info("Accepting data loss on link from {}: resync contiguous linkSeq -> {}",
-                remoteNodeId, newContiguous);
+        ClusterEvents.dataLoss(remoteNodeId, newContiguous);
         receiver.resetLinkTo(remoteNodeId, newContiguous);
         metrics.incrementClusterGapEvents();
         if (strictOrdering) {
@@ -760,7 +758,7 @@ public class PeerLink {
                 }
                 ClusterHeartbeatPacket hb = new ClusterHeartbeatPacket(localNodeId);
                 if (!controlQueue.offer(new OutboundItem.ControlFrame(hb))) {
-                    log.warn("Queue to peer {} full, heartbeat dropped", remoteNodeId);
+                    ClusterEvents.queueFull(remoteNodeId, "heartbeat");
                 }
             }
         } catch (InterruptedException e) {

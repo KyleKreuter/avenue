@@ -1,8 +1,14 @@
 package de.kyle.avenue.cluster;
 
+import de.kyle.avenue.admin.dto.RoutingSnapshot;
 import de.kyle.avenue.metrics.ClusterMetrics;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -164,6 +170,22 @@ public final class InterestRoutingTable {
     /** Number of topics that currently have at least one interested remote node (gauge source). */
     public int topicCount() {
         return topicToNodes.size();
+    }
+
+    /**
+     * Immutable, leak-free snapshot of the forward index for admin introspection (Phase F):
+     * {@code topic -> sorted list of interested remote node ids}. Every entry is deep-copied into a
+     * plain {@link java.util.List} and the whole map is wrapped unmodifiable, so the admin layer can
+     * neither mutate nor alias the live concurrent key-sets. The hot read path is untouched.
+     */
+    public RoutingSnapshot snapshot() {
+        Map<String, List<String>> copy = new TreeMap<>();
+        for (Map.Entry<String, Set<String>> e : topicToNodes.entrySet()) {
+            List<String> nodes = new ArrayList<>(e.getValue());
+            Collections.sort(nodes);
+            copy.put(e.getKey(), List.copyOf(nodes));
+        }
+        return new RoutingSnapshot(copy.size(), Collections.unmodifiableMap(copy));
     }
 
     // -------------------------------------------------------------------------
