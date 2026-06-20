@@ -1,30 +1,38 @@
 package de.kyle.avenue.cluster;
 
+import com.google.protobuf.ByteString;
 import de.kyle.avenue.metrics.ClusterMetrics;
-import de.kyle.avenue.packet.Packet;
-import de.kyle.avenue.packet.cluster.ClusterAuthChallengePacket;
-import de.kyle.avenue.packet.cluster.ClusterAuthHelloPacket;
-import de.kyle.avenue.packet.cluster.ClusterAuthResponsePacket;
+import de.kyle.avenue.proto.ClusterAuthChallenge;
+import de.kyle.avenue.proto.ClusterAuthHello;
+import de.kyle.avenue.proto.ClusterAuthResponse;
+import de.kyle.avenue.proto.ClusterEnvelope;
 import de.kyle.avenue.serialization.PacketFraming;
-import org.json.JSONObject;
+import de.kyle.avenue.serialization.WireCodec;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
-import java.nio.charset.StandardCharsets;
 
 /**
  * Performs the two-sided cluster link handshake using an HMAC challenge-response protocol.
+ * <p>
+ * Step 2 of the JSON-&gt;protobuf migration: the handshake messages are now {@link ClusterEnvelope}s
+ * ({@code ClusterAuthHello/Challenge/Response} oneof cases) framed by {@link PacketFraming}, no longer
+ * JSON. The {@code nonce}/{@code proof} fields are protobuf {@code bytes}. The {@link HmacAuthenticator}
+ * still computes its proof over the same canonical transcript (the Base64 nonce strings and the role
+ * tag), so the HMAC is byte-for-byte identical to the JSON path — only the wire codec changed. The
+ * Base64 nonce / proof strings are carried as UTF-8 {@link ByteString}s, which is exactly what the
+ * authenticator consumes and produces, so the constant-time proof comparison is unaffected.
  * <p>
  * The shared {@code cluster.secret} is used purely as an HMAC key and <strong>never</strong>
  * appears on the wire. Each side proves possession of the secret by HMAC-ing a canonical transcript
  * of both node IDs and both nonces (role-tagged to defeat reflection attacks):
  * <pre>
- *   Initiator --[ClusterAuthHelloPacket: nodeId_I, host, port, incarnation, nonce_I]--> Acceptor
- *   Initiator <--[ClusterAuthChallengePacket: nodeId_A, host, port, incarnation, nonce_A, proof_A]-- Acceptor
- *   Initiator --[ClusterAuthResponsePacket: nodeId_I, proof_I]--> Acceptor
+ *   Initiator --[ClusterAuthHello: nodeId_I, host, port, incarnation, nonce_I]--> Acceptor
+ *   Initiator <--[ClusterAuthChallenge: nodeId_A, host, port, incarnation, nonce_A, proof_A]-- Acceptor
+ *   Initiator --[ClusterAuthResponse: nodeId_I, proof_I]--> Acceptor
  * </pre>
  * The initiator verifies {@code proof_A} (ROLE=ACCEPTOR) before answering; the acceptor verifies
  * {@code proof_I} (ROLE=INITIATOR) before accepting the link. A proof mismatch raises a
@@ -46,8 +54,7 @@ final class ClusterHandshake {
     /**
      * Immutable result of a successful handshake. Beyond {@code remoteNodeId} (used today for the
      * peer registry and tie-break) it carries the peer's advertised contact information and process
-     * incarnation, which the SWIM membership layer (Phase E) will consume. Callers may ignore the
-     * advertised fields for now.
+     * incarnation, which the SWIM membership layer (Phase E) consumes.
      *
      * @param remoteNodeId      the authenticated remote node ID
      * @param remoteHost        the host the remote node advertised it can be reached on
@@ -95,22 +102,21 @@ final class ClusterHandshake {
         int previousSoTimeout = socket.getSoTimeout();
         socket.setSoTimeout(handshakeTimeoutMs);
         try {
-            // 1) Send our hello with a fresh nonce.
+            // 1) Send our hello with a fresh nonce (Base64 string carried as raw UTF-8 bytes).
             String initiatorNonce = authenticator.newNonce();
-            sendFrame(dout, new ClusterAuthHelloPacket(
+            sendFrame(dout, ClusterEnvelopes.authHello(
                     localNodeId, localHost, localClusterPort, localIncarnation,
-                    initiatorNonce, HmacAuthenticator.PROTOCOL));
+                    ByteString.copyFromUtf8(initiatorNonce), HmacAuthenticator.PROTOCOL));
 
             // 2) Read the acceptor's challenge and verify its proof (ROLE=ACCEPTOR).
-            ClusterAuthChallengePacket challenge =
-                    ClusterAuthChallengePacket.fromJson(readEnvelope(din, maxPacketSize));
+            ClusterAuthChallenge challenge = readEnvelope(din, maxPacketSize).getClusterAuthChallenge();
             String acceptorNodeId = challenge.getNodeId();
-            String acceptorNonce = challenge.getNonce();
+            String acceptorNonce = challenge.getNonce().toStringUtf8();
 
             String expectedAcceptorProof = authenticator.computeProof(
                     localNodeId, acceptorNodeId, initiatorNonce, acceptorNonce,
                     HmacAuthenticator.ROLE_ACCEPTOR);
-            if (!authenticator.proofsMatch(expectedAcceptorProof, challenge.getProof())) {
+            if (!authenticator.proofsMatch(expectedAcceptorProof, challenge.getProof().toStringUtf8())) {
                 metrics.incrementHandshakeAuthFailures();
                 throw new SecurityException("Cluster peer presented an invalid acceptor proof");
             }
@@ -119,7 +125,8 @@ final class ClusterHandshake {
             String initiatorProof = authenticator.computeProof(
                     localNodeId, acceptorNodeId, initiatorNonce, acceptorNonce,
                     HmacAuthenticator.ROLE_INITIATOR);
-            sendFrame(dout, new ClusterAuthResponsePacket(localNodeId, initiatorProof));
+            sendFrame(dout, ClusterEnvelopes.authResponse(
+                    localNodeId, ByteString.copyFromUtf8(initiatorProof)));
 
             return new AuthResult(
                     acceptorNodeId,
@@ -168,27 +175,25 @@ final class ClusterHandshake {
         socket.setSoTimeout(handshakeTimeoutMs);
         try {
             // 1) Read the initiator's hello.
-            ClusterAuthHelloPacket hello =
-                    ClusterAuthHelloPacket.fromJson(readEnvelope(din, maxPacketSize));
+            ClusterAuthHello hello = readEnvelope(din, maxPacketSize).getClusterAuthHello();
             String initiatorNodeId = hello.getNodeId();
-            String initiatorNonce = hello.getNonce();
+            String initiatorNonce = hello.getNonce().toStringUtf8();
 
             // 2) Build our challenge: fresh nonce + our proof (ROLE=ACCEPTOR).
             String acceptorNonce = authenticator.newNonce();
             String acceptorProof = authenticator.computeProof(
                     initiatorNodeId, localNodeId, initiatorNonce, acceptorNonce,
                     HmacAuthenticator.ROLE_ACCEPTOR);
-            sendFrame(dout, new ClusterAuthChallengePacket(
+            sendFrame(dout, ClusterEnvelopes.authChallenge(
                     localNodeId, localHost, localClusterPort, localIncarnation,
-                    acceptorNonce, acceptorProof));
+                    ByteString.copyFromUtf8(acceptorNonce), ByteString.copyFromUtf8(acceptorProof)));
 
             // 3) Read the initiator's response and verify its proof (ROLE=INITIATOR).
-            ClusterAuthResponsePacket response =
-                    ClusterAuthResponsePacket.fromJson(readEnvelope(din, maxPacketSize));
+            ClusterAuthResponse response = readEnvelope(din, maxPacketSize).getClusterAuthResponse();
             String expectedInitiatorProof = authenticator.computeProof(
                     initiatorNodeId, localNodeId, initiatorNonce, acceptorNonce,
                     HmacAuthenticator.ROLE_INITIATOR);
-            if (!authenticator.proofsMatch(expectedInitiatorProof, response.getProof())) {
+            if (!authenticator.proofsMatch(expectedInitiatorProof, response.getProof().toStringUtf8())) {
                 metrics.incrementHandshakeAuthFailures();
                 throw new SecurityException("Cluster peer presented an invalid initiator proof");
             }
@@ -209,16 +214,13 @@ final class ClusterHandshake {
     // Wire helpers
     // -------------------------------------------------------------------------
 
-    private static void sendFrame(DataOutputStream dout, Packet packet) throws IOException {
-        JSONObject envelope = new JSONObject();
-        envelope.put("header", new JSONObject(new String(packet.getHeader(), StandardCharsets.UTF_8)));
-        envelope.put("body", new JSONObject(new String(packet.getBody(), StandardCharsets.UTF_8)));
-        PacketFraming.writeFrame(dout, envelope.toString().getBytes(StandardCharsets.UTF_8));
+    private static void sendFrame(DataOutputStream dout, ClusterEnvelope envelope) throws IOException {
+        PacketFraming.writeFrame(dout, WireCodec.encodeCluster(envelope));
     }
 
-    private static JSONObject readEnvelope(DataInputStream din, int maxPacketSize) throws IOException {
+    private static ClusterEnvelope readEnvelope(DataInputStream din, int maxPacketSize) throws IOException {
         byte[] frame = PacketFraming.readFrame(din, maxPacketSize);
-        return new JSONObject(new String(frame, StandardCharsets.UTF_8));
+        return WireCodec.decodeCluster(frame, maxPacketSize);
     }
 
     private static void restoreSoTimeout(Socket socket, int soTimeoutMs) {
