@@ -2,6 +2,7 @@ package de.kyle.avenue.cluster;
 
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
+import de.kyle.avenue.net.SocketFactoryProvider;
 import de.kyle.avenue.packet.cluster.ClusterPublishPacket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,6 +46,9 @@ public class ClusterManager implements ClusterForwarder {
     private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final MessageDeduplicator deduplicator = new MessageDeduplicator();
 
+    /** Yields plain or TLS cluster sockets depending on {@code cluster.tls.enabled} (E14). */
+    private final SocketFactoryProvider socketFactoryProvider;
+
     /** Active links keyed by the remote node's ID. */
     private final ConcurrentHashMap<String, PeerLink> activePeers = new ConcurrentHashMap<>();
 
@@ -59,6 +63,13 @@ public class ClusterManager implements ClusterForwarder {
     public ClusterManager(AvenueConfig config, TopicSubscriptionHandler topicSubscriptionHandler) {
         this.config = config;
         this.topicSubscriptionHandler = topicSubscriptionHandler;
+        this.socketFactoryProvider = SocketFactoryProvider.forCluster(
+                config.isClusterTlsEnabled(),
+                config.getClusterTlsKeystorePath(),
+                config.getClusterTlsKeystorePassword(),
+                config.getClusterTlsTruststorePath(),
+                config.getClusterTlsTruststorePassword()
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -172,9 +183,10 @@ public class ClusterManager implements ClusterForwarder {
 
     private void acceptLoop() {
         int port = config.getClusterPort();
-        try (ServerSocket server = new ServerSocket(port)) {
+        try (ServerSocket server = socketFactoryProvider.createServerSocket(port)) {
             clusterServerSocket = server;
-            log.info("Cluster accept loop bound on port {}", server.getLocalPort());
+            log.info("Cluster accept loop bound on port {} (TLS={})",
+                    server.getLocalPort(), socketFactoryProvider.isTlsEnabled());
             boundLatch.countDown();
             while (running) {
                 try {
@@ -239,7 +251,7 @@ public class ClusterManager implements ClusterForwarder {
                 int port = Integer.parseInt(parts[1].trim());
 
                 log.debug("Connecting to cluster peer at {}:{}", host, port);
-                Socket socket = new Socket(host, port);
+                Socket socket = socketFactoryProvider.createSocket(host, port);
 
                 // Initiator-side handshake: send our hello first, then read peer's hello.
                 String remoteNodeId = ClusterHandshake.initiatorHandshake(
