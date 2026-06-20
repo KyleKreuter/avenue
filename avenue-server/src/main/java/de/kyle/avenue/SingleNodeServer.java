@@ -1,5 +1,6 @@
 package de.kyle.avenue;
 
+import de.kyle.avenue.cluster.ClusterForwarder;
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
@@ -31,9 +32,14 @@ import java.util.concurrent.Executors;
  *   <li>{@link #stop()} closes the server socket, which unblocks the accept loop and shuts the
  *       executor down for a clean teardown between tests.</li>
  * </ul>
+ * An optional {@link ClusterForwarder} can be injected so that the
+ * {@link de.kyle.avenue.handler.packet.publish.PublishMessageInboundPacketHandler} forwards
+ * local publishes to cluster peers. An external {@link TopicSubscriptionHandler} can also be
+ * injected to share the subscription table with the cluster delivery path. When neither is
+ * supplied the server operates in pure single-node mode (all existing tests are unaffected).
+ * <p>
  * The production entry point ({@link AvenueApplication#main}) keeps its previous blocking
- * behaviour: the no-arg constructor loads the file/env config, starts the server and blocks
- * the calling thread until the accept loop terminates.
+ * behaviour.
  */
 public class SingleNodeServer {
     private static final Logger log = LoggerFactory.getLogger(SingleNodeServer.class);
@@ -62,23 +68,41 @@ public class SingleNodeServer {
     }
 
     /**
-     * Testable constructor: builds the server around an injected configuration but does NOT
-     * start it. Call {@link #start()} to bind and begin accepting, then {@link #getPort()} to
-     * learn the bound port. This never blocks the caller.
+     * Testable constructor (no clustering). Uses a fresh {@link TopicSubscriptionHandler}
+     * and {@link ClusterForwarder#NOOP}. Fully backwards-compatible.
      *
-     * @param avenueConfig the configuration to use (secret/token/port/packetSize/queue tuning)
+     * @param avenueConfig the configuration to use
      */
     public SingleNodeServer(AvenueConfig avenueConfig) {
+        this(avenueConfig, new TopicSubscriptionHandler(), ClusterForwarder.NOOP);
+    }
+
+    /**
+     * Cluster-aware constructor with an externally managed {@link TopicSubscriptionHandler}.
+     * The shared handler allows the {@link de.kyle.avenue.cluster.ClusterManager} and this
+     * server to operate on the same subscription table, so cluster-delivered messages reach
+     * local subscribers registered via this server's client connections.
+     *
+     * @param avenueConfig              the configuration to use
+     * @param topicSubscriptionHandler  shared subscription table
+     * @param clusterForwarder          non-blocking forwarder; {@link ClusterForwarder#NOOP} disables forwarding
+     */
+    public SingleNodeServer(
+            AvenueConfig avenueConfig,
+            TopicSubscriptionHandler topicSubscriptionHandler,
+            ClusterForwarder clusterForwarder
+    ) {
         this.avenueConfig = avenueConfig;
         AuthenticationTokenHandler authenticationTokenHandler = new AuthenticationTokenHandler(this.avenueConfig);
-        this.topicSubscriptionHandler = new TopicSubscriptionHandler();
+        this.topicSubscriptionHandler = topicSubscriptionHandler;
         this.executorService = Executors.newVirtualThreadPerTaskExecutor();
         this.packetDeserializer = new PacketDeserializer(this.avenueConfig);
         this.packetSerializer = new PacketSerializer(this.avenueConfig);
         this.inboundPacketHandler = new InboundPacketHandler(
                 authenticationTokenHandler,
                 topicSubscriptionHandler,
-                executorService
+                executorService,
+                clusterForwarder
         );
         Runtime.getRuntime().addShutdownHook(new Thread(this::stop));
     }
@@ -101,7 +125,6 @@ public class SingleNodeServer {
         this.acceptThread = new Thread(this::acceptLoop, "avenue-accept-loop");
         this.acceptThread.start();
         try {
-            // Wait until the accept loop has bound the socket (or failed) before returning.
             boundLatch.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -126,8 +149,6 @@ public class SingleNodeServer {
                     );
                     this.executorService.execute(clientConnectionHandler);
                 } catch (IOException e) {
-                    // A close() on the server socket surfaces here as a SocketException; that is
-                    // the expected, clean way the accept loop exits on stop().
                     if (running) {
                         log.warn("Exception while trying to accept connection: {}", e.getMessage());
                     }
@@ -136,7 +157,6 @@ public class SingleNodeServer {
         } catch (IOException e) {
             log.error("Could not bind server socket: {}", e.getMessage());
         } finally {
-            // Release any waiter even if binding failed, so start() never hangs.
             boundLatch.countDown();
             stop();
         }
@@ -175,7 +195,6 @@ public class SingleNodeServer {
         }
         log.info("Stopping server");
         this.running = false;
-        // Closing the server socket unblocks ServerSocket.accept() in the accept loop.
         ServerSocket socket = this.serverSocket;
         if (socket != null && !socket.isClosed()) {
             try {
