@@ -15,6 +15,7 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * NIO event-loop counterpart of
@@ -53,6 +54,7 @@ public final class NioClientConnection implements ClientConnection {
     private final Runnable onDisconnect;
     private final int maxPacketSize;
     private final int outboundCapacity;
+    private final long offerTimeoutNanos;
     private final BackpressurePolicy backpressurePolicy;
 
     /** Set once the connection is registered with its worker's selector. */
@@ -73,8 +75,26 @@ public final class NioClientConnection implements ClientConnection {
     private final Deque<ByteBuffer> outbound = new ArrayDeque<>();
     private final Object outboundLock = new Object();
 
+    /**
+     * Nanotime when the outbound queue first rose above {@link #outboundCapacity} and stayed there,
+     * or {@code 0} while it is below the soft cap. Drives the offer-timeout grace before the
+     * backpressure policy is applied, mirroring the blocking transport's {@code offer(timeout)}: a
+     * transient burst is tolerated (the frame is still enqueued, never lost), only a queue that stays
+     * full beyond the offer timeout is treated as a genuine slow consumer. Guarded by
+     * {@link #outboundLock}.
+     */
+    private long overflowSinceNanos;
+
     /** Last time (nanos) a byte was read from this connection, for the idle-timeout sweep. */
     private volatile long lastReadNanos = System.nanoTime();
+
+    /**
+     * Coalescing flag for the cross-thread {@code OP_WRITE} enable: a foreign-thread producer enqueues
+     * this connection on its owning worker's pending-writes queue only when this flag flips from
+     * {@code false} to {@code true}, so a burst of fan-out frames produces a single queue entry
+     * instead of one per frame.
+     */
+    private final AtomicBoolean writeEnableQueued = new AtomicBoolean();
 
     /** Guards the single-shot close semantics (cancel key, unsubscribe, onDisconnect run once). */
     private volatile boolean closed;
@@ -93,6 +113,7 @@ public final class NioClientConnection implements ClientConnection {
         this.onDisconnect = onDisconnect;
         this.maxPacketSize = config.getPacketSize();
         this.outboundCapacity = Math.max(1, config.getOutboundQueueCapacity());
+        this.offerTimeoutNanos = Math.max(0, config.getOutboundQueueOfferTimeoutMillis()) * 1_000_000L;
         this.backpressurePolicy = config.getBackpressurePolicy();
     }
 
@@ -110,6 +131,21 @@ public final class NioClientConnection implements ClientConnection {
 
     long lastReadNanos() {
         return lastReadNanos;
+    }
+
+    /**
+     * Atomically marks that this connection has been enqueued for an {@code OP_WRITE} enable.
+     *
+     * @return {@code true} if the caller won the race and should enqueue it (flag flipped
+     *         {@code false -> true}); {@code false} if it was already queued
+     */
+    boolean markWriteEnableQueued() {
+        return writeEnableQueued.compareAndSet(false, true);
+    }
+
+    /** Clears the write-enable coalescing flag once the worker has processed the enqueue. */
+    void clearWriteEnableQueued() {
+        writeEnableQueued.set(false);
     }
 
     // ------------------------------------------------------------------
@@ -156,43 +192,56 @@ public final class NioClientConnection implements ClientConnection {
         if (closed) {
             return;
         }
-        boolean overflow = false;
+        int depth;
+        boolean sustainedOverflow = false;
+        boolean dropped = false;
         synchronized (outboundLock) {
-            if (outbound.size() >= outboundCapacity) {
-                overflow = true;
-            } else {
+            long now = System.nanoTime();
+            if (outbound.size() < outboundCapacity) {
+                // Under the soft cap: enqueue normally and clear any pending overflow timer.
                 outbound.addLast(framed);
+                overflowSinceNanos = 0;
+            } else {
+                // At/over the soft cap. Start the grace timer on the first overflow; once it has been
+                // full continuously for longer than the offer timeout the consumer is genuinely slow.
+                if (overflowSinceNanos == 0) {
+                    overflowSinceNanos = now;
+                }
+                boolean graceExpired = now - overflowSinceNanos >= offerTimeoutNanos;
+                if (graceExpired && backpressurePolicy == BackpressurePolicy.DROP_MESSAGE) {
+                    // DROP_MESSAGE: discard this frame, keep the connection (matches blocking).
+                    dropped = true;
+                } else if (graceExpired) {
+                    // DISCONNECT_SLOW_CONSUMER: tear the connection down (scheduled below).
+                    sustainedOverflow = true;
+                } else {
+                    // Still within the grace window: tolerate the transient burst and enqueue the
+                    // frame (the blocking transport's offer() also succeeds within the timeout, so no
+                    // message is lost for a short spike).
+                    outbound.addLast(framed);
+                }
             }
+            depth = outbound.size();
         }
-        if (overflow) {
-            applyBackpressure();
-            return;
-        }
-        metrics.incrementMessagesDelivered();
-        metrics.recordOutboundQueueDepth(queueDepth());
-        // Cross-thread wakeup: register OP_WRITE interest on the OWNING worker, never touch
-        // interestOps from this (possibly foreign) thread.
-        worker.enableWrite(this);
-    }
-
-    private void applyBackpressure() {
-        if (backpressurePolicy == BackpressurePolicy.DROP_MESSAGE) {
+        if (dropped) {
             metrics.incrementDroppedMessages();
             log.warn("Outbound queue for {} is full, dropping message (DROP_MESSAGE policy)",
                     remoteAddress());
-        } else {
+            return;
+        }
+        if (sustainedOverflow) {
             metrics.incrementSlowConsumerDisconnects();
-            log.warn("Outbound queue for {} is full, disconnecting slow consumer "
-                    + "(DISCONNECT_SLOW_CONSUMER policy)", remoteAddress());
+            log.warn("Outbound queue for {} stayed full beyond the offer timeout, disconnecting slow "
+                    + "consumer (DISCONNECT_SLOW_CONSUMER policy)", remoteAddress());
             // Closing must run on the owning worker (touches the selection key); schedule it.
             worker.closeConnection(this);
+            return;
         }
-    }
-
-    private int queueDepth() {
-        synchronized (outboundLock) {
-            return outbound.size();
-        }
+        metrics.incrementMessagesDelivered();
+        metrics.recordOutboundQueueDepth(depth);
+        // Cross-thread wakeup: register OP_WRITE interest on the OWNING worker, never touch
+        // interestOps from this (possibly foreign) thread.
+        worker.enableWrite(this);
     }
 
     // ------------------------------------------------------------------
@@ -298,6 +347,11 @@ public final class NioClientConnection implements ClientConnection {
                 // The head we just fully wrote is still the front element; remove it.
                 if (!outbound.isEmpty() && outbound.peekFirst() == head) {
                     outbound.removeFirst();
+                }
+                // Draining back under the soft cap clears the overflow grace timer so a consumer that
+                // recovers is not penalized for an earlier transient spike.
+                if (outbound.size() < outboundCapacity) {
+                    overflowSinceNanos = 0;
                 }
             }
         }

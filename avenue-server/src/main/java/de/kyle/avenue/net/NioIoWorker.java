@@ -51,8 +51,21 @@ final class NioIoWorker implements Runnable {
     private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final long idleTimeoutMillis;
 
-    /** Cross-thread task queue, drained at the top of every loop iteration. */
+    /**
+     * Cross-thread control task queue for the rare register/close operations. The per-message
+     * {@code OP_WRITE} enable does NOT go here — it uses the allocation-free {@link #pendingWrites}
+     * queue below, so the hot fan-out path never allocates a {@link Runnable}.
+     */
     private final Queue<Runnable> taskQueue = new ConcurrentLinkedQueue<>();
+
+    /**
+     * Connections that need {@code OP_WRITE} enabled, drained once per loop iteration. A connection
+     * enqueues itself here at most once (guarded by its own {@code writeEnableQueued} flag), so a
+     * burst of fan-out frames produces a single entry instead of one {@link Runnable} per frame —
+     * this is the fix for the {@code drainTasks}/{@code ConcurrentLinkedQueue.offer} hot spot the
+     * naive per-frame-task design produced.
+     */
+    private final Queue<NioClientConnection> pendingWrites = new ConcurrentLinkedQueue<>();
 
     private volatile Thread thread;
     private volatile boolean running = true;
@@ -77,6 +90,26 @@ final class NioIoWorker implements Runnable {
         this.thread.start();
     }
 
+    /** Whether the calling thread is this worker's own event-loop thread. */
+    boolean isWorkerThread() {
+        return Thread.currentThread() == this.thread;
+    }
+
+    /**
+     * Sets {@code OP_WRITE} on the connection's key directly. Only safe to call on the worker thread
+     * (the same-thread fast path and the {@link #pendingWrites} drain). Touching {@code interestOps}
+     * off-thread would race the selector, which is exactly why foreign threads go through the queue.
+     */
+    void enableWriteOnWorker(NioClientConnection connection) {
+        if (connection.isClosed()) {
+            return;
+        }
+        SelectionKey key = keyFor(connection);
+        if (key != null && key.isValid()) {
+            key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Cross-thread entry points (callable from any thread)
     // ------------------------------------------------------------------
@@ -89,7 +122,13 @@ final class NioIoWorker implements Runnable {
     void register(NioClientConnection connection) {
         execute(() -> {
             try {
-                SelectionKey key = connection.channel().register(selector, SelectionKey.OP_READ, connection);
+                int ops = SelectionKey.OP_READ;
+                // Defensive: if an outbound frame was already enqueued before this registration ran
+                // (a producer racing the acceptor), arm OP_WRITE immediately so it is not stranded.
+                if (connection.hasPendingWrites()) {
+                    ops |= SelectionKey.OP_WRITE;
+                }
+                SelectionKey key = connection.channel().register(selector, ops, connection);
                 connection.setKey(key);
             } catch (ClosedChannelException e) {
                 log.warn("Failed to register NIO connection (channel already closed)", e);
@@ -98,17 +137,26 @@ final class NioIoWorker implements Runnable {
         });
     }
 
-    /** Asks this worker to enable {@code OP_WRITE} for {@code connection}. Safe from any thread. */
+    /**
+     * Asks this worker to enable {@code OP_WRITE} for {@code connection}. Safe from any thread.
+     * <ul>
+     *   <li>Same-thread fast path: when the caller already <em>is</em> this worker (the common case —
+     *       inline publish fan-out runs on the publisher's worker, and a subscriber on the same worker
+     *       needs no hop), {@code interestOps} is set directly with no queue and no wakeup.</li>
+     *   <li>Cross-thread path: the connection enqueues itself onto {@link #pendingWrites} at most once
+     *       (coalesced via its own flag) and wakes the selector. No per-frame {@link Runnable} is
+     *       allocated.</li>
+     * </ul>
+     */
     void enableWrite(NioClientConnection connection) {
-        execute(() -> {
-            if (connection.isClosed()) {
-                return;
-            }
-            SelectionKey key = keyFor(connection);
-            if (key != null && key.isValid()) {
-                key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
-            }
-        });
+        if (isWorkerThread()) {
+            enableWriteOnWorker(connection);
+            return;
+        }
+        if (connection.markWriteEnableQueued()) {
+            pendingWrites.add(connection);
+            selector.wakeup();
+        }
     }
 
     /** Asks this worker to close {@code connection}. Safe from any thread. */
@@ -131,6 +179,7 @@ final class NioIoWorker implements Runnable {
         try {
             while (running) {
                 drainTasks();
+                drainPendingWrites();
                 if (!running) {
                     break;
                 }
@@ -177,6 +226,18 @@ final class NioIoWorker implements Runnable {
             } catch (Exception e) {
                 log.warn("NIO worker {} task failed", id, e);
             }
+        }
+    }
+
+    /**
+     * Drains the coalesced write-enable queue, clearing each connection's flag and setting
+     * {@code OP_WRITE}. Runs on the worker thread, so {@code interestOps} is set safely.
+     */
+    private void drainPendingWrites() {
+        NioClientConnection connection;
+        while ((connection = pendingWrites.poll()) != null) {
+            connection.clearWriteEnableQueued();
+            enableWriteOnWorker(connection);
         }
     }
 

@@ -148,8 +148,112 @@ Arbeitspunkt (`rate=120000`), und die abgeleiteten ns/Nachricht (= 1e9 / Saettig
 | 1.5 — `data` als `bytes` (opaker Passthrough) | 246 000 – 261 000 (Streuband) | ~3900 | 0.134 |
 | 4a — Outbound-Encode ohne Builder (JFR: Alloc-Win) | ~290 000 (Paare, flach) | n/a | ~0.13 |
 | 2 — Protokoll-Pipelining / Batched Publish | | | |
-| 3 — Event-Loop-IO-Rewrite | | | |
+| 3 — Event-Loop-IO (nio) | ~268 000 – 296 000 (Paare P=8, io-threads=4) | n/a | s. u. |
 | 4 — Allokations-/GC-Disziplin | | | |
+
+## Stufe 3 — Event-Loop-IO (hand-rolled NIO-Selector, `server.io-mode=nio`)
+
+> **Ehrliche Einordnung vorweg.** Auf **einer** Maschine (Loopback, Lastgenerator + Server teilen
+> sich die Kerne) bringt der NIO-Transport **keinen** Durchsatzgewinn gegenueber Blocking — beide
+> liegen bei den unabhaengigen Paaren P=8 im selben Band (~270–296k msg/s). Was der JFR **belegt** und
+> was das eigentliche Ziel dieser Stufe war: Der strukturelle **Virtual-Thread-park/unpark-Block
+> (~12–15 %)** aus der Reader→Writer-Thread-Uebergabe des Blocking-Modells ist im NIO-Modus
+> **vollstaendig verschwunden**. Der erwartete Multi-Core-Skalierungsnutzen Richtung 1M laesst sich —
+> wie in Stufe 0/Out-of-process bereits festgehalten — nur auf einer **zweiten Maschine** (Last uebers
+> Netz, nicht Loopback) validieren; co-located ist der Server-Effizienzgewinn durch
+> Thread-Oversubscription verdeckt.
+
+### Was implementiert wurde (Schritt B)
+
+Zweite `ClientConnection`-Implementierung hinter einem Config-Schalter, **Default bleibt Blocking**:
+
+- `server.io-mode = blocking` (Default, unveraendert) | `nio`; `server.nio.io-threads` (Default =
+  `availableProcessors()`).
+- **Acceptor** (ein Thread, non-blocking `ServerSocketChannel`) verteilt akzeptierte Channels
+  **round-robin** an N **I/O-Worker**, jeder mit eigenem `Selector` + disjunkter Connection-Menge.
+- **`NioClientConnection`** rahmt die Nutzlast mit demselben 4-Byte-Big-Endian-Praefix wie
+  `PacketFraming`; `enqueuePreSerialized` traegt — **wie im Blocking-Modus** — die **bare** Payload,
+  die Connection rahmt sie. Cross-thread-Wakeup: der Fremd-Thread setzt **nie** `interestOps` direkt,
+  sondern reiht die Connection (koaleszierend, ein Eintrag pro Burst) in die Pending-Write-Queue des
+  ownenden Workers + `selector.wakeup()`. Same-Worker-Fast-Path setzt `OP_WRITE` direkt ohne Queue.
+- **Framing ueber partielle Reads**: per-Connection-Akkumulationspuffer, in einer Schleife alle
+  vollstaendigen Frames extrahieren, Rest behalten/kompaktieren; negative/zu grosse Laenge ->
+  Connection schliessen (wie `PacketFraming.readFrame`).
+- **OP_WRITE-Backpressure**: Outbound-Deque bounded auf `server.outbound.queue.capacity`; bei
+  anhaltendem Ueberlauf jenseits des `offer-timeout` greift die konfigurierte Policy
+  (`DISCONNECT_SLOW_CONSUMER` -> close, `DROP_MESSAGE` -> Frame verwerfen), **gleiche Metriken** wie
+  Blocking. Ein transienter Burst innerhalb des Grace-Fensters wird toleriert (kein Verlust) — das
+  entspricht dem `offer(timeout)` des Blocking-Writers.
+- **Idle-Sweep** pro Worker (Sekundentakt via Select-Timeout) schliesst Connections, die laenger als
+  `idle-timeout-ms` nichts gesendet haben (gleiche Semantik; 0 = aus).
+- **Max-Connections** beim Accept gegen `activeConnections` geprueft -> ueber Limit sofort
+  schliessen + `connectionsRejected` (gleiche Semantik wie `SingleNodeServer`).
+- **TLS**: SSLEngine-ueber-NIO ist **nicht** Teil dieses Schritts. Bei `server.tls.enabled=true` UND
+  `server.io-mode=nio` loggt der Server eine WARN und faellt auf **Blocking** zurueck, damit der
+  TlsIntegrationTest (Blocking) unveraendert gruen bleibt. SSLEngine-NIO = Future Work.
+
+### Korrektheit
+
+- Neuer `integration/NioIntegrationTest`: voller Pfad ueber echte `TestClient`s gegen einen
+  `SingleNodeServer` mit `io-mode=nio` (ephemerer Port): connect -> auth -> subscribe (SubscribeAck)
+  -> publish -> cross-client receive; Fan-out an zwei Subscriber; Wrong-Token-Drop; **5000
+  Nachrichten ueber EINE Connection** (Framing ueber partielle Reads / mehrere Frames pro select).
+  Deterministisch (Latches/await, keine Sleeps).
+- **Alle 96 Tests** (92 Bestand + 4 neu) bleiben mit Default (Blocking) **unveraendert gruen**,
+  `mvn clean test` mehrfach wiederholt. Der einzige sporadische Ausreisser ist der bereits zuvor
+  flaky `SwimMembershipTest` (Cluster-Gossip-Konvergenz, timing-abhaengig, beruehrt den
+  Client-Transport ueberhaupt nicht).
+
+### JFR — Durchsatz und Hot-Methods (Out-of-process, P=8, topics=8, sub=1, msgSize=100, 15–20 s)
+
+Maschine: Apple Silicon (arm64, 11 logische Kerne), Corretto 21.0.5, Loopback, Server + Last in
+getrennten JVMs.
+
+| Transport | io-threads | Durchsatz (msg/s, 3 Laeufe) |
+| --- | --- | --- |
+| blocking | — | 287 768 / 289 793 / 291 381 (stabil) |
+| nio | 11 (= `availableProcessors`) | 90 888 / 156 290 / 175 186 (**stark streuend, schlechter**) |
+| nio | 4 | 262 827 / 268 517 / 295 671 (**Parity zu Blocking**) |
+
+**Erklaerung der nio@11-Regression:** 11 Selector-Worker + 16 Connections + 8 Lastgenerator-Threads
+auf 11 Kernen = massive **Thread-Oversubscription**, wenn Server und Last **dieselbe** Maschine
+teilen. Mit `io-threads=4` verschwindet die Oversubscription und NIO liegt gleichauf mit Blocking
+(bester Lauf 296k > Blocking). In Produktion (Server allein auf der Box) ist `availableProcessors`
+sinnvoll; fuer den co-located Bench ist 4 die faire Einstellung.
+
+**`jfr view hot-methods` — der entscheidende Vergleich (park/unpark weg?):**
+
+- **Blocking** (Top-Block): `ForkJoinTask$RunnableExecuteAction.exec` **10,0 %**,
+  `LockSupport.unpark` **3,9 %**, `LinkedTransferQueue$DualNode.await` **2,2 %**,
+  `unparkVirtualThread` **1,3 %** — zusammen ~17 % reine Virtual-Thread-Reader→Writer-Hop-Mechanik.
+- **NIO (io-threads=4)**: **0** Samples in `unparkVirtualThread`, `ForkJoinTask.exec`,
+  `LockSupport.unpark`, `LinkedTransferQueue.await`. Der Selector selbst
+  (`KQueueSelectorImpl.doSelect`/`setEventOps`) liegt bei ~1–2 %. Das Top-Profil ist jetzt reine
+  Nutzarbeit: protobuf parse/encode (`Utf8.encode`, `charAt`, `mergeFrom`), `fanOut`, `writeOutbound`,
+  Topic-`toLowerCase`, HMAC-`MessageDigest.isEqual`.
+
+> **Naive-Design-Befund (festgehalten, weil lehrreich):** Die **erste** NIO-Fassung reihte pro
+> Fan-out-Frame einen `Runnable` in eine `ConcurrentLinkedQueue` des Ziel-Workers ein. JFR zeigte
+> `NioIoWorker.drainTasks` **18 %** + `ConcurrentLinkedQueue.offer/poll` **~11 %** — der park/unpark-
+> Block war zwar weg, aber durch Task-Queue-Traffic ersetzt. Fix: **koaleszierende** Pending-Write-
+> Queue (eine Connection reiht sich pro Burst genau einmal ein, atomare Flagge) **plus**
+> Same-Worker-Fast-Path (kein Hop, wenn Producer = ownender Worker). Danach ist `drainTasks` aus dem
+> Top-25 verschwunden und der Durchsatz von ~140–175k auf ~268–296k gestiegen (Parity).
+
+**`jfr view allocation-by-class`:** In beiden Modi dominiert `byte[]` (~53 %, protobuf-Payload).
+NIO ergaenzt `HeapByteBuffer` (~4 %, der per-Frame gerahmte Buffer — ein zusaetzlicher Copy
+gegenueber dem direkten Write des Blocking-Writers) und `ConcurrentLinkedQueue$Node` (~2 %,
+Pending-Write-/Control-Queue). Kein neuer dominanter Allokations-Hotspot.
+
+### Fazit Stufe 3
+
+Der NIO-Selector-Transport liefert **dieselbe Client-Protokoll-Semantik** wie Blocking (Framing,
+Auth, Backpressure-Policy, Idle, Max-Conn, Metriken — per Integrationstest belegt) und entfernt den
+**Virtual-Thread-park/unpark-Block restlos** (JFR). Beim **Durchsatz auf einer Maschine** ist NIO
+mit richtig dimensionierten `io-threads` **gleichauf** mit Blocking, nicht besser — der erwartete
+Multi-Core-Skalierungsvorteil ist co-located durch geteilte CPU verdeckt und braucht zur Validierung
+eine **zweite Maschine** (Last uebers Netz). Default bleibt bewusst `blocking`; `nio` ist der
+opt-in-Schalter fuer den spaeteren Skalierungsnachweis.
 
 > **Stufe 1 — ehrliche Einordnung.** Die vier Hot-Path-Optimierungen (encode-once Fan-out, Inline-
 > Delivery statt Executor-Hop, gepufferter Read, einmalige Topic-Normalisierung) sind umgesetzt und

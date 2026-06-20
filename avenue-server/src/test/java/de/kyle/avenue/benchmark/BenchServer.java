@@ -70,6 +70,11 @@ public final class BenchServer {
     public static void main(String[] args) throws Exception {
         int port = (int) longArg(args, "port", DEFAULT_PORT);
         String host = stringArg(args, "host", "127.0.0.1");
+        // Transport selector for the benchmark: io-mode=blocking (default) or io-mode=nio. nio also
+        // accepts an optional io-threads= override (default = availableProcessors). This lets the
+        // perf comparison drive the exact same BenchServer config through both transports.
+        String ioMode = stringArg(args, "io-mode", "blocking");
+        int ioThreads = (int) longArg(args, "io-threads", 0);
 
         // Direct-value (test) config. The 26-arg overload is the one that lets us pin
         // clientIdleTimeoutMillis=0 (no reaping) and maxConnections=0 (unlimited). serverTcpNoDelay
@@ -95,6 +100,11 @@ public final class BenchServer {
                 false, "", "",          // server TLS off
                 false, "", "", "", ""   // cluster TLS off
         );
+        // Flip the transport via the copy constructor (direct-value configs always default to
+        // blocking). io-mode=blocking leaves the config untouched.
+        config = new AvenueConfig(config, ioMode, ioThreads);
+        System.out.printf(Locale.ROOT, "BenchServer io-mode=%s nioIoThreads=%d%n",
+                config.getServerIoMode(), config.getServerNioIoThreads());
 
         SingleNodeServer server = new SingleNodeServer(config);
         // Clean shutdown on Ctrl-C / process kill (SIGTERM). SingleNodeServer also registers its own

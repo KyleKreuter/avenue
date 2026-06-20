@@ -51,8 +51,11 @@ class NioIntegrationTest {
                 true,
                 SECRET,
                 TOKEN,
-                0, // ephemeral port
-                1024,
+                0,         // ephemeral port
+                1_000_000, // large outbound queue: the 5000-message burst exercises FRAMING across
+                           // partial reads, not backpressure. A generous capacity keeps the test
+                           // deterministic even when the whole suite competes for CPU (the slow-
+                           // consumer disconnect path has its own dedicated coverage elsewhere).
                 100
         );
         AvenueConfig config = new AvenueConfig(base, "nio", 0);
