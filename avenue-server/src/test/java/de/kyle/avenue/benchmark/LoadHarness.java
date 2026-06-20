@@ -1,5 +1,6 @@
 package de.kyle.avenue.benchmark;
 
+import com.google.protobuf.ByteString;
 import de.kyle.avenue.SingleNodeServer;
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.proto.AuthTokenRequest;
@@ -533,8 +534,9 @@ public final class LoadHarness {
             if (!recording.value) {
                 return;
             }
-            // Latency mode: payload is "<sentNanos>:<filler>". Parse the timestamp prefix.
-            String data = publish.getData();
+            // Latency mode: payload is "<sentNanos>:<filler>". Parse the timestamp prefix. The wire
+            // field is now opaque bytes; decode once here on the subscriber (client) side only.
+            String data = publish.getData().toStringUtf8();
             int colon = data.indexOf(':');
             if (colon <= 0) {
                 return;
@@ -620,7 +622,7 @@ public final class LoadHarness {
     private static ClientEnvelope publishEnvelope(String topic, String data) {
         return ClientEnvelope.newBuilder()
                 .setPublishInbound(PublishInbound.newBuilder()
-                        .setTopic(topic).setData(data).setSource("load").setToken(TOKEN).build())
+                        .setTopic(topic).setData(ByteString.copyFromUtf8(data)).setSource("load").setToken(TOKEN).build())
                 .build();
     }
 

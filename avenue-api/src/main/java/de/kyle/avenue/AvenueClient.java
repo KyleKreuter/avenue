@@ -1,5 +1,6 @@
 package de.kyle.avenue;
 
+import com.google.protobuf.ByteString;
 import de.kyle.avenue.config.AvenueClientConfig;
 import de.kyle.avenue.message.Message;
 import de.kyle.avenue.proto.AuthTokenRequest;
@@ -157,7 +158,12 @@ public class AvenueClient {
                             log.debug("Received a message for an unregistered topic '{}', ignoring", topic);
                             break;
                         }
-                        topicListener.onMessage(new Message(publish.getSource(), publish.getData()));
+                        // The payload is an opaque `bytes` field on the wire. The public Message API
+                        // still exposes it as a String, so we decode the UTF-8 bytes exactly ONCE here
+                        // at the client API edge — this is the single client-side decode point. The
+                        // server hot path itself never materializes the payload as a String.
+                        topicListener.onMessage(new Message(
+                                publish.getSource(), publish.getData().toStringUtf8()));
                     }
                     default -> log.debug("Received a packet of unhandled type '{}', ignoring",
                             envelope.getMsgCase());
@@ -180,7 +186,8 @@ public class AvenueClient {
                         .setTopic(normalizedTopic)
                         .setSource(this.clientName)
                         .setToken(this.authToken)
-                        .setData(data)
+                        // `data` is a `bytes` field: encode the caller's String to UTF-8 once here.
+                        .setData(ByteString.copyFromUtf8(data))
                         .build())
                 .build();
         writeEnvelopeLocked(envelope);

@@ -122,6 +122,7 @@ Arbeitspunkt (`rate=120000`), und die abgeleiteten ns/Nachricht (= 1e9 / Saettig
 | --- | --- | --- | --- |
 | 0 — Baseline | 253 556 | ~3944 | 0.114 |
 | 1 — Mechanische Hot-Path-Wins | 246 400 | ~4058 | 0.115 |
+| 1.5 — `data` als `bytes` (opaker Passthrough) | 246 000 – 261 000 (Streuband) | ~3900 | 0.134 |
 | 2 — Protokoll-Pipelining / Batched Publish | | | |
 | 3 — Event-Loop-IO-Rewrite | | | |
 | 4 — Allokations-/GC-Disziplin | | | |
@@ -145,6 +146,41 @@ Arbeitspunkt (`rate=120000`), und die abgeleiteten ns/Nachricht (= 1e9 / Saettig
 
 > Zusatz-Diagnose (kein Erfolgskriterium): die Fan-out-4-Werte aus dem 50k-Lauf oben bleiben als
 > Sekundaermessung erhalten, um Fan-out-Skalierung zu beobachten.
+
+> **Stufe 1.5 — `data` als `bytes` (opaker ByteString-Passthrough), ehrliche Einordnung.**
+> Profiler-Befund war: unter Last gingen relevante CPU-Anteile in
+> `String.charAt`/`StringLatin1.charAt`/`String.<init>(byte[])` — also protobuf, das das
+> `data`-`string`-Feld bei jedem Parse (bytes->String) und jedem Encode (String->bytes) Zeichen fuer
+> Zeichen UTF-8-transcodierte, obwohl der Server die Nutzlast nie anschaut. Der Fix: `data` in
+> `client.proto` (`PublishInbound`, `PublishOutbound`) und `cluster.proto` (`ClusterPublish`) von
+> `string` auf `bytes` umgestellt (Feldnummern unveraendert, hartes Cut-over). Die Nutzlast fliesst
+> jetzt als **immutable `ByteString`** vom Inbound-Parse bis zum Outbound-Encode durch — dieselbe
+> Instanz wird mit dem encode-once-Fan-out-Envelope und dem Cluster-Forward geteilt; sie wird auf dem
+> Server-Hotpath **nie** zu einem Java-`String`. `topic`/`source`/`token` bleiben `string`.
+>
+> **JFR-Gegencheck (isolierter Server, P=8-Last, 505 On-CPU-Samples):** Kein einziges
+> `charAt`/`Utf8.encode`/`String.<init>`-Sample beruehrt noch die Nutzlast — die payload-bezogene
+> Transcodierung ist **vollstaendig verschwunden** (0 Samples mit `getData`/payload im charAt/Utf8-
+> Stack). Die Nutzlast erscheint jetzt als `ByteString.LiteralByteString.<init>` / `copyOfRangeByte`
+> (reiner Byte-Copy). Der verbliebene String-/UTF-8-Anteil im Profil ist **per Design** Topic + Source
+> (weiter `string`-Felder) plus `TopicSubscriptionHandler.normalize` (`toLowerCase` auf dem Topic) —
+> also genau die Felder, die `string` bleiben sollten, NICHT die Nutzlast.
+>
+> **Durchsatz (out-of-process, isolierter Server):** Bei **1:1-Saettigung** liegt der Durchsatz im
+> selben Streuband wie vorher (246k–261k/s vs. Baseline 230–253k) — der Gewinn ist hier **innerhalb
+> des Mess-Rauschens**, weil bei 100-B-Nutzlast und Fan-out 1 die Server-CPU vom Lock-/Queue-/Park-
+> und protobuf-Builder-Overhead dominiert wird, nicht von der Payload-Transcodierung; und der
+> 1:1-Benchmark ist ohnehin ping-pong-latenz- statt CPU-limitiert. **Unabhaengige Paare P=8** liegen
+> stabil bei ~302–305k/s (Baseline ~298k). p99 @120k bleibt im Rauschband (~0.13 ms). Alle 87 Tests
+> bleiben gruen (≥3x `mvn clean test`).
+>
+> **Fazit ehrlich:** Der erhoffte grosse Makro-Durchsatzsprung bleibt bei dieser Nutzlastgroesse aus —
+> die ~40%-`charAt`-Zahl aus dem Ursprungsbefund stammte vermutlich aus einem Lauf mit groesserer
+> Nutzlast/anderem Sampling. Was der Fix **belegbar** leistet: Er entfernt die Payload-UTF-8-
+> Transcodierung als CPU-Block restlos und macht die Nutzlast zu einem geteilten, immutablen
+> Byte-Blob (passt zum encode-once-Fan-out). Der Nutzen waechst linear mit der Nutzlastgroesse und mit
+> dem Fan-out; bei grossen Payloads / hohem Fan-out ist das ein echter, dann auch im Durchsatz
+> sichtbarer Hebel.
 
 ## Out-of-process Messung (Server und Lastgenerator getrennt)
 

@@ -1,5 +1,6 @@
 package de.kyle.avenue.serialization;
 
+import com.google.protobuf.ByteString;
 import de.kyle.avenue.proto.ClientEnvelope;
 import de.kyle.avenue.proto.ClusterEnvelope;
 import de.kyle.avenue.proto.ClusterPublish;
@@ -28,7 +29,7 @@ class WireCodecTest {
                         .setTopic("orders")
                         .setSource("client-7")
                         .setToken("tok-abc")
-                        .setData("hello world")
+                        .setData(ByteString.copyFromUtf8("hello world"))
                         .build())
                 .build();
 
@@ -39,7 +40,7 @@ class WireCodecTest {
         assertEquals("orders", decoded.getPublishInbound().getTopic());
         assertEquals("client-7", decoded.getPublishInbound().getSource());
         assertEquals("tok-abc", decoded.getPublishInbound().getToken());
-        assertEquals("hello world", decoded.getPublishInbound().getData());
+        assertEquals("hello world", decoded.getPublishInbound().getData().toStringUtf8());
         assertEquals(original, decoded);
     }
 
@@ -53,7 +54,7 @@ class WireCodecTest {
                         .setOriginEpoch(1700000000000L)
                         .setSeq(42L)
                         .setLinkSeq(7L)
-                        .setData("payload")
+                        .setData(ByteString.copyFromUtf8("payload"))
                         .build())
                 .build();
 
@@ -132,7 +133,7 @@ class WireCodecTest {
     @Test
     void maxSizeGuardRejectsOversizedPayload() {
         ClusterEnvelope envelope = ClusterEnvelope.newBuilder()
-                .setClusterPublish(ClusterPublish.newBuilder().setData("x".repeat(64)).build())
+                .setClusterPublish(ClusterPublish.newBuilder().setData(ByteString.copyFromUtf8("x".repeat(64))).build())
                 .build();
         byte[] payload = WireCodec.encodeCluster(envelope);
         assertTrue(payload.length > 1, "payload should be non-trivial");

@@ -279,7 +279,7 @@ public class ClusterManager implements ClusterForwarder {
      * {@link ReplayBuffer}, never here on the publish path. The local delivery path is unaffected.
      */
     @Override
-    public void forward(String topic, String source, String data) {
+    public void forward(String topic, String source, com.google.protobuf.ByteString data) {
         if (targets.isEmpty()) {
             // No target ever discovered: do not burn a sequence number.
             return;

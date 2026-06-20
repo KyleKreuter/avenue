@@ -29,18 +29,25 @@ message SubscribeAck {
 }
 
 // Mirrors PublishMessageInboundPacket (header: topic, source, token; body: data).
+// `data` is `bytes` (not `string`): the server treats the payload as an opaque blob and never
+// transcodes it. On the wire it is the same UTF-8 bytes a string field would carry; only the
+// field type changed (field numbers are unchanged). This eliminates the per-message
+// bytes<->String UTF-8 transcoding (String.charAt / StringLatin1.charAt) that dominated the
+// server hot path under load.
 message PublishInbound {
   string topic = 1;
   string source = 2;
   string token = 3;
-  string data = 4;
+  bytes data = 4;
 }
 
 // Mirrors PublishMessageOutboundPacket (header: topic, source; body: data).
+// `data` is `bytes` — see PublishInbound.data. The opaque ByteString parsed from PublishInbound
+// is set here unchanged, so the payload flows through the server without ever becoming a String.
 message PublishOutbound {
   string topic = 1;
   string source = 2;
-  string data = 3;
+  bytes data = 3;
 }
 
 // Top-level client-plane envelope: exactly one message per frame.

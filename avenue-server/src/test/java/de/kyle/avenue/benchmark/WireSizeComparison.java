@@ -1,5 +1,6 @@
 package de.kyle.avenue.benchmark;
 
+import com.google.protobuf.ByteString;
 import de.kyle.avenue.proto.ClientEnvelope;
 import de.kyle.avenue.proto.ClusterEnvelope;
 import de.kyle.avenue.proto.ClusterPublish;
@@ -60,7 +61,7 @@ public final class WireSizeComparison {
         // Protobuf: exact bytes the codec puts on the wire (the bare ClientEnvelope payload).
         ClientEnvelope envelope = ClientEnvelope.newBuilder()
                 .setPublishOutbound(PublishOutbound.newBuilder()
-                        .setTopic(topic).setSource(source).setData(data).build())
+                        .setTopic(topic).setSource(source).setData(ByteString.copyFromUtf8(data)).build())
                 .build();
         int protobufBytes = WireCodec.encodeClient(envelope).length;
 
@@ -98,7 +99,7 @@ public final class WireSizeComparison {
                 .setClusterPublish(ClusterPublish.newBuilder()
                         .setTopic(topic).setSource(source).setOriginNodeId(originNodeId)
                         .setOriginEpoch(originEpoch).setSeq(seq).setLinkSeq(linkSeq)
-                        .setData(data).build())
+                        .setData(ByteString.copyFromUtf8(data)).build())
                 .build();
         int protobufBytes = WireCodec.encodeCluster(envelope).length;
 
