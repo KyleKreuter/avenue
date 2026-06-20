@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "de.kyle.avenue.proto";
+
+// Shared membership types used by the cluster control plane (SWIM, Phase E).
+// These mirror the existing JSON DTOs cluster/membership/{MemberState,GossipUpdate,Member}.
+
+// Lifecycle state of a cluster member, mirrors MemberState.java.
+// Field number 0 is ALIVE so the proto3 default matches the JSON default ("ALIVE").
+enum MemberStateProto {
+  ALIVE = 0;
+  SUSPECT = 1;
+  DEAD = 2;
+  LEFT = 3;
+}
+
+// One membership fact piggybacked on SWIM packets, mirrors GossipUpdate.java
+// (nodeId, state, incarnation, host, clusterPort). The JSON form keeps "state" as a string;
+// here it is the MemberStateProto enum.
+message GossipUpdate {
+  string node_id = 1;
+  MemberStateProto state = 2;
+  int64 incarnation = 3;
+  string host = 4;
+  int32 cluster_port = 5;
+}
+
+// Full member snapshot, mirrors Member.java
+// (nodeId, host, clusterPort, incarnation, state, stateChangedAtMillis).
+message MemberProto {
+  string node_id = 1;
+  string host = 2;
+  int32 cluster_port = 3;
+  int64 incarnation = 4;
+  MemberStateProto state = 5;
+  int64 state_changed_at_millis = 6;
+}
