@@ -2,6 +2,7 @@ package de.kyle.avenue.handler.packet;
 
 import de.kyle.avenue.annotation.Secured;
 import de.kyle.avenue.annotation.TopicHandler;
+import de.kyle.avenue.cluster.ClusterForwarder;
 import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.handler.packet.auth.AuthTokenRequestInboundPacketHandler;
@@ -24,19 +25,40 @@ import java.util.concurrent.ExecutorService;
  * handler's {@code handle} method are resolved exactly once at registration time and cached
  * as boolean flags inside a {@link RegisteredHandler}. The hot path therefore performs no
  * reflection or annotation scanning per packet.
+ * <p>
+ * An optional {@link ClusterForwarder} is injected into
+ * {@link PublishMessageInboundPacketHandler} to forward local publishes to cluster peers.
+ * When clustering is disabled, {@link ClusterForwarder#NOOP} is used automatically.
  */
 public class InboundPacketHandler {
     private final Map<String, RegisteredHandler> packethandlerMap = new ConcurrentHashMap<>();
     private final AuthenticationTokenHandler authenticationTokenHandler;
 
+    /**
+     * Single-node constructor (no clustering). Fully backwards-compatible with existing callers.
+     */
     public InboundPacketHandler(
             AuthenticationTokenHandler authenticationTokenHandler,
             TopicSubscriptionHandler topicSubscriptionHandler,
             ExecutorService executorService
     ) {
+        this(authenticationTokenHandler, topicSubscriptionHandler, executorService, ClusterForwarder.NOOP);
+    }
+
+    /**
+     * Cluster-aware constructor. The supplied {@code clusterForwarder} is injected into the
+     * {@link PublishMessageInboundPacketHandler}.
+     */
+    public InboundPacketHandler(
+            AuthenticationTokenHandler authenticationTokenHandler,
+            TopicSubscriptionHandler topicSubscriptionHandler,
+            ExecutorService executorService,
+            ClusterForwarder clusterForwarder
+    ) {
         this.authenticationTokenHandler = authenticationTokenHandler;
         register("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler));
-        register("PublishMessageInboundPacket", new PublishMessageInboundPacketHandler(topicSubscriptionHandler, executorService));
+        register("PublishMessageInboundPacket",
+                new PublishMessageInboundPacketHandler(topicSubscriptionHandler, executorService, clusterForwarder));
         register("SubscribeInboundPacket", new SubscribeInboundPacketHandler(topicSubscriptionHandler));
     }
 
