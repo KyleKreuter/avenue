@@ -18,6 +18,7 @@ public final class ClusterMetrics {
     private final AtomicLong messagesReceived = new AtomicLong();
     private final AtomicLong messagesDeduped = new AtomicLong();
     private final AtomicLong messagesDropped = new AtomicLong();
+    private final AtomicLong handshakeAuthFailures = new AtomicLong();
 
     // Gauge (current value).
     private final AtomicLong activePeerLinks = new AtomicLong();
@@ -44,6 +45,14 @@ public final class ClusterMetrics {
     /** Records that one outbound cluster frame was dropped due to a full peer queue. */
     public void incrementMessagesDropped() {
         messagesDropped.incrementAndGet();
+    }
+
+    /**
+     * Records that one cluster peer handshake was rejected because the HMAC proof did not verify
+     * (a peer that does not hold the shared {@code cluster.secret}).
+     */
+    public void incrementHandshakeAuthFailures() {
+        handshakeAuthFailures.incrementAndGet();
     }
 
     // ------------------------------------------------------------------
@@ -82,5 +91,9 @@ public final class ClusterMetrics {
 
     public long getActivePeerLinks() {
         return activePeerLinks.get();
+    }
+
+    public long getHandshakeAuthFailures() {
+        return handshakeAuthFailures.get();
     }
 }
