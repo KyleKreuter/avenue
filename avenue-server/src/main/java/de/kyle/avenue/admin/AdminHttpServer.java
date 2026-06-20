@@ -27,6 +27,14 @@ import java.util.concurrent.Executors;
 /**
  * Read-only admin introspection HTTP server (Phase F).
  * <p>
+ * <b>org.json note:</b> this class is the <em>only</em> place in the production code that still uses
+ * {@code org.json}. It is used here <b>solely to render the HTTP admin REST responses</b> — it is
+ * <b>not</b> part of the Avenue wire protocol. The client and cluster wire protocols were migrated to
+ * Protobuf (see {@code docs/protocol.md} and {@link de.kyle.avenue.serialization.WireCodec}); JSON is
+ * intentionally retained here because a hand-written, human-readable JSON REST surface for a
+ * loopback-bound introspection endpoint is the natural representation and carries no wire-protocol
+ * coupling. The {@code org.json} dependency therefore stays in the POM purely for this admin API.
+ * <p>
  * Built entirely on the JDK's {@link com.sun.net.httpserver.HttpServer} — <b>no new Maven
  * dependency</b>. It is <b>disabled by default</b> and binds to loopback ({@code 127.0.0.1}) unless
  * configured otherwise. Every endpoint is a side-effect-free {@code GET} that pulls an immutable

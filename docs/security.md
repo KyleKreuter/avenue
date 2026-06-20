@@ -138,6 +138,12 @@ domain-separation tags** (a fixed label mixed into the HMAC input), so the two d
 different MACs over the same transcript — preventing a reflection attack where an attacker echoes
 the acceptor's proof back as the initiator's.
 
+> **Wire representation.** Since the Protobuf wire-protocol migration the `nonce` and `proof` values
+> are carried as Protobuf **`bytes`** (raw binary) in the `ClusterAuthHello` / `ClusterAuthChallenge`
+> / `ClusterAuthResponse` messages — previously they were transmitted as hex/base64 **JSON strings**.
+> The HMAC computation (transcript, domain separation, constant-time verification) is **unchanged**;
+> only the on-wire encoding became binary. See [protocol.md](protocol.md).
+
 ### Properties
 
 - **Secret never on the wire** — only HMAC proofs are transmitted; the secret is the HMAC key.
