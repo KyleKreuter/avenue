@@ -1,0 +1,171 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "de.kyle.avenue.proto";
+
+import "common.proto";
+
+// Node-to-node cluster control plane. Each message mirrors one existing JSON packet class
+// under packet/cluster/* (header + body fields merged flat). All seq/epoch/incarnation
+// values are int64; nonce/proof are bytes (today hex/base64 strings, but binary on the wire).
+// The oneof envelope replaces header.name-based dispatch.
+
+// Mirrors ClusterPublishPacket (topic, source, originNodeId, originEpoch, seq, linkSeq, data).
+message ClusterPublish {
+  string topic = 1;
+  string source = 2;
+  string origin_node_id = 3;
+  int64 origin_epoch = 4;
+  int64 seq = 5;
+  int64 link_seq = 6;
+  // `data` is `bytes` (was `string`): the cross-node forward carries the opaque payload ByteString
+  // straight through, never transcoding it to/from a Java String. Field number unchanged.
+  bytes data = 7;
+}
+
+// Mirrors ClusterAckPacket (ackerNodeId + repeated Ack{originNodeId, originEpoch, ackedSeq}).
+message ClusterAck {
+  string acker_node_id = 1;
+  repeated AckEntry acks = 2;
+
+  message AckEntry {
+    string origin_node_id = 1;
+    int64 origin_epoch = 2;
+    int64 acked_seq = 3;
+  }
+}
+
+// Mirrors ClusterResumePacket (nodeId + repeated Resume{originNodeId, originEpoch, lastContiguousSeq}).
+message ClusterResume {
+  string node_id = 1;
+  repeated ResumeEntry resume = 2;
+
+  message ResumeEntry {
+    string origin_node_id = 1;
+    int64 origin_epoch = 2;
+    int64 last_contiguous_seq = 3;
+  }
+}
+
+// Mirrors ClusterGapPacket (senderNodeId, originNodeId, originEpoch, firstAvailableSeq).
+message ClusterGap {
+  string sender_node_id = 1;
+  string origin_node_id = 2;
+  int64 origin_epoch = 3;
+  int64 first_available_seq = 4;
+}
+
+// Mirrors ClusterInterestPacket (nodeId, interestVersion, op, topic). op is "ADD"/"REMOVE".
+message ClusterInterest {
+  string node_id = 1;
+  int64 interest_version = 2;
+  string op = 3;
+  string topic = 4;
+}
+
+// Mirrors ClusterInterestSyncPacket (nodeId, interestVersion, topics[]).
+message ClusterInterestSync {
+  string node_id = 1;
+  int64 interest_version = 2;
+  repeated string topics = 3;
+}
+
+// Mirrors ClusterAuthHelloPacket (nodeId, host, clusterPort, incarnation, nonce, protocol).
+message ClusterAuthHello {
+  string node_id = 1;
+  string host = 2;
+  int32 cluster_port = 3;
+  int64 incarnation = 4;
+  bytes nonce = 5;
+  string protocol = 6;
+}
+
+// Mirrors ClusterAuthChallengePacket (nodeId, host, clusterPort, incarnation, nonce, proof).
+message ClusterAuthChallenge {
+  string node_id = 1;
+  string host = 2;
+  int32 cluster_port = 3;
+  int64 incarnation = 4;
+  bytes nonce = 5;
+  bytes proof = 6;
+}
+
+// Mirrors ClusterAuthResponsePacket (nodeId, proof).
+message ClusterAuthResponse {
+  string node_id = 1;
+  bytes proof = 2;
+}
+
+// Mirrors ClusterHeartbeatPacket (nodeId).
+message Heartbeat {
+  string node_id = 1;
+}
+
+// Mirrors SwimPingPacket (seqNo, piggyback[]).
+message SwimPing {
+  int64 seq_no = 1;
+  repeated GossipUpdate piggyback = 2;
+}
+
+// Mirrors SwimAckPacket (seqNo, piggyback[]).
+message SwimAck {
+  int64 seq_no = 1;
+  repeated GossipUpdate piggyback = 2;
+}
+
+// Mirrors SwimPingReqPacket (targetNodeId, seqNo, piggyback[]).
+message SwimPingReq {
+  string target_node_id = 1;
+  int64 seq_no = 2;
+  repeated GossipUpdate piggyback = 3;
+}
+
+// Mirrors SwimPingReqAckPacket (targetNodeId, seqNo, piggyback[]).
+message SwimPingReqAck {
+  string target_node_id = 1;
+  int64 seq_no = 2;
+  repeated GossipUpdate piggyback = 3;
+}
+
+// Mirrors SwimJoinPacket (nodeId, host, clusterPort, incarnation).
+message SwimJoin {
+  string node_id = 1;
+  string host = 2;
+  int32 cluster_port = 3;
+  int64 incarnation = 4;
+}
+
+// Mirrors SwimJoinAckPacket (memberList[]). Carried as GossipUpdate, matching the JSON form.
+message SwimJoinAck {
+  repeated GossipUpdate members = 1;
+}
+
+// Mirrors SwimLeavePacket (nodeId, incarnation).
+message SwimLeave {
+  string node_id = 1;
+  int64 incarnation = 2;
+}
+
+// Top-level cluster-plane envelope: exactly one message per frame. Field numbers are stable
+// and contiguous so the dispatch can switch on the oneof case.
+message ClusterEnvelope {
+  oneof msg {
+    ClusterPublish cluster_publish = 1;
+    ClusterAck cluster_ack = 2;
+    ClusterResume cluster_resume = 3;
+    ClusterGap cluster_gap = 4;
+    ClusterInterest cluster_interest = 5;
+    ClusterInterestSync cluster_interest_sync = 6;
+    ClusterAuthHello cluster_auth_hello = 7;
+    ClusterAuthChallenge cluster_auth_challenge = 8;
+    ClusterAuthResponse cluster_auth_response = 9;
+    Heartbeat heartbeat = 10;
+    SwimPing swim_ping = 11;
+    SwimAck swim_ack = 12;
+    SwimPingReq swim_ping_req = 13;
+    SwimPingReqAck swim_ping_req_ack = 14;
+    SwimJoin swim_join = 15;
+    SwimJoinAck swim_join_ack = 16;
+    SwimLeave swim_leave = 17;
+  }
+}

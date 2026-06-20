@@ -17,4 +17,69 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
+    <dependencies>
+        <!--
+          Protobuf runtime for the generated wire-protocol classes (step 1 of the JSON->protobuf
+          migration). The generated sources land under target/generated-sources/protobuf and are
+          compiled against this runtime. Nothing is wired to the live JSON path yet.
+        -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>${protobuf.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <extensions>
+            <!--
+              Detects the host OS/arch and exposes it as ${os.detected.classifier}
+              (e.g. osx-aarch_64 on Apple Silicon). The protobuf plugin needs it to pick the
+              right protoc binary artifact.
+            -->
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>1.7.1</version>
+            </extension>
+        </extensions>
+        <plugins>
+            <!--
+              Lets the throughput benchmark be launched without hand-building a classpath:
+                mvn -q -pl avenue-server test-compile
+                mvn -q -pl avenue-server exec:java -Dexec.classpathScope=test \
+                    -Dexec.mainClass=de.kyle.avenue.benchmark.ThroughputBenchmark
+              It is NOT bound to any phase, so it never runs during a normal `mvn test`.
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+            </plugin>
+            <!--
+              Compiles the .proto schemas under src/main/proto into Java sources during
+              generate-sources. protoc itself is pulled from Maven Central as a platform-specific
+              executable artifact (no system protoc required). The generated sources are written to
+              the default target/generated-sources/protobuf and automatically added as a source root.
+            -->
+            <plugin>
+                <groupId>org.xolstice.maven.plugins</groupId>
+                <artifactId>protobuf-maven-plugin</artifactId>
+                <version>0.6.1</version>
+                <configuration>
+                    <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
+                    <protoSourceRoot>${basedir}/src/main/proto</protoSourceRoot>
+                </configuration>
+                <executions>
+                    <execution>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
 </project>
