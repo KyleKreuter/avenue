@@ -50,6 +50,10 @@ public class ClusterNode {
         // Use the cluster-aware SingleNodeServer constructor that accepts an external
         // TopicSubscriptionHandler and a ClusterForwarder. The ClusterManager IS the forwarder.
         this.singleNodeServer = new SingleNodeServer(config, sharedHandler, clusterManager);
+
+        // Fold the cluster counters into the shared metrics snapshot log (null-safe; only set
+        // when clustering is active).
+        this.singleNodeServer.getMetrics().setClusterMetrics(clusterManager.getClusterMetrics());
     }
 
     /**
