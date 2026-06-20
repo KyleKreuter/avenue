@@ -5,8 +5,8 @@ import de.kyle.avenue.proto.MemberStateProto;
 /**
  * A single membership fact piggybacked on SWIM control packets (Phase E gossip dissemination).
  * <p>
- * It is a plain DTO, not a framed {@link de.kyle.avenue.packet.Packet}: many of these ride inside one
- * SWIM packet as a {@code repeated GossipUpdate} on the wire. The domain {@code state} stays a String
+ * It is a plain DTO, not a framed wire message: many of these ride inside one SWIM packet as a
+ * {@code repeated GossipUpdate} on the wire. The domain {@code state} stays a String
  * ({@code ALIVE/SUSPECT/DEAD/LEFT}) so the registry merge rules can keep parsing it via
  * {@link MemberState#valueOf(String)}; the protobuf boundary converts it to/from the
  * {@link MemberStateProto} enum in {@link #toProto()} / {@link #fromProto}.

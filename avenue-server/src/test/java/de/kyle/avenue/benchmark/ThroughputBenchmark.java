@@ -2,17 +2,17 @@ package de.kyle.avenue.benchmark;
 
 import de.kyle.avenue.SingleNodeServer;
 import de.kyle.avenue.config.AvenueConfig;
-import de.kyle.avenue.packet.auth.AuthTokenRequestInboundPacket;
-import de.kyle.avenue.packet.publish.PublishMessageInboundPacket;
-import de.kyle.avenue.packet.subscribe.SubscribeInboundPacket;
+import de.kyle.avenue.proto.AuthTokenRequest;
+import de.kyle.avenue.proto.ClientEnvelope;
+import de.kyle.avenue.proto.PublishInbound;
+import de.kyle.avenue.proto.Subscribe;
 import de.kyle.avenue.serialization.PacketFraming;
-import org.json.JSONObject;
+import de.kyle.avenue.serialization.WireCodec;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -99,7 +99,7 @@ public final class ThroughputBenchmark {
             Thread t = new Thread(() -> {
                 try {
                     for (int m = 0; m < MESSAGES_PER_PUBLISHER; m++) {
-                        writeFrame(out, new PublishMessageInboundPacket(
+                        writeFrame(out, publishEnvelope(
                                 TOPIC, "msg-" + m, "publisher-" + publisherId, TOKEN));
                     }
                 } catch (IOException e) {
@@ -154,16 +154,22 @@ public final class ThroughputBenchmark {
     }
 
     private static void authenticate(DataOutputStream out, DataInputStream in) throws IOException {
-        writeFrame(out, new AuthTokenRequestInboundPacket(SECRET));
+        writeFrame(out, ClientEnvelope.newBuilder()
+                .setAuthRequest(AuthTokenRequest.newBuilder().setSecret(SECRET).build())
+                .build());
         // Consume the single auth-token response frame.
         PacketFraming.readFrame(in, PACKET_SIZE);
     }
 
-    private static void writeFrame(DataOutputStream out, de.kyle.avenue.packet.Packet packet) throws IOException {
-        JSONObject envelope = new JSONObject();
-        envelope.put("header", new JSONObject(new String(packet.getHeader(), StandardCharsets.UTF_8)));
-        envelope.put("body", new JSONObject(new String(packet.getBody(), StandardCharsets.UTF_8)));
-        byte[] payload = envelope.toString().getBytes(StandardCharsets.UTF_8);
+    private static ClientEnvelope publishEnvelope(String topic, String data, String source, String token) {
+        return ClientEnvelope.newBuilder()
+                .setPublishInbound(PublishInbound.newBuilder()
+                        .setTopic(topic).setData(data).setSource(source).setToken(token).build())
+                .build();
+    }
+
+    private static void writeFrame(DataOutputStream out, ClientEnvelope envelope) throws IOException {
+        byte[] payload = WireCodec.encodeClient(envelope, PACKET_SIZE);
         synchronized (out) {
             PacketFraming.writeFrame(out, payload);
         }
@@ -191,7 +197,9 @@ public final class ThroughputBenchmark {
 
         void authenticateAndSubscribe() throws IOException {
             authenticate(out, in);
-            writeFrame(out, new SubscribeInboundPacket(TOPIC, TOKEN));
+            writeFrame(out, ClientEnvelope.newBuilder()
+                    .setSubscribe(Subscribe.newBuilder().setTopic(TOPIC).setToken(TOKEN).build())
+                    .build());
             Thread reader = new Thread(this::readLoop, "bench-subscriber-reader");
             reader.setDaemon(true);
             reader.start();

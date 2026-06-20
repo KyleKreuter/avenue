@@ -4,7 +4,7 @@ import de.kyle.avenue.cluster.events.ClusterEvents;
 import de.kyle.avenue.cluster.membership.SwimMessageSink;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.ClusterMetrics;
-import de.kyle.avenue.packet.publish.PublishMessageOutboundPacket;
+import de.kyle.avenue.proto.ClientEnvelope;
 import de.kyle.avenue.proto.ClusterAck;
 import de.kyle.avenue.proto.ClusterEnvelope;
 import de.kyle.avenue.proto.ClusterGap;
@@ -18,6 +18,7 @@ import de.kyle.avenue.proto.SwimLeave;
 import de.kyle.avenue.proto.SwimPing;
 import de.kyle.avenue.proto.SwimPingReq;
 import de.kyle.avenue.proto.SwimPingReqAck;
+import de.kyle.avenue.serialization.ClientEnvelopes;
 import de.kyle.avenue.serialization.PacketFraming;
 import de.kyle.avenue.serialization.WireCodec;
 import org.slf4j.Logger;
@@ -444,8 +445,10 @@ public class PeerLink {
 
     private void deliver(ClusterPublish packet) {
         metrics.incrementMessagesReceived();
-        PublishMessageOutboundPacket outbound = new PublishMessageOutboundPacket(
-                packet.getTopic(), packet.getData(), packet.getSource());
+        // Fan out to local subscribers as a client-plane PublishOutbound envelope (the same wire
+        // message a locally-published message produces).
+        ClientEnvelope outbound = ClientEnvelopes.publishOutbound(
+                packet.getTopic(), packet.getSource(), packet.getData());
         topicSubscriptionHandler.deliverPacketToSubscribers(packet.getTopic(), outbound);
     }
 

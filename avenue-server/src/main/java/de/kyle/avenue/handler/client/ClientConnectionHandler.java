@@ -4,12 +4,9 @@ import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.packet.InboundPacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.AvenueMetrics;
-import de.kyle.avenue.packet.OutboundPacket;
-import de.kyle.avenue.serialization.PacketDeserializer;
+import de.kyle.avenue.proto.ClientEnvelope;
 import de.kyle.avenue.serialization.PacketFraming;
-import de.kyle.avenue.serialization.PacketSerializer;
-import org.json.JSONException;
-import org.json.JSONObject;
+import de.kyle.avenue.serialization.WireCodec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,10 +25,15 @@ import java.util.concurrent.TimeUnit;
  * Handles a single client connection.
  * <p>
  * Outbound writes are decoupled from delivery via a bounded per-client queue and a dedicated
- * writer running on a virtual thread. Producers ({@link #enqueue(OutboundPacket)}) never block
+ * writer running on a virtual thread. Producers ({@link #enqueue(ClientEnvelope)}) never block
  * on the socket, so one slow subscriber can no longer cause head-of-line blocking for the
  * fan-out to all other subscribers. Only the writer thread touches the {@link DataOutputStream},
  * which is why no write lock is needed any more.
+ * <p>
+ * Wire format: the queue carries typed {@link ClientEnvelope} protobuf messages; the writer
+ * serializes each via {@link WireCodec#encodeClient} and frames it with
+ * {@link PacketFraming#writeFrame}. Inbound frames are read raw and handed to the
+ * {@link InboundPacketHandler}, which decodes and dispatches them.
  * <p>
  * Liveness (E16): when {@code server.client.idle-timeout-ms > 0} a {@link Socket#setSoTimeout
  * read timeout} is applied. If no byte arrives from the client within that window the read
@@ -49,8 +51,6 @@ public class ClientConnectionHandler implements Runnable {
     private final InputStream inputStream;
     private final OutputStream outputStream;
     private final DataOutputStream dataOutputStream;
-    private final PacketDeserializer packetDeserializer;
-    private final PacketSerializer packetSerializer;
     private final InboundPacketHandler inboundPacketHandler;
     private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final AvenueConfig avenueConfig;
@@ -58,7 +58,7 @@ public class ClientConnectionHandler implements Runnable {
     private final Runnable onDisconnect;
 
     /** Bounded outbound queue. Backpressure is applied via offer() with a short timeout. */
-    private final BlockingQueue<OutboundPacket> outboundQueue;
+    private final BlockingQueue<ClientEnvelope> outboundQueue;
     private final long offerTimeoutMillis;
     private final BackpressurePolicy backpressurePolicy;
     private final long idleTimeoutMillis;
@@ -69,13 +69,11 @@ public class ClientConnectionHandler implements Runnable {
     /** Backwards-compatible constructor (no metrics, no disconnect callback). */
     public ClientConnectionHandler(
             Socket client,
-            PacketDeserializer packetDeserializer,
-            PacketSerializer packetSerializer,
             InboundPacketHandler inboundPacketHandler,
             AvenueConfig avenueConfig,
             TopicSubscriptionHandler topicSubscriptionHandler
     ) throws IOException {
-        this(client, packetDeserializer, packetSerializer, inboundPacketHandler, avenueConfig,
+        this(client, inboundPacketHandler, avenueConfig,
                 topicSubscriptionHandler, new AvenueMetrics(), () -> { });
     }
 
@@ -88,8 +86,6 @@ public class ClientConnectionHandler implements Runnable {
      */
     public ClientConnectionHandler(
             Socket client,
-            PacketDeserializer packetDeserializer,
-            PacketSerializer packetSerializer,
             InboundPacketHandler inboundPacketHandler,
             AvenueConfig avenueConfig,
             TopicSubscriptionHandler topicSubscriptionHandler,
@@ -101,8 +97,6 @@ public class ClientConnectionHandler implements Runnable {
         this.outputStream = client.getOutputStream();
         this.dataOutputStream = new DataOutputStream(this.outputStream);
         this.running = true;
-        this.packetSerializer = packetSerializer;
-        this.packetDeserializer = packetDeserializer;
         this.inboundPacketHandler = inboundPacketHandler;
         this.avenueConfig = avenueConfig;
         this.topicSubscriptionHandler = topicSubscriptionHandler;
@@ -133,10 +127,11 @@ public class ClientConnectionHandler implements Runnable {
                             idleTimeoutMillis, remoteAddress());
                     break;
                 }
-                JSONObject packet = packetDeserializer.deserialize(packetBytes);
                 try {
-                    inboundPacketHandler.handleInboundPacket(packet, this);
-                } catch (IllegalArgumentException | JSONException e) {
+                    // The handler decodes the raw protobuf frame and dispatches by oneof case.
+                    inboundPacketHandler.handleInboundPacket(
+                            packetBytes, avenueConfig.getPacketSize(), this);
+                } catch (IllegalArgumentException e) {
                     if (avenueConfig.isDropUnknownPackets()) {
                         log.error("Unknown or malformed packet was received, dropping client", e);
                         throw new RuntimeException(e);
@@ -159,13 +154,13 @@ public class ClientConnectionHandler implements Runnable {
     private void writerLoop() {
         try {
             while (this.running || !outboundQueue.isEmpty()) {
-                OutboundPacket packet = outboundQueue.poll(200, TimeUnit.MILLISECONDS);
-                if (packet == null) {
+                ClientEnvelope envelope = outboundQueue.poll(200, TimeUnit.MILLISECONDS);
+                if (envelope == null) {
                     continue;
                 }
-                byte[] serializedPacket = packetSerializer.serialize(packet);
-                // Single, named place that prepends the 4-byte length prefix before the payload.
-                PacketFraming.writeFrame(dataOutputStream, serializedPacket);
+                // Serialize the protobuf envelope, then prepend the 4-byte length prefix.
+                byte[] payload = WireCodec.encodeClient(envelope, avenueConfig.getPacketSize());
+                PacketFraming.writeFrame(dataOutputStream, payload);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -186,12 +181,12 @@ public class ClientConnectionHandler implements Runnable {
      *   <li>{@code DROP_MESSAGE} — the individual packet is dropped, the connection stays open.</li>
      * </ul>
      */
-    public void enqueue(OutboundPacket packet) {
+    public void enqueue(ClientEnvelope envelope) {
         if (!this.running) {
             return;
         }
         try {
-            boolean accepted = outboundQueue.offer(packet, offerTimeoutMillis, TimeUnit.MILLISECONDS);
+            boolean accepted = outboundQueue.offer(envelope, offerTimeoutMillis, TimeUnit.MILLISECONDS);
             if (accepted) {
                 metrics.incrementMessagesDelivered();
                 metrics.recordOutboundQueueDepth(outboundQueue.size());
@@ -218,8 +213,8 @@ public class ClientConnectionHandler implements Runnable {
      * Backwards-compatible direct-send entry point used by handlers that answer a request
      * inline (e.g. the auth-token response). Delegates to the asynchronous queue.
      */
-    public void send(OutboundPacket packet) {
-        enqueue(packet);
+    public void send(ClientEnvelope envelope) {
+        enqueue(envelope);
     }
 
     public synchronized void shutdown() {

@@ -7,14 +7,12 @@ import de.kyle.avenue.proto.ClusterEnvelope;
 /**
  * Protobuf wire (de)serialization for the Avenue protocol envelopes.
  * <p>
- * This is the protobuf counterpart to {@link PacketSerializer} / {@link PacketDeserializer}: it turns
- * a top-level {@link ClientEnvelope} / {@link ClusterEnvelope} into its bare payload bytes and back.
- * Just like the JSON path, it deals exclusively with the bare payload — the 4-byte length prefix that
- * frames a message on the stream is still added/removed by {@link PacketFraming}.
+ * It turns a top-level {@link ClientEnvelope} / {@link ClusterEnvelope} into its bare payload bytes
+ * and back. It deals exclusively with the bare payload — the 4-byte length prefix that frames a
+ * message on the stream is still added/removed by {@link PacketFraming}.
  * <p>
- * Step 1 of the JSON-&gt;protobuf migration only introduces this codec; nothing on the live path calls
- * it yet. The {@code maxSize} overloads mirror the size guard of {@link PacketSerializer} /
- * {@link PacketDeserializer} so the wiring step can preserve the existing oversized-payload behaviour.
+ * The {@code maxSize} overloads enforce the configured oversized-payload guard so the framing layer
+ * and the codec agree on the maximum allowed message size.
  */
 public final class WireCodec {
 

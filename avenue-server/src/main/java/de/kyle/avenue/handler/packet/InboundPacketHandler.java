@@ -1,7 +1,5 @@
 package de.kyle.avenue.handler.packet;
 
-import de.kyle.avenue.annotation.Secured;
-import de.kyle.avenue.annotation.TopicHandler;
 import de.kyle.avenue.cluster.ClusterForwarder;
 import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
@@ -10,30 +8,43 @@ import de.kyle.avenue.handler.packet.publish.PublishMessageInboundPacketHandler;
 import de.kyle.avenue.handler.packet.subscribe.SubscribeInboundPacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.AvenueMetrics;
-import org.json.JSONObject;
+import de.kyle.avenue.proto.ClientEnvelope;
+import de.kyle.avenue.serialization.WireCodec;
 
 import java.io.IOException;
-import java.lang.reflect.Method;
-import java.util.Arrays;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 
 /**
- * Routes inbound packets to their registered {@link PacketHandler}.
+ * Decodes an inbound client frame into a typed {@link ClientEnvelope} and routes it to the
+ * matching {@link PacketHandler} based on the set {@code oneof} case.
  * <p>
- * The {@link Secured @Secured} / {@link TopicHandler @TopicHandler} annotations on each
- * handler's {@code handle} method are resolved exactly once at registration time and cached
- * as boolean flags inside a {@link RegisteredHandler}. The hot path therefore performs no
- * reflection or annotation scanning per packet.
+ * Dispatch is a plain {@code switch} over {@link ClientEnvelope.MsgCase}. This replaces the old
+ * JSON {@code header.name}-based lookup, and the {@code @Secured}/{@code @TopicHandler} annotation
+ * flags are replaced by explicit, TYPED per-case checks below:
+ * <ul>
+ *   <li>{@code AUTH_REQUEST}: unsecured — no token is required to authenticate.</li>
+ *   <li>{@code SUBSCRIBE} / {@code PUBLISH_INBOUND}: secured — the message's {@code token} field
+ *       must match the local token (constant-time check), AND the {@code topic} field must be
+ *       present and non-empty. In proto3 an unset string defaults to {@code ""}, so an empty
+ *       topic / token is treated exactly like a missing one was under JSON, preserving the
+ *       original reject-and-drop behaviour.</li>
+ *   <li>The server-to-client cases ({@code AUTH_RESPONSE}, {@code SUBSCRIBE_ACK},
+ *       {@code PUBLISH_OUTBOUND}) and {@code MSG_NOT_SET} never legitimately arrive from a client;
+ *       they are rejected as malformed so the connection is dropped (same outcome a stray JSON
+ *       name produced).</li>
+ * </ul>
+ * Any rejection is an {@link IllegalArgumentException}, which the caller
+ * ({@link ClientConnectionHandler}) turns into the configured drop/close behaviour.
  * <p>
  * An optional {@link ClusterForwarder} is injected into
- * {@link PublishMessageInboundPacketHandler} to forward local publishes to cluster peers.
- * When clustering is disabled, {@link ClusterForwarder#NOOP} is used automatically.
+ * {@link PublishMessageInboundPacketHandler} to forward local publishes to cluster peers. When
+ * clustering is disabled, {@link ClusterForwarder#NOOP} is used automatically.
  */
 public class InboundPacketHandler {
-    private final Map<String, RegisteredHandler> packethandlerMap = new ConcurrentHashMap<>();
     private final AuthenticationTokenHandler authenticationTokenHandler;
+    private final AuthTokenRequestInboundPacketHandler authHandler;
+    private final SubscribeInboundPacketHandler subscribeHandler;
+    private final PublishMessageInboundPacketHandler publishHandler;
 
     /**
      * Single-node constructor (no clustering). Fully backwards-compatible with existing callers.
@@ -72,72 +83,68 @@ public class InboundPacketHandler {
             AvenueMetrics metrics
     ) {
         this.authenticationTokenHandler = authenticationTokenHandler;
-        register("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler));
-        register("PublishMessageInboundPacket",
-                new PublishMessageInboundPacketHandler(topicSubscriptionHandler, executorService, clusterForwarder, metrics));
-        register("SubscribeInboundPacket", new SubscribeInboundPacketHandler(topicSubscriptionHandler));
+        this.authHandler = new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler);
+        this.publishHandler = new PublishMessageInboundPacketHandler(
+                topicSubscriptionHandler, executorService, clusterForwarder, metrics);
+        this.subscribeHandler = new SubscribeInboundPacketHandler(topicSubscriptionHandler);
     }
 
     /**
-     * Registers a handler and resolves its annotation flags a single time. Any failure to
-     * locate the {@code handle} method is a programming error and fails fast at startup.
+     * Decodes a raw client frame and dispatches it to the matching handler after typed security
+     * gating.
+     *
+     * @param frameBytes             the bare protobuf payload of one frame (length prefix already
+     *                               consumed)
+     * @param maxPacketSize          the configured maximum payload size (oversize -&gt; reject)
+     * @param clientConnectionHandler the connection the frame arrived on
+     * @throws IllegalArgumentException if the payload is malformed, oversized, an unexpected case,
+     *                                  or fails the token/topic gate
      */
-    private void register(String packetName, PacketHandler handler) {
-        try {
-            Method handle = handler.getClass()
-                    .getDeclaredMethod("handle", JSONObject.class, ClientConnectionHandler.class);
-            boolean secured = Arrays.stream(handle.getAnnotations())
-                    .anyMatch(annotation -> annotation.annotationType().equals(Secured.class));
-            boolean topicHandler = Arrays.stream(handle.getAnnotations())
-                    .anyMatch(annotation -> annotation.annotationType().equals(TopicHandler.class));
-            packethandlerMap.put(packetName, new RegisteredHandler(handler, secured, topicHandler));
-        } catch (NoSuchMethodException e) {
-            throw new IllegalStateException("Packet handler " + packetName + " has no handle method", e);
+    public void handleInboundPacket(
+            byte[] frameBytes,
+            int maxPacketSize,
+            ClientConnectionHandler clientConnectionHandler
+    ) throws IOException {
+        ClientEnvelope envelope = WireCodec.decodeClient(frameBytes, maxPacketSize);
+        switch (envelope.getMsgCase()) {
+            case AUTH_REQUEST -> authHandler.handle(envelope, clientConnectionHandler);
+            case SUBSCRIBE -> {
+                // @Secured + @TopicHandler equivalent: a valid token and a non-empty topic.
+                verifyToken(envelope.getSubscribe().getToken());
+                requireTopic(envelope.getSubscribe().getTopic());
+                subscribeHandler.handle(envelope, clientConnectionHandler);
+            }
+            case PUBLISH_INBOUND -> {
+                // @Secured + @TopicHandler equivalent: a valid token and a non-empty topic.
+                verifyToken(envelope.getPublishInbound().getToken());
+                requireTopic(envelope.getPublishInbound().getTopic());
+                publishHandler.handle(envelope, clientConnectionHandler);
+            }
+            // Server-to-client cases and an unset oneof never legitimately originate from a
+            // client. Treat them as a desynced/hostile peer and reject (drop/close downstream).
+            default -> throw new IllegalArgumentException(
+                    "Unexpected client message case: " + envelope.getMsgCase());
         }
     }
 
-    public void handleInboundPacket(JSONObject packet, ClientConnectionHandler clientConnectionHandler) throws IOException {
-        if (!packet.has("header")) {
-            throw new IOException("Packet received does not contain a header field");
-        }
-        Object headerO = packet.get("header");
-        if (!(headerO instanceof JSONObject header)) {
-            throw new IOException("Packet has header field but was not parsed correctly");
-        }
-        if (!header.has("name")) {
-            throw new IOException("Packet has no name field in the header");
-        }
-        String packetName = header.getString("name");
-        RegisteredHandler registeredHandler = packethandlerMap.get(packetName);
-        if (registeredHandler == null) {
-            throw new IllegalArgumentException("Packet with the provided name not found");
-        }
-
-        // Hot path: only check cached flags, no reflection.
-        if (registeredHandler.secured()) {
-            verifyToken(header);
-        }
-        if (registeredHandler.topicHandler() && !header.has("topic")) {
-            throw new IllegalArgumentException("Packet does not contain a topic");
-        }
-
-        registeredHandler.handler().handle(packet, clientConnectionHandler);
-    }
-
-    private void verifyToken(JSONObject header) {
-        if (!header.has("token")) {
-            throw new IllegalArgumentException("Packet does not contain a token");
-        }
-        String clientToken = header.getString("token");
+    /**
+     * Verifies the client-supplied token against the local token using the existing constant-time
+     * comparison. An empty token (proto3 default for an unset field) can never match a non-empty
+     * configured token, so it is rejected exactly like a missing token was under JSON.
+     */
+    private void verifyToken(String clientToken) {
         if (!this.authenticationTokenHandler.isValidToken(clientToken)) {
             throw new IllegalArgumentException("Provided token mismatched local token");
         }
     }
 
     /**
-     * Caches a handler together with its annotation-derived flags so the dispatch path never
-     * has to touch reflection.
+     * Rejects a missing/empty topic. proto3 represents an unset string as {@code ""}, which is the
+     * "missing topic" case; this preserves the original {@code @TopicHandler} reject behaviour.
      */
-    private record RegisteredHandler(PacketHandler handler, boolean secured, boolean topicHandler) {
+    private void requireTopic(String topic) {
+        if (topic == null || topic.isEmpty()) {
+            throw new IllegalArgumentException("Packet does not contain a topic");
+        }
     }
 }

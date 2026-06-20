@@ -2,15 +2,15 @@ package de.kyle.avenue;
 
 import de.kyle.avenue.config.AvenueClientConfig;
 import de.kyle.avenue.message.Message;
-import de.kyle.avenue.packet.auth.AuthTokenRequestInboundPacket;
-import de.kyle.avenue.packet.publish.PublishMessageInboundPacket;
-import de.kyle.avenue.packet.subscribe.SubscribeInboundPacket;
-import de.kyle.avenue.serialization.PacketDeserializer;
+import de.kyle.avenue.proto.AuthTokenRequest;
+import de.kyle.avenue.proto.ClientEnvelope;
+import de.kyle.avenue.proto.PublishInbound;
+import de.kyle.avenue.proto.PublishOutbound;
+import de.kyle.avenue.proto.Subscribe;
 import de.kyle.avenue.serialization.PacketFraming;
-import de.kyle.avenue.serialization.PacketSerializer;
+import de.kyle.avenue.serialization.WireCodec;
 import de.kyle.avenue.topic.Topic;
 import de.kyle.avenue.topic.TopicListener;
-import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,8 +45,6 @@ public class AvenueClient {
     private InputStream inputStream;
     private OutputStream outputStream;
     private DataOutputStream dataOutputStream;
-    private final PacketDeserializer packetDeserializer;
-    private final PacketSerializer packetSerializer;
     private final int packetSize;
 
     /**
@@ -86,8 +84,6 @@ public class AvenueClient {
         AvenueClientConfig config = new AvenueClientConfig();
         this.socket = new Socket();
         this.running = true;
-        this.packetDeserializer = new PacketDeserializer(config.getPacketSize());
-        this.packetSerializer = new PacketSerializer(config.getPacketSize());
         this.packetSize = config.getPacketSize();
         this.topicListenerMap = new ConcurrentHashMap<>();
         this.pendingSubscriptions = ConcurrentHashMap.newKeySet();
@@ -98,12 +94,14 @@ public class AvenueClient {
                 this.inputStream = this.socket.getInputStream();
                 this.outputStream = this.socket.getOutputStream();
                 this.dataOutputStream = new DataOutputStream(this.outputStream);
-                AuthTokenRequestInboundPacket authTokenRequestInboundPacket =
-                        new AuthTokenRequestInboundPacket(config.getAuthenticationSecret());
-                byte[] serialized = packetSerializer.serialize(authTokenRequestInboundPacket);
+                ClientEnvelope authRequest = ClientEnvelope.newBuilder()
+                        .setAuthRequest(AuthTokenRequest.newBuilder()
+                                .setSecret(config.getAuthenticationSecret())
+                                .build())
+                        .build();
                 // The auth request is sent before readiness, so it bypasses the readiness
                 // gate and writes directly under the write lock.
-                writeFrameLocked(serialized);
+                writeEnvelopeLocked(authRequest);
                 listen();
             } catch (IOException e) {
                 log.error("An error occurred while connecting to the server", e);
@@ -131,44 +129,39 @@ public class AvenueClient {
             // after authentication.
             while (this.running) {
                 byte[] packetBytes = PacketFraming.readFrame(dataInputStream, packetSize);
-                JSONObject packet = packetDeserializer.deserialize(packetBytes);
-                JSONObject header = packet.getJSONObject("header");
-                JSONObject body = packet.getJSONObject("body");
-                String name = header.getString("name");
+                ClientEnvelope envelope = WireCodec.decodeClient(packetBytes, packetSize);
 
-                if (name.equals("AuthTokenResponseOutboundPacket")) {
-                    this.authToken = body.getString("token");
-                    // Signal readiness and flush any subscriptions registered before auth.
-                    // We must NOT return here: the loop has to keep reading topic messages.
-                    readyLatch.countDown();
-                    flushPendingSubscriptions();
-                    continue;
-                }
-
-                if (name.equals("SubscribeAckOutboundPacket")) {
-                    // Server confirmed a subscription is now active. Treat it as a positive
-                    // signal: clear the topic from the pending set so it is not re-sent on the
-                    // next flush. This must never break the listen loop.
-                    String topic = normalizeTopic(body.getString("topic"));
-                    pendingSubscriptions.remove(topic);
-                    log.debug("Subscription for topic '{}' acknowledged by server", topic);
-                    continue;
-                }
-
-                if (name.equals("PublishMessageOutboundPacket")) {
-                    String topic = normalizeTopic(header.getString("topic"));
-                    TopicListener topicListener = topicListenerMap.get(topic);
-                    if (topicListener == null) {
-                        // Unknown topic: nothing is registered for it locally. Ignore the
-                        // message and keep reading instead of tearing the loop down.
-                        log.debug("Received a message for an unregistered topic '{}', ignoring", topic);
-                        continue;
+                switch (envelope.getMsgCase()) {
+                    case AUTH_RESPONSE -> {
+                        this.authToken = envelope.getAuthResponse().getToken();
+                        // Signal readiness and flush any subscriptions registered before auth.
+                        // We must NOT return here: the loop has to keep reading topic messages.
+                        readyLatch.countDown();
+                        flushPendingSubscriptions();
                     }
-                    topicListener.onMessage(new Message(header.getString("source"), body.getString("data")));
-                    continue;
+                    case SUBSCRIBE_ACK -> {
+                        // Server confirmed a subscription is now active. Treat it as a positive
+                        // signal: clear the topic from the pending set so it is not re-sent on the
+                        // next flush. This must never break the listen loop.
+                        String topic = normalizeTopic(envelope.getSubscribeAck().getTopic());
+                        pendingSubscriptions.remove(topic);
+                        log.debug("Subscription for topic '{}' acknowledged by server", topic);
+                    }
+                    case PUBLISH_OUTBOUND -> {
+                        PublishOutbound publish = envelope.getPublishOutbound();
+                        String topic = normalizeTopic(publish.getTopic());
+                        TopicListener topicListener = topicListenerMap.get(topic);
+                        if (topicListener == null) {
+                            // Unknown topic: nothing is registered for it locally. Ignore the
+                            // message and keep reading instead of tearing the loop down.
+                            log.debug("Received a message for an unregistered topic '{}', ignoring", topic);
+                            break;
+                        }
+                        topicListener.onMessage(new Message(publish.getSource(), publish.getData()));
+                    }
+                    default -> log.debug("Received a packet of unhandled type '{}', ignoring",
+                            envelope.getMsgCase());
                 }
-
-                log.debug("Received a packet of unhandled type '{}', ignoring", name);
             }
         } catch (IOException e) {
             if (this.running) {
@@ -182,10 +175,15 @@ public class AvenueClient {
     public void sendMessage(String topic, String data) throws IOException {
         awaitReady();
         String normalizedTopic = normalizeTopic(topic);
-        PublishMessageInboundPacket publishMessageInboundPacket =
-                new PublishMessageInboundPacket(normalizedTopic, data, this.clientName, this.authToken);
-        byte[] serialized = packetSerializer.serialize(publishMessageInboundPacket);
-        writeFrameLocked(serialized);
+        ClientEnvelope envelope = ClientEnvelope.newBuilder()
+                .setPublishInbound(PublishInbound.newBuilder()
+                        .setTopic(normalizedTopic)
+                        .setSource(this.clientName)
+                        .setToken(this.authToken)
+                        .setData(data)
+                        .build())
+                .build();
+        writeEnvelopeLocked(envelope);
     }
 
     public void shutdown() {
@@ -258,26 +256,31 @@ public class AvenueClient {
     }
 
     /**
-     * Sends a single {@link SubscribeInboundPacket} for the given normalized topic. Must only
+     * Sends a single {@code Subscribe} envelope for the given normalized topic. Must only
      * be called once an auth token is available.
      *
      * @param topic the already-normalized topic name
      * @throws IOException if writing to the stream fails
      */
     private void sendSubscribe(String topic) throws IOException {
-        SubscribeInboundPacket subscribeInboundPacket = new SubscribeInboundPacket(topic, this.authToken);
-        byte[] serialized = packetSerializer.serialize(subscribeInboundPacket);
-        writeFrameLocked(serialized);
+        ClientEnvelope envelope = ClientEnvelope.newBuilder()
+                .setSubscribe(Subscribe.newBuilder()
+                        .setTopic(topic)
+                        .setToken(this.authToken)
+                        .build())
+                .build();
+        writeEnvelopeLocked(envelope);
     }
 
     /**
-     * Writes a single framed payload to the shared output stream while holding the write lock
-     * to prevent interleaving with other senders.
+     * Encodes a {@link ClientEnvelope} and writes it as a single framed message to the shared
+     * output stream while holding the write lock to prevent interleaving with other senders.
      *
-     * @param payload the serialized packet payload (without length prefix)
-     * @throws IOException if writing fails
+     * @param envelope the client envelope to send
+     * @throws IOException if encoding or writing fails
      */
-    private void writeFrameLocked(byte[] payload) throws IOException {
+    private void writeEnvelopeLocked(ClientEnvelope envelope) throws IOException {
+        byte[] payload = WireCodec.encodeClient(envelope, packetSize);
         writeLock.lock();
         try {
             PacketFraming.writeFrame(this.dataOutputStream, payload);

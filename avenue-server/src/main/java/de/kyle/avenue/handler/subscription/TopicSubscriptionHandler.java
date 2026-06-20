@@ -2,7 +2,7 @@ package de.kyle.avenue.handler.subscription;
 
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.metrics.AvenueMetrics;
-import de.kyle.avenue.packet.OutboundPacket;
+import de.kyle.avenue.proto.ClientEnvelope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -92,7 +92,7 @@ public class TopicSubscriptionHandler {
         return topic.toLowerCase(Locale.ROOT).strip();
     }
 
-    public void deliverPacketToSubscribers(String topic, OutboundPacket packet) {
+    public void deliverPacketToSubscribers(String topic, ClientEnvelope envelope) {
         Set<ClientConnectionHandler> subscribers = topicSubscriptions.get(normalize(topic));
         if (subscribers == null || subscribers.isEmpty()) {
             log.warn("Packet was not delivered to other clients because no subscriptions are registered");
@@ -101,7 +101,7 @@ public class TopicSubscriptionHandler {
         // The concurrent set tolerates concurrent subscribe/unsubscribe during iteration.
         // Delivery is non-blocking: each handler only enqueues onto its own outbound queue.
         for (ClientConnectionHandler clientConnectionHandler : subscribers) {
-            clientConnectionHandler.enqueue(packet);
+            clientConnectionHandler.enqueue(envelope);
         }
     }
 
