@@ -1,5 +1,6 @@
 package de.kyle.avenue.cluster;
 
+import de.kyle.avenue.cluster.membership.SwimMessageSink;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.ClusterMetrics;
 import de.kyle.avenue.packet.Packet;
@@ -10,6 +11,13 @@ import de.kyle.avenue.packet.cluster.ClusterInterestPacket;
 import de.kyle.avenue.packet.cluster.ClusterInterestSyncPacket;
 import de.kyle.avenue.packet.cluster.ClusterPublishPacket;
 import de.kyle.avenue.packet.cluster.ClusterResumePacket;
+import de.kyle.avenue.packet.cluster.SwimAckPacket;
+import de.kyle.avenue.packet.cluster.SwimJoinAckPacket;
+import de.kyle.avenue.packet.cluster.SwimJoinPacket;
+import de.kyle.avenue.packet.cluster.SwimLeavePacket;
+import de.kyle.avenue.packet.cluster.SwimPingPacket;
+import de.kyle.avenue.packet.cluster.SwimPingReqAckPacket;
+import de.kyle.avenue.packet.cluster.SwimPingReqPacket;
 import de.kyle.avenue.packet.publish.PublishMessageOutboundPacket;
 import de.kyle.avenue.serialization.PacketFraming;
 import org.json.JSONObject;
@@ -72,6 +80,13 @@ public class PeerLink {
     private static final Logger log = LoggerFactory.getLogger(PeerLink.class);
 
     private static final int CONTROL_QUEUE_CAPACITY = 1024;
+
+    /**
+     * Idle ingest-poll budget for the writer loop. Kept small so a control frame the reader enqueues
+     * — notably a time-sensitive SWIM ack (Phase E) — is flushed within a few ms instead of waiting
+     * out a long publish poll. Virtual threads make the brief parking negligible.
+     */
+    private static final long CONTROL_IDLE_POLL_MS = 5L;
 
     /**
      * Callbacks the link uses to reach state owned by {@link ClusterManager} that must outlive any
@@ -150,6 +165,13 @@ public class PeerLink {
     /** Supplies the full interest-state sync to send on link-up and never block the caller. */
     private final java.util.function.Supplier<ClusterInterestSyncPacket> interestSyncSupplier;
 
+    /**
+     * Phase E — receiving-side SWIM membership sink. Nullable (single-node / cluster-disabled). Set
+     * via {@link #setSwimSink(SwimMessageSink)} right after construction so the large existing
+     * constructor signature stays untouched.
+     */
+    private volatile SwimMessageSink swimSink;
+
     /** Control/backfill frames written verbatim by the writer (heartbeat, ack, resume, gap, replay). */
     private final BlockingQueue<OutboundItem> controlQueue = new LinkedBlockingQueue<>(CONTROL_QUEUE_CAPACITY);
 
@@ -225,6 +247,11 @@ public class PeerLink {
         Thread.ofVirtual().name("cluster-reader-" + remoteNodeId).start(this::readerLoop);
         Thread.ofVirtual().name("cluster-hb-sender-" + remoteNodeId).start(this::heartbeatSenderLoop);
         Thread.ofVirtual().name("cluster-ack-sender-" + remoteNodeId).start(this::ackSenderLoop);
+    }
+
+    /** Sets the SWIM membership sink that incoming SWIM packets on this link are routed to (Phase E). */
+    public void setSwimSink(SwimMessageSink swimSink) {
+        this.swimSink = swimSink;
     }
 
     public String getRemoteNodeId() {
@@ -325,6 +352,13 @@ public class PeerLink {
             case "ClusterGapPacket" -> handleGap(envelope);
             case "ClusterInterestPacket" -> handleInterest(envelope);
             case "ClusterInterestSyncPacket" -> handleInterestSync(envelope);
+            case "SwimPingPacket" -> handleSwimPing(envelope);
+            case "SwimAckPacket" -> handleSwimAck(envelope);
+            case "SwimPingReqPacket" -> handleSwimPingReq(envelope);
+            case "SwimPingReqAckPacket" -> handleSwimPingReqAck(envelope);
+            case "SwimJoinPacket" -> handleSwimJoin(envelope);
+            case "SwimJoinAckPacket" -> handleSwimJoinAck(envelope);
+            case "SwimLeavePacket" -> handleSwimLeave(envelope);
             default -> log.debug("Unknown cluster packet '{}' from peer {}, ignoring", name, remoteNodeId);
         }
     }
@@ -551,6 +585,101 @@ public class PeerLink {
     }
 
     // -------------------------------------------------------------------------
+    // SWIM membership handling (Phase E, receiving side)
+    // -------------------------------------------------------------------------
+
+    private void handleSwimPing(JSONObject envelope) {
+        SwimMessageSink sink = swimSink;
+        if (sink == null) {
+            return;
+        }
+        try {
+            SwimPingPacket p = SwimPingPacket.fromJson(envelope);
+            sink.onSwimPing(remoteNodeId, p.getSeqNo(), p.getPiggyback());
+        } catch (Exception e) {
+            log.warn("Malformed SwimPingPacket from peer {}: {}", remoteNodeId, e.getMessage());
+        }
+    }
+
+    private void handleSwimAck(JSONObject envelope) {
+        SwimMessageSink sink = swimSink;
+        if (sink == null) {
+            return;
+        }
+        try {
+            SwimAckPacket p = SwimAckPacket.fromJson(envelope);
+            sink.onSwimAck(remoteNodeId, p.getSeqNo(), p.getPiggyback());
+        } catch (Exception e) {
+            log.warn("Malformed SwimAckPacket from peer {}: {}", remoteNodeId, e.getMessage());
+        }
+    }
+
+    private void handleSwimPingReq(JSONObject envelope) {
+        SwimMessageSink sink = swimSink;
+        if (sink == null) {
+            return;
+        }
+        try {
+            SwimPingReqPacket p = SwimPingReqPacket.fromJson(envelope);
+            sink.onSwimPingReq(remoteNodeId, p.getTargetNodeId(), p.getSeqNo(), p.getPiggyback());
+        } catch (Exception e) {
+            log.warn("Malformed SwimPingReqPacket from peer {}: {}", remoteNodeId, e.getMessage());
+        }
+    }
+
+    private void handleSwimPingReqAck(JSONObject envelope) {
+        SwimMessageSink sink = swimSink;
+        if (sink == null) {
+            return;
+        }
+        try {
+            SwimPingReqAckPacket p = SwimPingReqAckPacket.fromJson(envelope);
+            sink.onSwimPingReqAck(remoteNodeId, p.getTargetNodeId(), p.getSeqNo(), p.getPiggyback());
+        } catch (Exception e) {
+            log.warn("Malformed SwimPingReqAckPacket from peer {}: {}", remoteNodeId, e.getMessage());
+        }
+    }
+
+    private void handleSwimJoin(JSONObject envelope) {
+        SwimMessageSink sink = swimSink;
+        if (sink == null) {
+            return;
+        }
+        try {
+            SwimJoinPacket p = SwimJoinPacket.fromJson(envelope);
+            sink.onSwimJoin(remoteNodeId, p.getHost(), p.getClusterPort(), p.getIncarnation());
+        } catch (Exception e) {
+            log.warn("Malformed SwimJoinPacket from peer {}: {}", remoteNodeId, e.getMessage());
+        }
+    }
+
+    private void handleSwimJoinAck(JSONObject envelope) {
+        SwimMessageSink sink = swimSink;
+        if (sink == null) {
+            return;
+        }
+        try {
+            SwimJoinAckPacket p = SwimJoinAckPacket.fromJson(envelope);
+            sink.onSwimJoinAck(remoteNodeId, p.getMemberList());
+        } catch (Exception e) {
+            log.warn("Malformed SwimJoinAckPacket from peer {}: {}", remoteNodeId, e.getMessage());
+        }
+    }
+
+    private void handleSwimLeave(JSONObject envelope) {
+        SwimMessageSink sink = swimSink;
+        if (sink == null) {
+            return;
+        }
+        try {
+            SwimLeavePacket p = SwimLeavePacket.fromJson(envelope);
+            sink.onSwimLeave(remoteNodeId, p.getIncarnation());
+        } catch (Exception e) {
+            log.warn("Malformed SwimLeavePacket from peer {}: {}", remoteNodeId, e.getMessage());
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Writer loop
     // -------------------------------------------------------------------------
 
@@ -567,7 +696,12 @@ public class PeerLink {
                 // Then one live publish: append to the replay buffer (may block under backpressure
                 // — this is the ONLY place blocking is allowed) and send if it was buffered. The
                 // entry's seq() is the per-link linkSeq assigned by the sender for THIS target.
-                ReplayBuffer.Entry entry = ingestQueue.poll(didWork ? 0 : 100, TimeUnit.MILLISECONDS);
+                //
+                // Idle wait budget: keep it short (CONTROL_IDLE_POLL_MS) so a control frame enqueued
+                // by the reader thread — most importantly a time-sensitive SWIM ack — is flushed
+                // promptly rather than waiting out a long ingest poll. This bounds SWIM probe RTT well
+                // under the probe timeout without spinning (a virtual thread parking briefly is cheap).
+                ReplayBuffer.Entry entry = ingestQueue.poll(didWork ? 0 : CONTROL_IDLE_POLL_MS, TimeUnit.MILLISECONDS);
                 if (entry != null) {
                     if (replayBuffer.append(entry.seq(), entry.payload())) {
                         writeItem(new OutboundItem.PreSerializedFrame(entry.payload()));

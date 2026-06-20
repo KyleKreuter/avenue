@@ -1,5 +1,11 @@
 package de.kyle.avenue.cluster;
 
+import de.kyle.avenue.cluster.membership.GossipUpdate;
+import de.kyle.avenue.cluster.membership.Member;
+import de.kyle.avenue.cluster.membership.MemberRegistry;
+import de.kyle.avenue.cluster.membership.MemberRegistryListener;
+import de.kyle.avenue.cluster.membership.MemberState;
+import de.kyle.avenue.cluster.membership.SwimMembership;
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.config.ClusterTuning;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
@@ -9,6 +15,7 @@ import de.kyle.avenue.packet.cluster.ClusterInterestPacket;
 import de.kyle.avenue.packet.cluster.ClusterInterestSyncPacket;
 import de.kyle.avenue.packet.cluster.ClusterPublishPacket;
 import de.kyle.avenue.packet.cluster.ClusterResumePacket;
+import de.kyle.avenue.packet.cluster.SwimJoinPacket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -112,6 +119,24 @@ public class ClusterManager implements ClusterForwarder {
     private final Set<String> blockedPeers = ConcurrentHashMap.newKeySet();
 
     // -------------------------------------------------------------------------
+    // Phase E — SWIM membership + link supervision
+    // -------------------------------------------------------------------------
+
+    /** SWIM membership engine; {@code null} when clustering is disabled. */
+    private final SwimMembership swimMembership;
+    private final MemberRegistry memberRegistry;
+    /**
+     * Members we are deliberately not (re)connecting to: DEAD/LEFT peers. Cleared when the member
+     * becomes ALIVE again. Drives the membership-based {@link #supervisedConnectLoop} (LinkSupervisor).
+     */
+    private final Set<String> suppressedPeers = ConcurrentHashMap.newKeySet();
+    /** Members for which a supervised outbound connect loop is currently running (dedup guard). */
+    private final Set<String> supervising = ConcurrentHashMap.newKeySet();
+
+    /** Effective max frame size for cluster links: the larger of the client packet size and the SWIM cap. */
+    private final int clusterMaxPacketSize;
+
+    // -------------------------------------------------------------------------
     // Phase D — interest state
     // -------------------------------------------------------------------------
 
@@ -185,6 +210,41 @@ public class ClusterManager implements ClusterForwarder {
         this.topicSubscriptionHandler = topicSubscriptionHandler;
         this.socketFactory = socketFactory;
         this.authenticator = new HmacAuthenticator(config.getClusterSecret());
+        this.clusterMaxPacketSize = Math.max(config.getPacketSize(), tuning.clusterPacketMaxSize());
+
+        // Phase E — SWIM membership. Only active when clustering is enabled.
+        this.memberRegistry = new MemberRegistry();
+        if (config.isClusterEnabled()) {
+            this.swimMembership = new SwimMembership(
+                    config.getNodeId(), advertisedHost(), config.getClusterPort(),
+                    System.currentTimeMillis(), memberRegistry, tuning, clusterMetrics,
+                    this::peerLinkFor);
+            // LinkSupervisor: react to membership transitions by maintaining / dropping outbound links.
+            this.memberRegistry.addListener(new MemberRegistryListener() {
+                @Override
+                public void onAlive(Member member) {
+                    suppressedPeers.remove(member.getNodeId());
+                    maybeSuperviseConnect(member);
+                }
+
+                @Override
+                public void onSuspect(Member member) {
+                    // Keep the link (if any); SWIM may still refute. No action.
+                }
+
+                @Override
+                public void onDead(Member member) {
+                    suppressOutbound(member.getNodeId());
+                }
+
+                @Override
+                public void onLeft(Member member) {
+                    suppressOutbound(member.getNodeId());
+                }
+            });
+        } else {
+            this.swimMembership = null;
+        }
         // Phase D: subscribe to local interest transitions so we can propagate them.
         this.topicSubscriptionHandler.setInterestListener(new TopicSubscriptionHandler.InterestListener() {
             @Override
@@ -381,18 +441,30 @@ public class ClusterManager implements ClusterForwarder {
         executor.submit(this::originExpirySweepLoop);
         executor.submit(this::interestSyncLoop);
 
+        // Phase E — start the SWIM engine and bootstrap discovery via the static seeds. Each seed gets
+        // a join loop; once joined, the membership-driven LinkSupervisor maintains links to every other
+        // discovered member, so dynamically discovered nodes are connected without a static peer entry.
+        if (swimMembership != null) {
+            swimMembership.start();
+        }
+
         List<String> peers = config.getClusterPeers();
         if (peers != null) {
             for (String peer : peers) {
                 String trimmed = peer.trim();
                 if (!trimmed.isEmpty()) {
-                    executor.submit(() -> outboundConnectLoop(trimmed));
+                    executor.submit(() -> seedJoinLoop(trimmed));
                 }
             }
         }
     }
 
     public void stop() {
+        // Phase E — announce a graceful leave before tearing links down, so peers converge to LEFT
+        // far faster than the suspicion timeout. Must run while the links are still up.
+        if (swimMembership != null) {
+            swimMembership.stop();
+        }
         running = false;
         ServerSocket ss = clusterServerSocket;
         if (ss != null && !ss.isClosed()) {
@@ -440,6 +512,31 @@ public class ClusterManager implements ClusterForwarder {
 
     public int getActivePeerCount() {
         return activePeers.size();
+    }
+
+    /**
+     * Phase E — number of remote members this node currently considers ALIVE (excludes self). Returns
+     * {@code 0} when clustering is disabled.
+     */
+    public int getMemberCount() {
+        return swimMembership != null ? memberRegistry.aliveCount() : 0;
+    }
+
+    /** @VisibleForTesting — the SWIM member registry, for membership-state assertions. */
+    public MemberRegistry getMemberRegistry() {
+        return memberRegistry;
+    }
+
+    /** Blocks until at least {@code expectedAlive} remote members are ALIVE, or the timeout elapses. */
+    public boolean awaitMembership(int expectedAlive, long timeout, TimeUnit unit) throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + unit.toNanos(timeout);
+        while (System.nanoTime() < deadlineNanos) {
+            if (getMemberCount() >= expectedAlive) {
+                return true;
+            }
+            Thread.sleep(20);
+        }
+        return getMemberCount() >= expectedAlive;
     }
 
     public boolean awaitAnyPeer(long timeout, TimeUnit unit) throws InterruptedException {
@@ -506,7 +603,7 @@ public class ClusterManager implements ClusterForwarder {
             peerSocket.setTcpNoDelay(true);
             ClusterHandshake.AuthResult auth = ClusterHandshake.acceptorHandshake(
                     peerSocket, config.getNodeId(), advertisedHost(), getClusterPort(),
-                    originSequencer.epoch(), authenticator, config.getPacketSize(),
+                    localIncarnation(), authenticator, clusterMaxPacketSize,
                     ClusterHandshake.DEFAULT_HANDSHAKE_TIMEOUT_MS, clusterMetrics);
             String remoteNodeId = auth.remoteNodeId();
 
@@ -527,6 +624,8 @@ public class ClusterManager implements ClusterForwarder {
                 closeQuietly(peerSocket);
                 return;
             }
+            // Phase E — learn the remote as ALIVE from its handshake-advertised contact info.
+            registerAlive(remoteNodeId, auth.remoteHost(), auth.remoteClusterPort(), auth.remoteIncarnation());
             link.start();
             log.info("Accepted cluster peer: {}", remoteNodeId);
 
@@ -540,67 +639,176 @@ public class ClusterManager implements ClusterForwarder {
     }
 
     // -------------------------------------------------------------------------
-    // Outbound connect loop with exponential backoff
+    // Phase E — seed join loop + membership-driven LinkSupervisor
     // -------------------------------------------------------------------------
 
-    private void outboundConnectLoop(String peerAddress) {
+    /**
+     * Bootstraps cluster membership via a static seed: connect + HMAC handshake, build the live
+     * {@link PeerLink}, register the seed as ALIVE, then send a {@link SwimJoinPacket} over the link.
+     * The seed replies with a {@code SwimJoinAckPacket} (full member list) which the SWIM layer merges,
+     * firing onAlive for every discovered member so the {@link #supervisedConnectLoop} connects out to
+     * them. Once joined, this seed link is an ordinary peer link; the loop only re-arms if it drops.
+     */
+    private void seedJoinLoop(String peerAddress) {
+        String[] parts = peerAddress.split(":", 2);
+        if (parts.length != 2) {
+            log.error("Invalid cluster peer address '{}' (expected host:port)", peerAddress);
+            return;
+        }
+        String host = parts[0].trim();
+        int port;
+        try {
+            port = Integer.parseInt(parts[1].trim());
+        } catch (NumberFormatException e) {
+            log.error("Invalid cluster peer port in '{}'", peerAddress);
+            return;
+        }
+
         long backoffMs = MIN_BACKOFF_MS;
         while (running) {
             try {
-                String[] parts = peerAddress.split(":", 2);
-                if (parts.length != 2) {
-                    log.error("Invalid cluster peer address '{}' (expected host:port)", peerAddress);
-                    return;
-                }
-                String host = parts[0].trim();
-                int port = Integer.parseInt(parts[1].trim());
-
-                log.debug("Connecting to cluster peer at {}:{}", host, port);
-                Socket socket = socketFactory.createSocket(host, port);
-
-                ClusterHandshake.AuthResult auth = ClusterHandshake.initiatorHandshake(
-                        socket, config.getNodeId(), advertisedHost(), getClusterPort(),
-                        originSequencer.epoch(), authenticator, config.getPacketSize(),
-                        ClusterHandshake.DEFAULT_HANDSHAKE_TIMEOUT_MS, clusterMetrics);
-                String remoteNodeId = auth.remoteNodeId();
-
-                if (blockedPeers.contains(remoteNodeId)) {
-                    log.info("Peer {} is blocked, closing outbound connection", remoteNodeId);
-                    closeQuietly(socket);
-                    sleepQuietly(backoffMs);
-                    continue;
-                }
-                if (config.getNodeId().compareTo(remoteNodeId) > 0 && activePeers.containsKey(remoteNodeId)) {
-                    log.info("Tie-break: yielding outbound to {}, using inbound link", remoteNodeId);
-                    closeQuietly(socket);
-                    waitForLinkClose(remoteNodeId);
-                    backoffMs = MIN_BACKOFF_MS;
-                    continue;
-                }
-
-                PeerLink link = buildLink(socket, remoteNodeId);
-                if (link == null) {
-                    log.info("Peer {} already connected, closing outbound duplicate", remoteNodeId);
-                    closeQuietly(socket);
-                    waitForLinkClose(remoteNodeId);
-                    backoffMs = MIN_BACKOFF_MS;
-                    continue;
-                }
-                link.start();
-                log.info("Connected to cluster peer {} at {}:{}", remoteNodeId, host, port);
+                String remoteNodeId = connectAndJoin(host, port, true);
                 backoffMs = MIN_BACKOFF_MS;
-                waitForLinkClose(remoteNodeId);
-
+                if (remoteNodeId != null) {
+                    waitForLinkClose(remoteNodeId);
+                }
             } catch (Exception e) {
                 if (!running) {
                     break;
                 }
-                log.warn("Cannot connect to cluster peer {}: {} — retry in {} ms",
-                        peerAddress, e.getMessage(), backoffMs);
+                log.warn("Cannot join via seed {}: {} — retry in {} ms", peerAddress, e.getMessage(), backoffMs);
                 sleepQuietly(backoffMs);
                 backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
             }
         }
+    }
+
+    /**
+     * Membership-driven outbound connect loop (LinkSupervisor). Started for a discovered ALIVE member
+     * when the local node is the "lower" node id (tie-break). Maintains an outbound link while the
+     * member stays connectable; stops permanently once the member is suppressed (DEAD/LEFT) or
+     * clustering stops.
+     */
+    private void supervisedConnectLoop(String remoteNodeId, String host, int port) {
+        long backoffMs = MIN_BACKOFF_MS;
+        try {
+            while (running && !suppressedPeers.contains(remoteNodeId)) {
+                try {
+                    if (activePeers.containsKey(remoteNodeId)) {
+                        waitForLinkClose(remoteNodeId);
+                        backoffMs = MIN_BACKOFF_MS;
+                        continue;
+                    }
+                    String id = connectAndJoin(host, port, false);
+                    backoffMs = MIN_BACKOFF_MS;
+                    if (id != null) {
+                        waitForLinkClose(id);
+                    } else {
+                        sleepQuietly(backoffMs);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    if (!running) {
+                        break;
+                    }
+                    log.debug("Supervised connect to {} ({}:{}) failed: {} — retry in {} ms",
+                            remoteNodeId, host, port, e.getMessage(), backoffMs);
+                    sleepQuietly(backoffMs);
+                    backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+                }
+            }
+        } finally {
+            supervising.remove(remoteNodeId);
+        }
+    }
+
+    /**
+     * Connects to {@code host:port}, performs the HMAC handshake, builds + starts the {@link PeerLink},
+     * registers the peer as ALIVE and (when {@code sendJoin}) sends a {@link SwimJoinPacket}. Returns
+     * the remote node id of the established link, or {@code null} if the connection was a tie-break
+     * yield / duplicate (no link built).
+     */
+    private String connectAndJoin(String host, int port, boolean sendJoin) throws IOException {
+        Socket socket = socketFactory.createSocket(host, port);
+        ClusterHandshake.AuthResult auth = ClusterHandshake.initiatorHandshake(
+                socket, config.getNodeId(), advertisedHost(), getClusterPort(),
+                localIncarnation(), authenticator, clusterMaxPacketSize,
+                ClusterHandshake.DEFAULT_HANDSHAKE_TIMEOUT_MS, clusterMetrics);
+        String remoteNodeId = auth.remoteNodeId();
+
+        if (blockedPeers.contains(remoteNodeId)) {
+            log.info("Peer {} is blocked, closing outbound connection", remoteNodeId);
+            closeQuietly(socket);
+            return null;
+        }
+        if (config.getNodeId().compareTo(remoteNodeId) > 0 && activePeers.containsKey(remoteNodeId)) {
+            log.info("Tie-break: yielding outbound to {}, using inbound link", remoteNodeId);
+            closeQuietly(socket);
+            return null;
+        }
+
+        PeerLink link = buildLink(socket, remoteNodeId);
+        if (link == null) {
+            log.info("Peer {} already connected, closing outbound duplicate", remoteNodeId);
+            closeQuietly(socket);
+            return null;
+        }
+        registerAlive(remoteNodeId, auth.remoteHost(), auth.remoteClusterPort(), auth.remoteIncarnation());
+        link.start();
+        log.info("Connected to cluster peer {} at {}:{}", remoteNodeId, host, port);
+
+        if (sendJoin && swimMembership != null) {
+            link.enqueueControl(new SwimJoinPacket(
+                    config.getNodeId(), advertisedHost(), getClusterPort(),
+                    swimMembership.getLocalIncarnation()));
+        }
+        return remoteNodeId;
+    }
+
+    /**
+     * Records a directly-connected peer as ALIVE and schedules its ALIVE fact for gossip, so a node
+     * we only reached via a direct link is still disseminated to indirect peers. No-op when clustering
+     * is disabled.
+     */
+    private void registerAlive(String nodeId, String host, int clusterPort, long incarnation) {
+        if (swimMembership == null) {
+            return;
+        }
+        swimMembership.noteAliveAndGossip(nodeId, host, clusterPort, incarnation);
+    }
+
+    /**
+     * LinkSupervisor reaction to onAlive: if we are the lower node id (tie-break, the side that
+     * initiates) and have neither a live link nor a running supervisor for the member, start one.
+     */
+    private void maybeSuperviseConnect(Member member) {
+        if (!running || swimMembership == null) {
+            return;
+        }
+        String nodeId = member.getNodeId();
+        if (nodeId.equals(config.getNodeId()) || blockedPeers.contains(nodeId)) {
+            return;
+        }
+        if (config.getNodeId().compareTo(nodeId) >= 0) {
+            return; // higher/equal node id: the remote initiates to us
+        }
+        if (member.getHost() == null || member.getHost().isBlank() || member.getClusterPort() <= 0) {
+            return; // no usable contact info (e.g. learned only via a sparse gossip fact)
+        }
+        if (activePeers.containsKey(nodeId)) {
+            return;
+        }
+        if (supervising.add(nodeId)) {
+            String host = member.getHost();
+            int port = member.getClusterPort();
+            executor.submit(() -> supervisedConnectLoop(nodeId, host, port));
+        }
+    }
+
+    private void suppressOutbound(String nodeId) {
+        suppressedPeers.add(nodeId);
     }
 
     // -------------------------------------------------------------------------
@@ -661,7 +869,7 @@ public class ClusterManager implements ClusterForwarder {
                 remoteNodeId,
                 config.getNodeId(),
                 originSequencer.epoch(),
-                config.getPacketSize(),
+                clusterMaxPacketSize,
                 config.getClusterHeartbeatIntervalMs(),
                 tuning.ackIntervalMs(),
                 tuning.strictOrdering(),
@@ -675,6 +883,14 @@ public class ClusterManager implements ClusterForwarder {
                 () -> {
                     if (activePeers.remove(remoteNodeId, self[0])) {
                         clusterMetrics.decrementActivePeerLinks();
+                        // Phase E — the link tore down (crash / partition / watchdog / drop): mark the
+                        // peer SUSPECT at once so the failure detector does not lag behind the
+                        // transport. onLinkClosed only suspects a currently-ALIVE member, so it is a
+                        // no-op for a peer that already LEFT/DEAD, and indirect probing confirms or the
+                        // peer refutes via a higher incarnation.
+                        if (swimMembership != null && running) {
+                            swimMembership.onLinkClosed(remoteNodeId);
+                        }
                         // Mark the target for expiry: it survives until origin.expiry-ms without a link.
                         touchTarget(remoteNodeId);
                         // Phase D / Phase C interplay: do NOT drop the peer's interest here. The
@@ -691,6 +907,8 @@ public class ClusterManager implements ClusterForwarder {
                 }
         );
         self[0] = link;
+        // Phase E — route incoming SWIM control packets on this link to the membership engine.
+        link.setSwimSink(swimMembership);
         PeerLink existing = activePeers.putIfAbsent(remoteNodeId, link);
         if (existing != null) {
             return null;
@@ -754,11 +972,25 @@ public class ClusterManager implements ClusterForwarder {
     }
 
     private String advertisedHost() {
+        String configured = tuning.advertisedHost();
+        if (configured != null && !configured.isBlank()) {
+            return configured;
+        }
         try {
             return InetAddress.getLocalHost().getHostAddress();
         } catch (UnknownHostException e) {
             return "127.0.0.1";
         }
+    }
+
+    /** This node's current SWIM incarnation, or the origin epoch when clustering is disabled. */
+    private long localIncarnation() {
+        return swimMembership != null ? swimMembership.getLocalIncarnation() : originSequencer.epoch();
+    }
+
+    /** Resolves a live {@link PeerLink} to a peer for the SWIM engine; {@code null} if not connected. */
+    private PeerLink peerLinkFor(String nodeId) {
+        return activePeers.get(nodeId);
     }
 
     private void waitForLinkClose(String nodeId) throws InterruptedException {

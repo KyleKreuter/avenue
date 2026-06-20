@@ -38,6 +38,22 @@ public final class ClusterMetrics {
      */
     private final AtomicLong interestRoutedSkipped = new AtomicLong();
 
+    // Phase E — SWIM membership.
+    /** Current number of remote members in ALIVE state (gauge). */
+    private final AtomicLong membersAlive = new AtomicLong();
+    /** Current number of remote members in SUSPECT state (gauge). */
+    private final AtomicLong membersSuspect = new AtomicLong();
+    /** Current number of remote members in DEAD state (gauge). */
+    private final AtomicLong membersDead = new AtomicLong();
+    private final AtomicLong joinEvents = new AtomicLong();
+    private final AtomicLong leaveEvents = new AtomicLong();
+    private final AtomicLong suspectEvents = new AtomicLong();
+    private final AtomicLong deadEvents = new AtomicLong();
+    private final AtomicLong indirectProbesSent = new AtomicLong();
+    private final AtomicLong gossipMessagesSent = new AtomicLong();
+    private final AtomicLong gossipMessagesReceived = new AtomicLong();
+    private final AtomicLong incarnationConflicts = new AtomicLong();
+
     // Gauge (current value).
     private final AtomicLong activePeerLinks = new AtomicLong();
     /** Current total depth of all per-target replay buffers (sum of un-acked entries). */
@@ -162,8 +178,111 @@ public final class ClusterMetrics {
     }
 
     // ------------------------------------------------------------------
+    // Phase E — SWIM membership mutations
+    // ------------------------------------------------------------------
+
+    /** Sets the current ALIVE-members gauge. */
+    public void setMembersAlive(long value) {
+        membersAlive.set(value);
+    }
+
+    /** Sets the current SUSPECT-members gauge. */
+    public void setMembersSuspect(long value) {
+        membersSuspect.set(value);
+    }
+
+    /** Sets the current DEAD-members gauge. */
+    public void setMembersDead(long value) {
+        membersDead.set(value);
+    }
+
+    /** Records a member join (a newly discovered ALIVE member). */
+    public void incrementJoinEvents() {
+        joinEvents.incrementAndGet();
+    }
+
+    /** Records a member graceful leave. */
+    public void incrementLeaveEvents() {
+        leaveEvents.incrementAndGet();
+    }
+
+    /** Records a member transitioning to SUSPECT. */
+    public void incrementSuspectEvents() {
+        suspectEvents.incrementAndGet();
+    }
+
+    /** Records a member transitioning to DEAD. */
+    public void incrementDeadEvents() {
+        deadEvents.incrementAndGet();
+    }
+
+    /** Records an indirect probe (ping-req) that was sent to a helper. */
+    public void incrementIndirectProbesSent() {
+        indirectProbesSent.incrementAndGet();
+    }
+
+    /** Records one SWIM control packet sent (probe / ack / gossip carrier). */
+    public void incrementGossipMessagesSent() {
+        gossipMessagesSent.incrementAndGet();
+    }
+
+    /** Records one SWIM control packet received. */
+    public void incrementGossipMessagesReceived() {
+        gossipMessagesReceived.incrementAndGet();
+    }
+
+    /** Records that an own-node SUSPECT/DEAD was refuted by bumping the local incarnation. */
+    public void incrementIncarnationConflicts() {
+        incarnationConflicts.incrementAndGet();
+    }
+
+    // ------------------------------------------------------------------
     // Getters (for tests and the periodic reporter)
     // ------------------------------------------------------------------
+
+    public long getMembersAlive() {
+        return membersAlive.get();
+    }
+
+    public long getMembersSuspect() {
+        return membersSuspect.get();
+    }
+
+    public long getMembersDead() {
+        return membersDead.get();
+    }
+
+    public long getJoinEvents() {
+        return joinEvents.get();
+    }
+
+    public long getLeaveEvents() {
+        return leaveEvents.get();
+    }
+
+    public long getSuspectEvents() {
+        return suspectEvents.get();
+    }
+
+    public long getDeadEvents() {
+        return deadEvents.get();
+    }
+
+    public long getIndirectProbesSent() {
+        return indirectProbesSent.get();
+    }
+
+    public long getGossipMessagesSent() {
+        return gossipMessagesSent.get();
+    }
+
+    public long getGossipMessagesReceived() {
+        return gossipMessagesReceived.get();
+    }
+
+    public long getIncarnationConflicts() {
+        return incarnationConflicts.get();
+    }
 
     public long getMessagesForwarded() {
         return messagesForwarded.get();

@@ -3,14 +3,16 @@ package de.kyle.avenue.config;
 import de.kyle.avenue.cluster.ReplayBuffer;
 
 /**
- * Bundle of cluster transport tuning knobs introduced with Phase C's at-least-once delivery.
+ * Bundle of cluster transport tuning knobs introduced with Phase C's at-least-once delivery and
+ * extended through Phase D (interest routing) and Phase E (SWIM membership).
  * <p>
  * These are gathered into a single record (instead of being added as yet more
  * {@link AvenueConfig} constructor parameters) so the existing 7-, 13- and 26-argument
  * {@code AvenueConfig} constructors — and every test that calls them — stay source-compatible: they
  * simply delegate to {@link #defaults()}. The file/{@code .env} constructor builds a populated
  * instance from the {@code cluster.replay.*}, {@code cluster.ack-interval-ms},
- * {@code cluster.strict-ordering} and {@code cluster.origin.expiry-ms} properties.
+ * {@code cluster.strict-ordering}, {@code cluster.origin.expiry-ms}, {@code cluster.interest.*} and
+ * {@code cluster.swim.*} properties.
  *
  * @param replayCapacity        max buffered un-acked messages per target ({@code cluster.replay.capacity})
  * @param backpressurePolicy    policy when the replay ring is full ({@code cluster.replay.backpressure.policy})
@@ -26,6 +28,21 @@ import de.kyle.avenue.cluster.ReplayBuffer;
  * @param interestBroadcastGraceMs grace window after an interest topology change during which a node
  *                              floods the affected topic to ALL peers (closes the subscribe/publish
  *                              race), {@code 0} = off ({@code cluster.interest.broadcast-grace-ms})
+ * @param swimProbeIntervalMs   SWIM probe period in ms ({@code cluster.swim.probe-interval-ms}); Phase E
+ * @param swimProbeTimeoutMs    SWIM (direct and indirect) probe timeout in ms
+ *                              ({@code cluster.swim.probe-timeout-ms})
+ * @param swimIndirectProbeCount number of helpers used for an indirect probe
+ *                              ({@code cluster.swim.indirect-probe-count})
+ * @param swimSuspicionTimeoutMs how long a member stays SUSPECT before being declared DEAD
+ *                              ({@code cluster.swim.suspicion-timeout-ms})
+ * @param swimGossipFanout      max number of gossip updates piggybacked per SWIM packet
+ *                              ({@code cluster.swim.gossip-fanout})
+ * @param swimDeadMemberTimeoutMs how long a DEAD/LEFT member is retained before reaping
+ *                              ({@code cluster.swim.dead-member-timeout-ms})
+ * @param advertisedHost        host this node advertises to peers ({@code cluster.advertised-host};
+ *                              empty = auto-detect the local IP)
+ * @param clusterPacketMaxSize  max frame size for cluster links, larger than the client packet size
+ *                              to fit JoinAck member lists ({@code cluster.packet.max-size})
  */
 public record ClusterTuning(
         int replayCapacity,
@@ -35,7 +52,15 @@ public record ClusterTuning(
         boolean strictOrdering,
         long originExpiryMs,
         long interestSyncIntervalMs,
-        long interestBroadcastGraceMs
+        long interestBroadcastGraceMs,
+        long swimProbeIntervalMs,
+        long swimProbeTimeoutMs,
+        int swimIndirectProbeCount,
+        long swimSuspicionTimeoutMs,
+        int swimGossipFanout,
+        long swimDeadMemberTimeoutMs,
+        String advertisedHost,
+        int clusterPacketMaxSize
 ) {
 
     public static final int DEFAULT_REPLAY_CAPACITY = 65_536;
@@ -46,10 +71,37 @@ public record ClusterTuning(
     public static final long DEFAULT_INTEREST_SYNC_INTERVAL_MS = 10_000L;
     public static final long DEFAULT_INTEREST_BROADCAST_GRACE_MS = 0L;
 
+    // Phase E — SWIM membership defaults.
+    public static final long DEFAULT_SWIM_PROBE_INTERVAL_MS = 1_000L;
+    public static final long DEFAULT_SWIM_PROBE_TIMEOUT_MS = 500L;
+    public static final int DEFAULT_SWIM_INDIRECT_PROBE_COUNT = 3;
+    public static final long DEFAULT_SWIM_SUSPICION_TIMEOUT_MS = 5_000L;
+    public static final int DEFAULT_SWIM_GOSSIP_FANOUT = 4;
+    public static final long DEFAULT_SWIM_DEAD_MEMBER_TIMEOUT_MS = 30_000L;
+    public static final String DEFAULT_ADVERTISED_HOST = "";
+    public static final int DEFAULT_CLUSTER_PACKET_MAX_SIZE = 1_048_576;
+
+    /**
+     * Compact canonical constructor: applies the SWIM defaults if a caller (a legacy short
+     * constructor or {@code defaults()}) leaves the Phase E knobs at sentinel values, and normalizes
+     * a {@code null} advertised host to the empty string. Concretely, non-positive SWIM intervals /
+     * counts are coerced to their defaults so a partially-specified tuning is always usable.
+     */
+    public ClusterTuning {
+        if (swimProbeIntervalMs <= 0) swimProbeIntervalMs = DEFAULT_SWIM_PROBE_INTERVAL_MS;
+        if (swimProbeTimeoutMs <= 0) swimProbeTimeoutMs = DEFAULT_SWIM_PROBE_TIMEOUT_MS;
+        if (swimIndirectProbeCount < 0) swimIndirectProbeCount = DEFAULT_SWIM_INDIRECT_PROBE_COUNT;
+        if (swimSuspicionTimeoutMs <= 0) swimSuspicionTimeoutMs = DEFAULT_SWIM_SUSPICION_TIMEOUT_MS;
+        if (swimGossipFanout <= 0) swimGossipFanout = DEFAULT_SWIM_GOSSIP_FANOUT;
+        if (swimDeadMemberTimeoutMs <= 0) swimDeadMemberTimeoutMs = DEFAULT_SWIM_DEAD_MEMBER_TIMEOUT_MS;
+        if (advertisedHost == null) advertisedHost = DEFAULT_ADVERTISED_HOST;
+        if (clusterPacketMaxSize <= 0) clusterPacketMaxSize = DEFAULT_CLUSTER_PACKET_MAX_SIZE;
+    }
+
     /**
      * Backwards-compatible 6-argument constructor (pre-Phase-D). Keeps every existing caller — in
      * particular the Phase C {@code AtLeastOnceTest} tunings — source-compatible by applying the
-     * Phase D interest defaults (10 s anti-entropy sync, broadcast-grace off).
+     * Phase D interest defaults and the Phase E SWIM defaults.
      */
     public ClusterTuning(
             int replayCapacity,
@@ -62,6 +114,28 @@ public record ClusterTuning(
         this(replayCapacity, backpressurePolicy, replayOfferTimeoutMs, ackIntervalMs,
                 strictOrdering, originExpiryMs,
                 DEFAULT_INTEREST_SYNC_INTERVAL_MS, DEFAULT_INTEREST_BROADCAST_GRACE_MS);
+    }
+
+    /**
+     * Backwards-compatible 8-argument constructor (pre-Phase-E). Applies the Phase E SWIM defaults so
+     * any caller that already pinned the Phase C/D knobs keeps working.
+     */
+    public ClusterTuning(
+            int replayCapacity,
+            ReplayBuffer.BackpressurePolicy backpressurePolicy,
+            long replayOfferTimeoutMs,
+            long ackIntervalMs,
+            boolean strictOrdering,
+            long originExpiryMs,
+            long interestSyncIntervalMs,
+            long interestBroadcastGraceMs
+    ) {
+        this(replayCapacity, backpressurePolicy, replayOfferTimeoutMs, ackIntervalMs,
+                strictOrdering, originExpiryMs, interestSyncIntervalMs, interestBroadcastGraceMs,
+                DEFAULT_SWIM_PROBE_INTERVAL_MS, DEFAULT_SWIM_PROBE_TIMEOUT_MS,
+                DEFAULT_SWIM_INDIRECT_PROBE_COUNT, DEFAULT_SWIM_SUSPICION_TIMEOUT_MS,
+                DEFAULT_SWIM_GOSSIP_FANOUT, DEFAULT_SWIM_DEAD_MEMBER_TIMEOUT_MS,
+                DEFAULT_ADVERTISED_HOST, DEFAULT_CLUSTER_PACKET_MAX_SIZE);
     }
 
     /** Production-safe defaults used by every non-file constructor of {@link AvenueConfig}. */

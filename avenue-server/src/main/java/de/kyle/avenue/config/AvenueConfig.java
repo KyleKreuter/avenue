@@ -382,10 +382,57 @@ public class AvenueConfig {
                         properties.getProperty("cluster.interest.broadcast-grace-ms",
                                 Long.toString(ClusterTuning.DEFAULT_INTEREST_BROADCAST_GRACE_MS)))
         );
+        // Phase E — SWIM membership tuning.
+        long swimProbeIntervalMs = Long.parseLong(
+                dotenv.get("CLUSTER_SWIM_PROBE_INTERVAL_MS",
+                        properties.getProperty("cluster.swim.probe-interval-ms",
+                                Long.toString(ClusterTuning.DEFAULT_SWIM_PROBE_INTERVAL_MS)))
+        );
+        long swimProbeTimeoutMs = Long.parseLong(
+                dotenv.get("CLUSTER_SWIM_PROBE_TIMEOUT_MS",
+                        properties.getProperty("cluster.swim.probe-timeout-ms",
+                                Long.toString(ClusterTuning.DEFAULT_SWIM_PROBE_TIMEOUT_MS)))
+        );
+        int swimIndirectProbeCount = Integer.parseInt(
+                dotenv.get("CLUSTER_SWIM_INDIRECT_PROBE_COUNT",
+                        properties.getProperty("cluster.swim.indirect-probe-count",
+                                Integer.toString(ClusterTuning.DEFAULT_SWIM_INDIRECT_PROBE_COUNT)))
+        );
+        long swimSuspicionTimeoutMs = Long.parseLong(
+                dotenv.get("CLUSTER_SWIM_SUSPICION_TIMEOUT_MS",
+                        properties.getProperty("cluster.swim.suspicion-timeout-ms",
+                                Long.toString(ClusterTuning.DEFAULT_SWIM_SUSPICION_TIMEOUT_MS)))
+        );
+        int swimGossipFanout = Integer.parseInt(
+                dotenv.get("CLUSTER_SWIM_GOSSIP_FANOUT",
+                        properties.getProperty("cluster.swim.gossip-fanout",
+                                Integer.toString(ClusterTuning.DEFAULT_SWIM_GOSSIP_FANOUT)))
+        );
+        long swimDeadMemberTimeoutMs = Long.parseLong(
+                dotenv.get("CLUSTER_SWIM_DEAD_MEMBER_TIMEOUT_MS",
+                        properties.getProperty("cluster.swim.dead-member-timeout-ms",
+                                Long.toString(ClusterTuning.DEFAULT_SWIM_DEAD_MEMBER_TIMEOUT_MS)))
+        );
+        String advertisedHost = dotenv.get("CLUSTER_ADVERTISED_HOST",
+                properties.getProperty("cluster.advertised-host", ClusterTuning.DEFAULT_ADVERTISED_HOST));
+        int clusterPacketMaxSize = Integer.parseInt(
+                dotenv.get("CLUSTER_PACKET_MAX_SIZE",
+                        properties.getProperty("cluster.packet.max-size",
+                                Integer.toString(ClusterTuning.DEFAULT_CLUSTER_PACKET_MAX_SIZE)))
+        );
         clusterTuning = new ClusterTuning(
                 replayCapacity, replayPolicy, replayOfferTimeoutMs,
                 ackIntervalMs, strictOrdering, originExpiryMs,
-                interestSyncIntervalMs, interestBroadcastGraceMs);
+                interestSyncIntervalMs, interestBroadcastGraceMs,
+                swimProbeIntervalMs, swimProbeTimeoutMs, swimIndirectProbeCount,
+                swimSuspicionTimeoutMs, swimGossipFanout, swimDeadMemberTimeoutMs,
+                advertisedHost, clusterPacketMaxSize);
+
+        // Phase E — fail fast on a misconfigured cluster node id. Only enforced in the file/.env path
+        // (direct-value constructors always pass an explicit nodeId), and only when clustering is on.
+        if (clusterEnabled && (nodeId == null || nodeId.isBlank())) {
+            throw new IllegalStateException("cluster.node-id must be set when cluster.enabled=true");
+        }
 
         // Wave 5 — Security & Ops settings (all optional, safe defaults).
         clientIdleTimeoutMillis = Long.parseLong(

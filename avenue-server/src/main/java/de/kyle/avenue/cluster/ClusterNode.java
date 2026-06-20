@@ -103,6 +103,27 @@ public class ClusterNode {
     }
 
     /**
+     * Phase E — number of remote members this node currently considers ALIVE (excludes self).
+     * {@code 0} when clustering is disabled.
+     */
+    public int getMemberCount() {
+        return clusterManager.getMemberCount();
+    }
+
+    /**
+     * Blocks until this node sees at least {@code expectedAlive} ALIVE remote members, or the timeout
+     * elapses. Test-synchronization helper for SWIM convergence.
+     */
+    public boolean awaitMembership(int expectedAlive, long timeout, TimeUnit unit) throws InterruptedException {
+        return clusterManager.awaitMembership(expectedAlive, timeout, unit);
+    }
+
+    /** @VisibleForTesting — the SWIM member registry, for membership-state assertions. */
+    public de.kyle.avenue.cluster.membership.MemberRegistry getMemberRegistry() {
+        return clusterManager.getMemberRegistry();
+    }
+
+    /**
      * Closes the link to the given peer (test seam for reconnect / partition simulation). The
      * owning connect loop will reconnect unless the peer is also blocked.
      */
