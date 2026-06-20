@@ -20,8 +20,17 @@ public final class ClusterMetrics {
     private final AtomicLong messagesDropped = new AtomicLong();
     private final AtomicLong handshakeAuthFailures = new AtomicLong();
 
+    // Phase C — at-least-once delivery counters.
+    private final AtomicLong clusterBackfillMessages = new AtomicLong();
+    private final AtomicLong clusterGapEvents = new AtomicLong();
+    private final AtomicLong clusterSlowPeerStalls = new AtomicLong();
+    private final AtomicLong acksSent = new AtomicLong();
+    private final AtomicLong acksReceived = new AtomicLong();
+
     // Gauge (current value).
     private final AtomicLong activePeerLinks = new AtomicLong();
+    /** Current total depth of all per-target replay buffers (sum of un-acked entries). */
+    private final AtomicLong replayBufferDepth = new AtomicLong();
 
     // ------------------------------------------------------------------
     // Counter mutations
@@ -59,6 +68,50 @@ public final class ClusterMetrics {
     // Gauge mutations
     // ------------------------------------------------------------------
 
+    /** Records that one buffered message was re-sent to a peer during reconnect backfill. */
+    public void incrementClusterBackfillMessages() {
+        clusterBackfillMessages.incrementAndGet();
+    }
+
+    /** Adds {@code n} to the backfill-messages counter (batch increment during a replay). */
+    public void addClusterBackfillMessages(long n) {
+        if (n > 0) {
+            clusterBackfillMessages.addAndGet(n);
+        }
+    }
+
+    /**
+     * Records that a gap occurred: replay state for a requested range was unavailable, or an entry
+     * was dropped under backpressure, forcing the receiver to resync forward past lost messages.
+     */
+    public void incrementClusterGapEvents() {
+        clusterGapEvents.incrementAndGet();
+    }
+
+    /** Records that a writer stalled because the replay buffer was full (slow peer backpressure). */
+    public void incrementClusterSlowPeerStalls() {
+        clusterSlowPeerStalls.incrementAndGet();
+    }
+
+    /** Records that one cumulative ACK packet was sent towards a peer. */
+    public void incrementAcksSent() {
+        acksSent.incrementAndGet();
+    }
+
+    /** Records that one cumulative ACK packet was received from a peer. */
+    public void incrementAcksReceived() {
+        acksReceived.incrementAndGet();
+    }
+
+    /**
+     * Adjusts the aggregate replay-buffer-depth gauge by {@code delta} (positive when entries are
+     * buffered, negative when they are acked/evicted). Each {@link de.kyle.avenue.cluster.ReplayBuffer}
+     * reports its own size change so the gauge reflects the cluster-wide un-acked backlog.
+     */
+    public void addReplayBufferDepth(long delta) {
+        replayBufferDepth.addAndGet(delta);
+    }
+
     /** Increments the active-peer-link gauge (a link was added). */
     public void incrementActivePeerLinks() {
         activePeerLinks.incrementAndGet();
@@ -95,5 +148,29 @@ public final class ClusterMetrics {
 
     public long getHandshakeAuthFailures() {
         return handshakeAuthFailures.get();
+    }
+
+    public long getClusterBackfillMessages() {
+        return clusterBackfillMessages.get();
+    }
+
+    public long getClusterGapEvents() {
+        return clusterGapEvents.get();
+    }
+
+    public long getClusterSlowPeerStalls() {
+        return clusterSlowPeerStalls.get();
+    }
+
+    public long getAcksSent() {
+        return acksSent.get();
+    }
+
+    public long getAcksReceived() {
+        return acksReceived.get();
+    }
+
+    public long getReplayBufferDepth() {
+        return replayBufferDepth.get();
     }
 }

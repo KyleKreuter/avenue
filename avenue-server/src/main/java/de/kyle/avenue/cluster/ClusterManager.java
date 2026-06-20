@@ -1,10 +1,12 @@
 package de.kyle.avenue.cluster;
 
 import de.kyle.avenue.config.AvenueConfig;
+import de.kyle.avenue.config.ClusterTuning;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.ClusterMetrics;
 import de.kyle.avenue.net.SocketFactoryProvider;
 import de.kyle.avenue.packet.cluster.ClusterPublishPacket;
+import de.kyle.avenue.packet.cluster.ClusterResumePacket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -13,6 +15,7 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -23,23 +26,21 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Manages all cluster peer links for a single Avenue node and implements
- * {@link ClusterForwarder} so it can be injected directly into
- * {@link de.kyle.avenue.handler.packet.publish.PublishMessageInboundPacketHandler}.
+ * {@link ClusterForwarder}.
  * <p>
- * Responsibilities:
- * <ol>
- *   <li>Runs a TCP accept loop on the configured cluster port for incoming peer
- *       connections.</li>
- *   <li>Initiates outbound connections to all statically configured peers with
- *       exponential-backoff reconnect on failure.</li>
- *   <li>Maintains the active {@link PeerLink} set, keyed by remote {@code nodeId}, with a
- *       deterministic tie-break when an inbound and an outbound link to the same peer race.</li>
- *   <li>Implements {@link ClusterForwarder#forward} to fan out a local publish to all peers,
- *       serializing the {@link ClusterPublishPacket} exactly once and sharing the immutable
- *       {@link OutboundItem.PreSerializedFrame} across every target link.</li>
- *   <li>Deduplicates inbound publishes per {@code (originNodeId, originEpoch)} via
- *       {@link OriginSequenceTracker}.</li>
- * </ol>
+ * Phase C — at-least-once delivery:
+ * <ul>
+ *   <li>Holds one {@link ReplayBuffer} per <b>target node id</b> in {@link #replayBuffers}, NOT per
+ *       link. The buffer therefore survives a link teardown, so a rebuilt link to the same peer can
+ *       backfill everything the peer has not acknowledged (partition + heal). A buffer is freed only
+ *       after {@code cluster.origin.expiry-ms} without any active link to that target.</li>
+ *   <li>{@link #forward} assigns one strictly-monotonic {@code seq} from the single
+ *       {@link OriginSequencer} per local publish (origin == self) and hands it to every active
+ *       link's writer non-blockingly. The blocking {@code append} into the replay ring happens on
+ *       the writer thread, so the local delivery / client-reader path never stalls.</li>
+ *   <li>Per-origin ordered dedup via {@link OriginSequenceTracker} (receiving side). Backfill is
+ *       idempotent because the tracker rejects any {@code seq <= contiguousSeq}.</li>
+ * </ul>
  * All I/O threads are virtual threads (Java 21).
  */
 public class ClusterManager implements ClusterForwarder {
@@ -50,41 +51,63 @@ public class ClusterManager implements ClusterForwarder {
     private static final long MAX_BACKOFF_MS = 30_000L;
 
     private final AvenueConfig config;
+    private final ClusterTuning tuning;
     private final TopicSubscriptionHandler topicSubscriptionHandler;
 
-    /** Per-node monotonic publish sequencer; one instance per node. */
+    /** Per-node monotonic publish sequencer; one instance per node (single counter source). */
     private final OriginSequencer originSequencer = new OriginSequencer();
 
-    /** HMAC helper keyed by {@code cluster.secret}; drives the challenge-response handshake. */
     private final HmacAuthenticator authenticator;
 
     /** Per-origin ordered dedup trackers, keyed by {@code originNodeId:originEpoch}. */
     private final ConcurrentHashMap<String, OriginSequenceTracker> originTrackers = new ConcurrentHashMap<>();
 
-    /** Cluster transport metrics; folded into the shared metrics snapshot when wired. */
+    /** Origin metadata (nodeId, epoch) per origin key, so resume/ack packets can be reconstructed. */
+    private final ConcurrentHashMap<String, OriginMeta> originMeta = new ConcurrentHashMap<>();
+
+    /**
+     * Per-target send state (replay buffer + publish ingest queue), keyed by the remote node id.
+     * Survives link teardown so a reconnect can resume and backfill, and so messages published
+     * during a partition accumulate in the ingest queue until the link returns. Carries a
+     * last-touch timestamp for {@code origin.expiry-ms} reclamation.
+     */
+    private final ConcurrentHashMap<String, TargetState> targets = new ConcurrentHashMap<>();
+
+    /** Generous bound on the per-target publish ingest queue (independent of replay capacity). */
+    private static final int INGEST_QUEUE_CAPACITY = 65_536;
+
     private final ClusterMetrics clusterMetrics = new ClusterMetrics();
-
-    /** Yields plain or TLS cluster sockets depending on {@code cluster.tls.enabled} (E14). */
     private final ClusterSocketFactory socketFactory;
-
-    /** Active links keyed by the remote node's ID. */
     private final ConcurrentHashMap<String, PeerLink> activePeers = new ConcurrentHashMap<>();
-
-    /** Node IDs blocked from reconnecting (test seam for partition simulation). */
     private final Set<String> blockedPeers = ConcurrentHashMap.newKeySet();
 
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
     private volatile boolean running = false;
     private volatile ServerSocket clusterServerSocket;
-
-    /** Released once the cluster server socket is bound (or the bind attempt failed). */
     private final CountDownLatch boundLatch = new CountDownLatch(1);
 
+    /** Immutable origin descriptor for reconstructing resume/ack packets. */
+    private record OriginMeta(String originNodeId, long originEpoch) {
+    }
+
     /**
-     * Production constructor. Builds the cluster {@link SocketFactoryProvider} (plain or TLS)
-     * from configuration exactly as before.
+     * Per-target durable send state that outlives any single {@link PeerLink}: the replay buffer
+     * (sent-but-unacked entries, for backfill) and the publish ingest queue (handoff from
+     * {@link #forward}, drained by the active link's writer; accumulates during a partition).
      */
+    private static final class TargetState {
+        final ReplayBuffer buffer;
+        final java.util.concurrent.BlockingQueue<ReplayBuffer.Entry> ingest;
+        volatile long lastTouchMs;
+
+        TargetState(ReplayBuffer buffer, int ingestCapacity, long nowMs) {
+            this.buffer = buffer;
+            this.ingest = new java.util.concurrent.LinkedBlockingQueue<>(ingestCapacity);
+            this.lastTouchMs = nowMs;
+        }
+    }
+
     public ClusterManager(AvenueConfig config, TopicSubscriptionHandler topicSubscriptionHandler) {
         this(config, topicSubscriptionHandler, SocketFactoryProvider.forCluster(
                 config.isClusterTlsEnabled(),
@@ -95,17 +118,13 @@ public class ClusterManager implements ClusterForwarder {
         ));
     }
 
-    /**
-     * Test-oriented constructor accepting an injected {@link ClusterSocketFactory}. The
-     * production constructor delegates here with a {@link SocketFactoryProvider}; tests can pass a
-     * fake factory to intercept the cluster wire. Production behaviour is unchanged.
-     */
     public ClusterManager(
             AvenueConfig config,
             TopicSubscriptionHandler topicSubscriptionHandler,
             ClusterSocketFactory socketFactory
     ) {
         this.config = config;
+        this.tuning = config.getClusterTuning();
         this.topicSubscriptionHandler = topicSubscriptionHandler;
         this.socketFactory = socketFactory;
         this.authenticator = new HmacAuthenticator(config.getClusterSecret());
@@ -116,54 +135,96 @@ public class ClusterManager implements ClusterForwarder {
     // -------------------------------------------------------------------------
 
     /**
-     * Forwards a locally-received publish to all connected peers. Stamps this node's
-     * {@code nodeId} as {@code originNodeId} and assigns the {@code (epoch, seq)} identity from
-     * the local {@link OriginSequencer}. The packet is serialized to envelope bytes exactly once
-     * and the same immutable {@link OutboundItem.PreSerializedFrame} is enqueued on every peer
-     * link (O(1) instead of O(N) serialization). Non-blocking: a full peer queue drops the frame
-     * for that peer (at-most-once).
+     * Forwards a locally-received publish to all connected peers. Assigns one
+     * {@code (epoch, seq)} identity from the {@link OriginSequencer} (single counter source, so the
+     * seq stream towards every target is already strictly monotonic), serializes the
+     * {@link ClusterPublishPacket} exactly once, and hands the same bytes to every active link's
+     * writer. Strictly non-blocking: backpressure is absorbed on each link's writer thread by its
+     * {@link ReplayBuffer}, never here on the publish path.
      */
     @Override
     public void forward(String topic, String source, String data) {
-        if (activePeers.isEmpty()) {
-            // No peers: do not burn a sequence number, keeping the origin sequence dense.
+        if (targets.isEmpty()) {
+            // No target ever discovered: do not burn a sequence number, keeping the origin sequence
+            // dense for the first peer that connects.
             return;
         }
+        long seq = originSequencer.nextSeq();
         ClusterPublishPacket packet = new ClusterPublishPacket(
-                topic,
-                source,
-                config.getNodeId(),
-                originSequencer.epoch(),
-                originSequencer.nextSeq(),
-                data
-        );
-        // Serialize ONCE; share the immutable byte[] across all target links.
-        OutboundItem.PreSerializedFrame frame =
-                new OutboundItem.PreSerializedFrame(PeerLink.serializeEnvelope(packet));
-        activePeers.values().forEach(link -> {
-            link.forward(frame);
-            clusterMetrics.incrementMessagesForwarded();
-        });
+                topic, source, config.getNodeId(),
+                originSequencer.epoch(), seq, data);
+        byte[] payload = PeerLink.serializeEnvelope(packet);
+        ReplayBuffer.Entry entry = new ReplayBuffer.Entry(seq, payload);
+        // Hand off non-blockingly to every known target's ingest queue. The active link's writer
+        // appends to the replay ring (applying backpressure on ITS thread) and sends; for a
+        // partitioned target the entry waits in the ingest queue until the link returns. This keeps
+        // the local publish / client-reader thread strictly non-blocking.
+        for (TargetState target : targets.values()) {
+            if (target.ingest.offer(entry)) {
+                clusterMetrics.incrementMessagesForwarded();
+            } else {
+                // Ingest overflow (a long partition or a persistently slow peer): drop + gap, never
+                // block the publish path and never kill anything.
+                clusterMetrics.incrementMessagesDropped();
+                clusterMetrics.incrementClusterGapEvents();
+            }
+        }
     }
 
-    /**
-     * Acceptance decision for an inbound publish, delegated from {@link PeerLink}. Looks up (or
-     * creates) the {@link OriginSequenceTracker} for the origin key and applies ordered dedup.
-     */
+    // -------------------------------------------------------------------------
+    // ReceiverContext (per-link, receiving side) — delegates to manager-owned state
+    // -------------------------------------------------------------------------
+
     private boolean acceptOrigin(String originKey, long seq) {
+        rememberOrigin(originKey);
         return originTrackers
-                .computeIfAbsent(originKey, key -> new OriginSequenceTracker())
+                .computeIfAbsent(originKey, k -> new OriginSequenceTracker())
                 .accept(seq);
+    }
+
+    private long contiguousSeqFor(String originKey) {
+        OriginSequenceTracker tracker = originTrackers.get(originKey);
+        return tracker == null ? 0L : tracker.contiguousSeq();
+    }
+
+    private void resetTrackerTo(String originKey, long newContiguous) {
+        rememberOrigin(originKey);
+        originTrackers
+                .computeIfAbsent(originKey, k -> new OriginSequenceTracker())
+                .resetTo(newContiguous);
+    }
+
+    /** Builds the resume/ack points for every origin this node has received from. */
+    private List<ClusterResumePacket.Resume> resumePoints() {
+        List<ClusterResumePacket.Resume> points = new ArrayList<>();
+        for (var entry : originMeta.entrySet()) {
+            OriginMeta meta = entry.getValue();
+            long contiguous = contiguousSeqFor(entry.getKey());
+            points.add(new ClusterResumePacket.Resume(meta.originNodeId(), meta.originEpoch(), contiguous));
+        }
+        return points;
+    }
+
+    private void rememberOrigin(String originKey) {
+        originMeta.computeIfAbsent(originKey, k -> {
+            int idx = k.lastIndexOf(':');
+            String nodeId = idx >= 0 ? k.substring(0, idx) : k;
+            long epoch = 0L;
+            if (idx >= 0) {
+                try {
+                    epoch = Long.parseLong(k.substring(idx + 1));
+                } catch (NumberFormatException ignored) {
+                    // leave epoch 0
+                }
+            }
+            return new OriginMeta(nodeId, epoch);
+        });
     }
 
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
 
-    /**
-     * Starts the cluster accept loop and all outbound connector loops. Returns after the
-     * cluster server socket is bound.
-     */
     public void start() {
         running = true;
         executor.submit(this::acceptLoop);
@@ -172,6 +233,8 @@ public class ClusterManager implements ClusterForwarder {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+
+        executor.submit(this::originExpirySweepLoop);
 
         List<String> peers = config.getClusterPeers();
         if (peers != null) {
@@ -184,7 +247,6 @@ public class ClusterManager implements ClusterForwarder {
         }
     }
 
-    /** Closes all peer links and the cluster server socket. */
     public void stop() {
         running = false;
         ServerSocket ss = clusterServerSocket;
@@ -204,33 +266,23 @@ public class ClusterManager implements ClusterForwarder {
     // Accessors
     // -------------------------------------------------------------------------
 
-    /** Exposes the config for use by {@link ClusterNode}. */
     public AvenueConfig getConfig() {
         return config;
     }
 
-    /** Exposes the cluster metrics (for the shared snapshot log and tests). */
     public ClusterMetrics getClusterMetrics() {
         return clusterMetrics;
     }
 
-    /**
-     * Returns the actual bound port of the cluster server socket, or {@code -1} if not bound.
-     */
     public int getClusterPort() {
         ServerSocket ss = clusterServerSocket;
         return (ss != null && ss.isBound()) ? ss.getLocalPort() : -1;
     }
 
-    /** Returns the number of currently active peer links. */
     public int getActivePeerCount() {
         return activePeers.size();
     }
 
-    /**
-     * Blocks until at least one peer link is active, or the timeout elapses. Used in tests
-     * for deterministic synchronization before asserting cross-node delivery.
-     */
     public boolean awaitAnyPeer(long timeout, TimeUnit unit) throws InterruptedException {
         long deadlineNanos = System.nanoTime() + unit.toNanos(timeout);
         while (System.nanoTime() < deadlineNanos) {
@@ -246,11 +298,6 @@ public class ClusterManager implements ClusterForwarder {
     // Test seams (partition / reconnect control). @VisibleForTesting
     // -------------------------------------------------------------------------
 
-    /**
-     * Closes the link to the given node, if present. The owning connect loop (if any) will
-     * observe the closure and reconnect unless the peer is blocked.
-     */
-    // @VisibleForTesting
     void dropPeer(String nodeId) {
         PeerLink link = activePeers.get(nodeId);
         if (link != null) {
@@ -258,15 +305,11 @@ public class ClusterManager implements ClusterForwarder {
         }
     }
 
-    /** Prevents (re)connecting to the given node and drops any current link. */
-    // @VisibleForTesting
     void blockPeer(String nodeId) {
         blockedPeers.add(nodeId);
         dropPeer(nodeId);
     }
 
-    /** Allows connecting to the given node again. */
-    // @VisibleForTesting
     void unblockPeer(String nodeId) {
         blockedPeers.remove(nodeId);
     }
@@ -301,23 +344,11 @@ public class ClusterManager implements ClusterForwarder {
 
     private void handleIncomingPeer(Socket peerSocket) {
         try {
-            // Cluster links are latency-sensitive: disable Nagle on accepted sockets too (the
-            // ServerSocket cannot pre-set this on the child socket).
             peerSocket.setTcpNoDelay(true);
-
-            // Acceptor-side HMAC challenge-response handshake. The advertised host/port/incarnation
-            // in the result are carried for the future SWIM layer; we only use remoteNodeId today.
             ClusterHandshake.AuthResult auth = ClusterHandshake.acceptorHandshake(
-                    peerSocket,
-                    config.getNodeId(),
-                    advertisedHost(),
-                    getClusterPort(),
-                    originSequencer.epoch(),
-                    authenticator,
-                    config.getPacketSize(),
-                    ClusterHandshake.DEFAULT_HANDSHAKE_TIMEOUT_MS,
-                    clusterMetrics
-            );
+                    peerSocket, config.getNodeId(), advertisedHost(), getClusterPort(),
+                    originSequencer.epoch(), authenticator, config.getPacketSize(),
+                    ClusterHandshake.DEFAULT_HANDSHAKE_TIMEOUT_MS, clusterMetrics);
             String remoteNodeId = auth.remoteNodeId();
 
             if (blockedPeers.contains(remoteNodeId)) {
@@ -325,10 +356,6 @@ public class ClusterManager implements ClusterForwarder {
                 closeQuietly(peerSocket);
                 return;
             }
-
-            // Tie-break: when both sides connect simultaneously, the node with the lexicographically
-            // SMALLER id keeps its OUTBOUND link. So on the inbound side, if our id is smaller than
-            // the remote's we prefer to keep our own outbound link and reject this inbound one.
             if (config.getNodeId().compareTo(remoteNodeId) < 0 && activePeers.containsKey(remoteNodeId)) {
                 log.info("Tie-break: keeping outbound link to {}, rejecting inbound duplicate", remoteNodeId);
                 closeQuietly(peerSocket);
@@ -337,7 +364,6 @@ public class ClusterManager implements ClusterForwarder {
 
             PeerLink link = buildLink(peerSocket, remoteNodeId);
             if (link == null) {
-                // Lost the putIfAbsent race; an existing link already wins.
                 log.info("Already connected to peer {}, dropping duplicate incoming connection", remoteNodeId);
                 closeQuietly(peerSocket);
                 return;
@@ -373,18 +399,10 @@ public class ClusterManager implements ClusterForwarder {
                 log.debug("Connecting to cluster peer at {}:{}", host, port);
                 Socket socket = socketFactory.createSocket(host, port);
 
-                // Initiator-side HMAC challenge-response handshake.
                 ClusterHandshake.AuthResult auth = ClusterHandshake.initiatorHandshake(
-                        socket,
-                        config.getNodeId(),
-                        advertisedHost(),
-                        getClusterPort(),
-                        originSequencer.epoch(),
-                        authenticator,
-                        config.getPacketSize(),
-                        ClusterHandshake.DEFAULT_HANDSHAKE_TIMEOUT_MS,
-                        clusterMetrics
-                );
+                        socket, config.getNodeId(), advertisedHost(), getClusterPort(),
+                        originSequencer.epoch(), authenticator, config.getPacketSize(),
+                        ClusterHandshake.DEFAULT_HANDSHAKE_TIMEOUT_MS, clusterMetrics);
                 String remoteNodeId = auth.remoteNodeId();
 
                 if (blockedPeers.contains(remoteNodeId)) {
@@ -393,10 +411,6 @@ public class ClusterManager implements ClusterForwarder {
                     sleepQuietly(backoffMs);
                     continue;
                 }
-
-                // Tie-break: the node with the lexicographically LARGER id yields its outbound link
-                // to the peer's outbound and relies on the inbound link instead. So if our id is
-                // larger and a link already exists, close this outbound duplicate.
                 if (config.getNodeId().compareTo(remoteNodeId) > 0 && activePeers.containsKey(remoteNodeId)) {
                     log.info("Tie-break: yielding outbound to {}, using inbound link", remoteNodeId);
                     closeQuietly(socket);
@@ -416,8 +430,6 @@ public class ClusterManager implements ClusterForwarder {
                 link.start();
                 log.info("Connected to cluster peer {} at {}:{}", remoteNodeId, host, port);
                 backoffMs = MIN_BACKOFF_MS;
-
-                // Block here until this link dies; then reconnect.
                 waitForLinkClose(remoteNodeId);
 
             } catch (Exception e) {
@@ -437,28 +449,56 @@ public class ClusterManager implements ClusterForwarder {
     // -------------------------------------------------------------------------
 
     /**
-     * Builds a {@link PeerLink} and atomically registers it under {@code remoteNodeId}. Returns
-     * the started-ready link on success, or {@code null} if another link is already registered
-     * for that node (the caller must close its socket). The link is registered via
-     * {@code putIfAbsent} BEFORE {@link PeerLink#start()} is called, and its {@code onClose}
-     * removes it only by value-equality so a losing link can never evict the registered winner.
+     * Builds a {@link PeerLink} and atomically registers it under {@code remoteNodeId}. The
+     * per-target {@link ReplayBuffer} is fetched (or created) here and reused across reconnects, so
+     * a rebuilt link can backfill. Returns {@code null} if another link is already registered.
      */
     private PeerLink buildLink(Socket socket, String remoteNodeId) throws IOException {
-        // Holder so the onClose callback can refer to the link instance it belongs to.
+        TargetState target = targetFor(remoteNodeId);
+
+        PeerLink.ReceiverContext receiver = new PeerLink.ReceiverContext() {
+            @Override
+            public boolean accept(String originKey, long seq) {
+                return acceptOrigin(originKey, seq);
+            }
+
+            @Override
+            public long contiguousSeq(String originKey) {
+                return contiguousSeqFor(originKey);
+            }
+
+            @Override
+            public void resetTo(String originKey, long newContiguous) {
+                resetTrackerTo(originKey, newContiguous);
+            }
+
+            @Override
+            public List<ClusterResumePacket.Resume> resumePoints() {
+                return ClusterManager.this.resumePoints();
+            }
+        };
+
         PeerLink[] self = new PeerLink[1];
         PeerLink link = new PeerLink(
                 socket,
                 remoteNodeId,
                 config.getNodeId(),
+                originSequencer.epoch(),
                 config.getPacketSize(),
                 config.getClusterHeartbeatIntervalMs(),
+                tuning.ackIntervalMs(),
+                tuning.strictOrdering(),
                 topicSubscriptionHandler,
-                this::acceptOrigin,
+                receiver,
+                target.buffer,
+                target.ingest,
                 clusterMetrics,
+                Clock.SYSTEM,
                 () -> {
-                    // Value-equality removal: only remove if THIS link is the registered one.
                     if (activePeers.remove(remoteNodeId, self[0])) {
                         clusterMetrics.decrementActivePeerLinks();
+                        // Mark the target for expiry: it survives until origin.expiry-ms without a link.
+                        touchTarget(remoteNodeId);
                         log.info("Peer {} removed from active set", remoteNodeId);
                     }
                 }
@@ -466,19 +506,64 @@ public class ClusterManager implements ClusterForwarder {
         self[0] = link;
         PeerLink existing = activePeers.putIfAbsent(remoteNodeId, link);
         if (existing != null) {
-            // Lost the race — caller closes the socket; do NOT start this link.
             return null;
         }
         clusterMetrics.incrementActivePeerLinks();
+        touchTarget(remoteNodeId);
         return link;
     }
 
+    /** Returns the per-target send state, creating it on first use and refreshing its touch time. */
+    private TargetState targetFor(String remoteNodeId) {
+        TargetState target = targets.computeIfAbsent(remoteNodeId, k ->
+                new TargetState(new ReplayBuffer(
+                        tuning.replayCapacity(),
+                        tuning.backpressurePolicy(),
+                        tuning.replayOfferTimeoutMs(),
+                        clusterMetrics), INGEST_QUEUE_CAPACITY, System.currentTimeMillis()));
+        target.lastTouchMs = System.currentTimeMillis();
+        return target;
+    }
+
+    private void touchTarget(String remoteNodeId) {
+        TargetState target = targets.get(remoteNodeId);
+        if (target != null) {
+            target.lastTouchMs = System.currentTimeMillis();
+        }
+    }
+
     /**
-     * Best-effort advertised host for this node, carried in the handshake for the future SWIM
-     * layer. Resolves the local host address, falling back to the loopback literal. The value is
-     * not security-relevant (it is not part of the HMAC transcript on its own merit) and is
-     * currently ignored by peers.
+     * Periodically frees replay buffers for targets that have had no active link for longer than
+     * {@code cluster.origin.expiry-ms}. Releasing the buffer's depth-gauge contribution avoids a
+     * gauge leak. Active targets are never reclaimed.
      */
+    private void originExpirySweepLoop() {
+        long expiryMs = tuning.originExpiryMs();
+        // Sweep at a fraction of the expiry interval, bounded so tests with a tiny expiry still tick.
+        long sweepMs = Math.max(50L, Math.min(expiryMs, 5_000L));
+        try {
+            while (running) {
+                Thread.sleep(sweepMs);
+                long now = System.currentTimeMillis();
+                for (var entry : targets.entrySet()) {
+                    String nodeId = entry.getKey();
+                    if (activePeers.containsKey(nodeId)) {
+                        continue; // never expire a target with a live link
+                    }
+                    TargetState target = entry.getValue();
+                    if (now - target.lastTouchMs >= expiryMs) {
+                        if (targets.remove(nodeId, target)) {
+                            target.buffer.release();
+                            log.info("Released expired replay state for target {}", nodeId);
+                        }
+                    }
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private String advertisedHost() {
         try {
             return InetAddress.getLocalHost().getHostAddress();

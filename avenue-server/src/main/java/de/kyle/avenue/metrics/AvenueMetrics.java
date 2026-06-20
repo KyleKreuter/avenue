@@ -200,10 +200,14 @@ public final class AvenueMetrics {
         ClusterMetrics cluster = this.clusterMetrics;
         if (cluster != null) {
             log.info("Avenue cluster metrics | activePeerLinks={} forwarded={} received={} "
-                            + "deduped={} dropped={}",
+                            + "deduped={} dropped={} | backfill={} gaps={} slowPeerStalls={} "
+                            + "acksSent={} acksReceived={} replayDepth={}",
                     cluster.getActivePeerLinks(), cluster.getMessagesForwarded(),
                     cluster.getMessagesReceived(), cluster.getMessagesDeduped(),
-                    cluster.getMessagesDropped());
+                    cluster.getMessagesDropped(),
+                    cluster.getClusterBackfillMessages(), cluster.getClusterGapEvents(),
+                    cluster.getClusterSlowPeerStalls(), cluster.getAcksSent(),
+                    cluster.getAcksReceived(), cluster.getReplayBufferDepth());
         }
     }
 }

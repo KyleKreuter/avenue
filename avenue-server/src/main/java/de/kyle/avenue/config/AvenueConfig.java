@@ -49,6 +49,15 @@ public class AvenueConfig {
     private final String clusterSecret;
     private final long clusterHeartbeatIntervalMs;
 
+    /**
+     * Phase C cluster tuning (replay/ack/ordering). Bundled into one record so the legacy
+     * 7/13/26-arg constructors stay source-compatible: they all delegate with
+     * {@link ClusterTuning#defaults()}. Only the file/{@code .env} constructor reads the
+     * {@code cluster.replay.*} / {@code cluster.ack-interval-ms} / {@code cluster.strict-ordering} /
+     * {@code cluster.origin.expiry-ms} properties.
+     */
+    private final ClusterTuning clusterTuning;
+
     // -------------------------------------------------------------------------
     // Wave 5 — Security & Ops fields (all optional, safe defaults)
     // -------------------------------------------------------------------------
@@ -195,6 +204,52 @@ public class AvenueConfig {
             String clusterTlsTruststorePath,
             String clusterTlsTruststorePassword
     ) {
+        // Direct-value (test) callers get the production-default cluster tuning. The dedicated
+        // tuning-aware overload below lets cluster tests pin replay/ack/ordering knobs.
+        this(packetSize, dropUnknownPackets, authenticationSecret, authenticationToken, port,
+                outboundQueueCapacity, outboundQueueOfferTimeoutMillis, clusterEnabled, nodeId,
+                clusterPort, clusterPeers, clusterSecret, clusterHeartbeatIntervalMs,
+                clientIdleTimeoutMillis, maxConnections, backpressurePolicy, metricsLogIntervalSeconds,
+                serverTlsEnabled, serverTlsKeystorePath, serverTlsKeystorePassword,
+                clusterTlsEnabled, clusterTlsKeystorePath, clusterTlsKeystorePassword,
+                clusterTlsTruststorePath, clusterTlsTruststorePassword,
+                ClusterTuning.defaults());
+    }
+
+    /**
+     * Tuning-aware full direct-value constructor. Identical to the 26-argument overload but accepts
+     * an explicit {@link ClusterTuning}, so Phase C cluster tests can pin replay capacity, ack
+     * interval, backpressure policy and strict ordering deterministically. Production code never
+     * calls this directly — it uses the file/{@code .env} constructor.
+     */
+    public AvenueConfig(
+            int packetSize,
+            boolean dropUnknownPackets,
+            String authenticationSecret,
+            String authenticationToken,
+            int port,
+            int outboundQueueCapacity,
+            long outboundQueueOfferTimeoutMillis,
+            boolean clusterEnabled,
+            String nodeId,
+            int clusterPort,
+            List<String> clusterPeers,
+            String clusterSecret,
+            long clusterHeartbeatIntervalMs,
+            long clientIdleTimeoutMillis,
+            int maxConnections,
+            BackpressurePolicy backpressurePolicy,
+            long metricsLogIntervalSeconds,
+            boolean serverTlsEnabled,
+            String serverTlsKeystorePath,
+            String serverTlsKeystorePassword,
+            boolean clusterTlsEnabled,
+            String clusterTlsKeystorePath,
+            String clusterTlsKeystorePassword,
+            String clusterTlsTruststorePath,
+            String clusterTlsTruststorePassword,
+            ClusterTuning clusterTuning
+    ) {
         this.packetSize = packetSize;
         this.dropUnknownPackets = dropUnknownPackets;
         this.authenticationSecret = authenticationSecret;
@@ -211,6 +266,7 @@ public class AvenueConfig {
         this.clusterPeers = clusterPeers != null ? List.copyOf(clusterPeers) : List.of();
         this.clusterSecret = clusterSecret != null ? clusterSecret : "";
         this.clusterHeartbeatIntervalMs = clusterHeartbeatIntervalMs;
+        this.clusterTuning = clusterTuning != null ? clusterTuning : ClusterTuning.defaults();
         this.clientIdleTimeoutMillis = clientIdleTimeoutMillis;
         this.maxConnections = maxConnections;
         this.backpressurePolicy = backpressurePolicy != null
@@ -283,6 +339,41 @@ public class AvenueConfig {
                 dotenv.get("CLUSTER_HEARTBEAT_INTERVAL_MS",
                         properties.getProperty("cluster.heartbeat-interval-ms", "5000"))
         );
+
+        // Phase C — at-least-once replay/ack/ordering tuning, bundled into ClusterTuning.
+        int replayCapacity = Integer.parseInt(
+                dotenv.get("CLUSTER_REPLAY_CAPACITY",
+                        properties.getProperty("cluster.replay.capacity",
+                                Integer.toString(ClusterTuning.DEFAULT_REPLAY_CAPACITY)))
+        );
+        de.kyle.avenue.cluster.ReplayBuffer.BackpressurePolicy replayPolicy =
+                de.kyle.avenue.cluster.ReplayBuffer.BackpressurePolicy.fromConfig(
+                        dotenv.get("CLUSTER_REPLAY_BACKPRESSURE_POLICY",
+                                properties.getProperty("cluster.replay.backpressure.policy", "BLOCK"))
+                );
+        long replayOfferTimeoutMs = Long.parseLong(
+                dotenv.get("CLUSTER_REPLAY_OFFER_TIMEOUT_MS",
+                        properties.getProperty("cluster.replay.offer-timeout-ms",
+                                Long.toString(ClusterTuning.DEFAULT_REPLAY_OFFER_TIMEOUT_MS)))
+        );
+        long ackIntervalMs = Long.parseLong(
+                dotenv.get("CLUSTER_ACK_INTERVAL_MS",
+                        properties.getProperty("cluster.ack-interval-ms",
+                                Long.toString(ClusterTuning.DEFAULT_ACK_INTERVAL_MS)))
+        );
+        boolean strictOrdering = Boolean.parseBoolean(
+                dotenv.get("CLUSTER_STRICT_ORDERING",
+                        properties.getProperty("cluster.strict-ordering",
+                                Boolean.toString(ClusterTuning.DEFAULT_STRICT_ORDERING)))
+        );
+        long originExpiryMs = Long.parseLong(
+                dotenv.get("CLUSTER_ORIGIN_EXPIRY_MS",
+                        properties.getProperty("cluster.origin.expiry-ms",
+                                Long.toString(ClusterTuning.DEFAULT_ORIGIN_EXPIRY_MS)))
+        );
+        clusterTuning = new ClusterTuning(
+                replayCapacity, replayPolicy, replayOfferTimeoutMs,
+                ackIntervalMs, strictOrdering, originExpiryMs);
 
         // Wave 5 — Security & Ops settings (all optional, safe defaults).
         clientIdleTimeoutMillis = Long.parseLong(
@@ -453,6 +544,15 @@ public class AvenueConfig {
     /** Returns the heartbeat interval in milliseconds. Default is 5 000 ms. */
     public long getClusterHeartbeatIntervalMs() {
         return clusterHeartbeatIntervalMs;
+    }
+
+    /**
+     * Returns the Phase C cluster tuning bundle (replay capacity / backpressure policy / ack
+     * interval / strict ordering / origin expiry). Never {@code null}; direct-value constructors
+     * return {@link ClusterTuning#defaults()}.
+     */
+    public ClusterTuning getClusterTuning() {
+        return clusterTuning;
     }
 
     // -------------------------------------------------------------------------
