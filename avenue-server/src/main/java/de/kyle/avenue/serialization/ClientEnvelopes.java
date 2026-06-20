@@ -1,5 +1,6 @@
 package de.kyle.avenue.serialization;
 
+import com.google.protobuf.ByteString;
 import de.kyle.avenue.proto.AuthTokenResponse;
 import de.kyle.avenue.proto.ClientEnvelope;
 import de.kyle.avenue.proto.PublishOutbound;
@@ -19,13 +20,18 @@ public final class ClientEnvelopes {
 
     /**
      * Builds a {@link PublishOutbound} envelope for fan-out to a local subscriber.
+     * <p>
+     * The payload is an opaque {@link ByteString}: it is set on the {@code data} {@code bytes} field
+     * verbatim (no copy, no UTF-8 transcoding). On the server hot path the {@code ByteString} is the
+     * very same immutable instance parsed from the inbound publish (or received from a cluster peer),
+     * so the payload is never materialized as a Java {@code String} between parse and encode.
      *
      * @param topic  the (already normalized) topic the message was published on
      * @param source the publisher's logical source name
-     * @param data   the message payload
+     * @param data   the opaque message payload (shared, immutable)
      * @return a client envelope with the {@code publish_outbound} case set
      */
-    public static ClientEnvelope publishOutbound(String topic, String source, String data) {
+    public static ClientEnvelope publishOutbound(String topic, String source, ByteString data) {
         return ClientEnvelope.newBuilder()
                 .setPublishOutbound(PublishOutbound.newBuilder()
                         .setTopic(topic)

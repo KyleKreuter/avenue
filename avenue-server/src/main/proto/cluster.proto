@@ -18,7 +18,9 @@ message ClusterPublish {
   int64 origin_epoch = 4;
   int64 seq = 5;
   int64 link_seq = 6;
-  string data = 7;
+  // `data` is `bytes` (was `string`): the cross-node forward carries the opaque payload ByteString
+  // straight through, never transcoding it to/from a Java String. Field number unchanged.
+  bytes data = 7;
 }
 
 // Mirrors ClusterAckPacket (ackerNodeId + repeated Ack{originNodeId, originEpoch, ackedSeq}).

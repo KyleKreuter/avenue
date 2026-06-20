@@ -1,5 +1,6 @@
 package de.kyle.avenue.benchmark;
 
+import com.google.protobuf.ByteString;
 import de.kyle.avenue.SingleNodeServer;
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.proto.AuthTokenRequest;
@@ -164,7 +165,7 @@ public final class ThroughputBenchmark {
     private static ClientEnvelope publishEnvelope(String topic, String data, String source, String token) {
         return ClientEnvelope.newBuilder()
                 .setPublishInbound(PublishInbound.newBuilder()
-                        .setTopic(topic).setData(data).setSource(source).setToken(token).build())
+                        .setTopic(topic).setData(ByteString.copyFromUtf8(data)).setSource(source).setToken(token).build())
                 .build();
     }
 

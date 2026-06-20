@@ -37,8 +37,14 @@ public final class ClusterEnvelopes {
 
     // --- Publish + at-least-once control --------------------------------------------------------
 
+    /**
+     * Builds a {@link ClusterPublish} cross-node forward. The payload {@code data} is an opaque
+     * {@link ByteString} set verbatim on the {@code bytes} field — the same immutable instance the
+     * publish handler parsed from the local client — so the cross-node path never transcodes it
+     * to/from a Java {@code String}.
+     */
     public static ClusterEnvelope publish(String topic, String source, String originNodeId,
-                                   long originEpoch, long seq, long linkSeq, String data) {
+                                   long originEpoch, long seq, long linkSeq, ByteString data) {
         return ClusterEnvelope.newBuilder()
                 .setClusterPublish(ClusterPublish.newBuilder()
                         .setTopic(topic)

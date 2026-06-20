@@ -1,5 +1,6 @@
 package de.kyle.avenue.integration;
 
+import com.google.protobuf.ByteString;
 import de.kyle.avenue.proto.AuthTokenRequest;
 import de.kyle.avenue.proto.ClientEnvelope;
 import de.kyle.avenue.proto.PublishInbound;
@@ -120,7 +121,9 @@ final class TestClient implements Closeable {
                 .put("name", "PublishMessageOutboundPacket")
                 .put("topic", publish.getTopic())
                 .put("source", publish.getSource());
-        JSONObject body = new JSONObject().put("data", publish.getData());
+        // `data` is now an opaque `bytes` field; decode its UTF-8 bytes back to a String here at the
+        // test-client edge so the historic body.data String assertions keep working verbatim.
+        JSONObject body = new JSONObject().put("data", publish.getData().toStringUtf8());
         return new JSONObject().put("header", header).put("body", body);
     }
 
@@ -194,7 +197,7 @@ final class TestClient implements Closeable {
         writeEnvelope(ClientEnvelope.newBuilder()
                 .setPublishInbound(PublishInbound.newBuilder()
                         .setTopic(topic)
-                        .setData(data)
+                        .setData(ByteString.copyFromUtf8(data))
                         .setSource(source)
                         .setToken(token)
                         .build())

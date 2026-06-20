@@ -1,5 +1,7 @@
 package de.kyle.avenue.cluster;
 
+import com.google.protobuf.ByteString;
+
 /**
  * Functional interface for forwarding a local publish event to cluster peers.
  * <p>
@@ -16,6 +18,9 @@ public interface ClusterForwarder {
     /** No-op forwarder used when clustering is disabled. */
     ClusterForwarder NOOP = (topic, source, data) -> { };
 
+    // NOTE: the lambda above binds against the single abstract method below; its `data` parameter is
+    // the opaque ByteString payload.
+
     /**
      * Forwards a locally-received publish to all connected cluster peers.
      * Implementations MUST be non-blocking; any queueing or I/O is done asynchronously.
@@ -25,7 +30,7 @@ public interface ClusterForwarder {
      *
      * @param topic  normalized topic key
      * @param source original client-supplied source identifier
-     * @param data   message payload
+     * @param data   opaque message payload (immutable {@link ByteString}, never transcoded)
      */
-    void forward(String topic, String source, String data);
+    void forward(String topic, String source, ByteString data);
 }

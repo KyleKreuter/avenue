@@ -1,5 +1,6 @@
 package de.kyle.avenue.handler.packet.publish;
 
+import com.google.protobuf.ByteString;
 import de.kyle.avenue.cluster.ClusterForwarder;
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
@@ -123,7 +124,12 @@ public class PublishMessageInboundPacketHandler implements PacketHandler {
 
         String topic = publish.getTopic();
         String source = publish.getSource();
-        String data = publish.getData();
+        // OPAQUE PASSTHROUGH: the payload is an immutable ByteString taken straight from the parsed
+        // inbound publish. It is NEVER turned into a Java String on the server hot path — it is shared
+        // verbatim with the encode-once fan-out envelope and the cluster forward. Because protobuf
+        // `bytes` is a raw memcpy (no per-character UTF-8 transcoding), this eliminates the
+        // String.charAt / StringLatin1.charAt CPU block that dominated the hot path under load.
+        ByteString data = publish.getData();
 
         // Metric: a local client publish was accepted and is about to be fanned out.
         metrics.incrementMessagesPublished();

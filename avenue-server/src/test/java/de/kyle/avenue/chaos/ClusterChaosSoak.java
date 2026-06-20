@@ -1,5 +1,6 @@
 package de.kyle.avenue.chaos;
 
+import com.google.protobuf.ByteString;
 import de.kyle.avenue.cluster.ClusterNode;
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.config.ClusterTuning;
@@ -262,7 +263,7 @@ public final class ClusterChaosSoak {
     private static ClientEnvelope publishEnvelope(String topic, String data, String source, String token) {
         return ClientEnvelope.newBuilder()
                 .setPublishInbound(PublishInbound.newBuilder()
-                        .setTopic(topic).setData(data).setSource(source).setToken(token).build())
+                        .setTopic(topic).setData(ByteString.copyFromUtf8(data)).setSource(source).setToken(token).build())
                 .build();
     }
 
@@ -312,7 +313,7 @@ public final class ClusterChaosSoak {
                     if (env.getMsgCase() != ClientEnvelope.MsgCase.PUBLISH_OUTBOUND) {
                         continue;
                     }
-                    long seq = Long.parseLong(env.getPublishOutbound().getData());
+                    long seq = Long.parseLong(env.getPublishOutbound().getData().toStringUtf8());
                     if (seen.putIfAbsent(seq, Boolean.TRUE) != null) {
                         duplicates.incrementAndGet();
                     }
