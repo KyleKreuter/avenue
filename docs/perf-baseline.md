@@ -145,3 +145,103 @@ Arbeitspunkt (`rate=120000`), und die abgeleiteten ns/Nachricht (= 1e9 / Saettig
 
 > Zusatz-Diagnose (kein Erfolgskriterium): die Fan-out-4-Werte aus dem 50k-Lauf oben bleiben als
 > Sekundaermessung erhalten, um Fan-out-Skalierung zu beobachten.
+
+## Out-of-process Messung (Server und Lastgenerator getrennt)
+
+### Warum
+
+Die `LoadHarness` bootet im Default-Modus den `SingleNodeServer` **in-proc** — also in
+**derselben JVM** wie der Lastgenerator. Dadurch teilen sich Last und Server dieselben CPU-Kerne,
+denselben GC und denselben JIT. Die Maschine saettigt dann bei ~300k msg/s, und gemessen wird die
+Summe aus **Last + Server**, nicht die isolierte Server-Kapazitaet. Die Frage "kann der Server
+mehr, wenn ich mehr Publisher draufgebe?" laesst sich so nicht beantworten, weil der Lastgenerator
+selbst CPU verbraucht.
+
+Der `connect=`-Modus der Harness + die neue Klasse `BenchServer` trennen beides in **zwei
+getrennte JVMs/Scheduler**: `BenchServer` laeuft in einem eigenen `java`-Prozess auf festem Port,
+die Harness in einem zweiten Prozess verbindet sich per `connect=host:port`. Warm-up, getrennte
+Raten, Latenz-Pacing, `SubscribeAck`-Bereitschaft, Teardown und Ausgabe sind identisch zum
+In-JVM-Modus.
+
+### Wie man es startet
+
+```bash
+export JAVA_HOME=/Users/.../corretto-21.0.5/Contents/Home
+
+# Erster Positionsparameter = Server-Port, Rest wird an LoadHarness durchgereicht.
+# Das Skript injiziert connect=127.0.0.1:PORT selbst (also NICHT selbst connect= setzen).
+
+# (a) 1:1-Saettigung
+./scripts/bench-split.sh 4180 publishers=1 subscribers=1 topics=1 msgSize=100 warmupSeconds=4 seconds=8
+
+# (b) Publisher-Skalierung (gemeinsames Topic)
+./scripts/bench-split.sh 4180 publishers=8 subscribers=1 topics=1 msgSize=100 warmupSeconds=4 seconds=8
+
+# (b') Unabhaengige Paare (jeder Publisher eigenes Topic + eigener Subscriber)
+./scripts/bench-split.sh 4180 publishers=8 subscribers=1 topics=8 msgSize=100 warmupSeconds=4 seconds=8
+
+# (c) 1:1-Latenz bei festem Arbeitspunkt
+./scripts/bench-split.sh 4180 publishers=1 subscribers=1 msgSize=100 rate=120000
+```
+
+`scripts/bench-split.sh` (a) baut den Test-Classpath via
+`mvn -q -pl avenue-server dependency:build-classpath` + `target/classes:target/test-classes`,
+(b) startet `BenchServer` als eigenen `java`-Prozess (NICHT `mvn exec:java`, damit es eine wirklich
+getrennte JVM ist) und wartet auf die `BENCH SERVER READY`-Zeile, (c) startet `LoadHarness` als
+zweiten `java`-Prozess mit `connect=127.0.0.1:PORT`, (d) killt am Ende den Server-Prozess.
+
+`BenchServer` nutzt eine Direktwert-Test-Config (fester Port, `secret`/`token` passend zur Harness,
+1-MiB-Packetsize, **idle-timeout 0** (kein Reaping waehrend der Messung), `TCP_NODELAY=true`,
+unlimitierte Connections, grosse Outbound-Queue) und blockiert nach dem Binden, bis der Prozess
+gekillt wird.
+
+### Gemessene Zahlen (Out-of-process, msgSize=100, warmupSeconds=4, seconds=8)
+
+Maschine: Apple Silicon (arm64), Corretto 21.0.5, Loopback (127.0.0.1), Server und Last in
+getrennten JVMs.
+
+| Szenario | Out-of-process (msg/s) | In-JVM-Vergleich (msg/s) |
+| --- | --- | --- |
+| 1:1 Saettigung | **230 000 – 253 000** (Lauf-Streuung) | ~226 000 (tagaktuell) / 253 000 (frueher) |
+| Publisher-Skalierung, gemeinsames Topic, P=2 | 342 000 | — |
+| Publisher-Skalierung, gemeinsames Topic, P=4 | 199 000 – 237 000 (stark streuend) | — |
+| Publisher-Skalierung, gemeinsames Topic, P=8 | 329 000 | — |
+| **Unabhaengige Paare P=2** (topics=2, sub=1) | **292 000** | — |
+| **Unabhaengige Paare P=4** (topics=4, sub=1) | **295 000** | — |
+| **Unabhaengige Paare P=8** (topics=8, sub=1) | **298 000 – 300 000** | ~265 000 (In-JVM, 8 unabh. Paare) |
+
+1:1-Latenz bei `rate=120000` (Arbeitspunkt unterhalb Saettigung):
+
+| Metrik | Out-of-process | In-JVM-Baseline |
+| --- | --- | --- |
+| Erreichte Publish-Rate | 118 923 msg/s | ~119 168 msg/s |
+| p50 | 0.035 ms | ~0.046 ms |
+| p99 | **0.133 ms** | **0.114 ms** |
+| p999 | 0.553 ms | 0.301 ms |
+| max | 2.619 ms | — |
+
+### Schlussfolgerung: ~300k ist der echte Server-Deckel, nicht Last-Limitierung
+
+Die entscheidende Messung sind die **unabhaengigen Paare** (jeder Publisher hat sein eigenes Topic
+und seinen eigenen Subscriber, keine Fan-in-/Fan-out-Verzerrung). Hier **skaliert der Durchsatz
+NICHT** mit der Publisher-Anzahl: P=2, P=4 und P=8 liefern alle ~292–300k msg/s — praktisch flach.
+Waere die bisherige In-JVM-Messung last-limitiert gewesen (also der Server haette noch Reserven, nur
+der Lastgenerator war der Engpass), muesste der Durchsatz in der getrennten Topologie mit mehr
+Publishern deutlich steigen. Das tut er nicht.
+
+Damit ist **~300k msg/s der echte Deckel des aktuellen Single-Node-Hot-Paths**, nicht ein Artefakt
+des In-JVM-Messaufbaus. Die getrennte Messung verschiebt die Headline-Zahl nur marginal (1:1 von
+~226k auf ~230–253k im selben Streuband; unabhaengige Paare von ~265k In-JVM auf ~298k
+out-of-process — ein kleiner, aber kein qualitativer Sprung). Die Latenz bleibt unveraendert gut
+(p99 ~0.13 ms bei 120k). Der naechste echte Hebel bleibt damit Stufe 2/3 (Pipelining /
+Event-Loop-IO), nicht der Messaufbau.
+
+> **Ehrlicher Hinweis zur Belastbarkeit.** Loopback + zwei Prozesse auf **einer** Maschine ist
+> besser als In-JVM (getrennte Scheduler, getrennte Heaps/GC), teilt sich aber weiterhin die CPU
+> derselben Maschine — der Lastgenerator konkurriert also nach wie vor um Kerne. Fuer wirklich
+> belastbare **Absolutzahlen** sollte der Lastgenerator auf einer **zweiten Maschine** ueber das
+> Netz laufen (statt Loopback). Bewusst **kein Docker**: auf macOS laeuft Docker in einer Linux-VM
+> mit virtualisierter NIC, was Latenz und Durchsatz verfaelschen wuerde. Die hier gemessenen Zahlen
+> sind daher als "besser als In-JVM, aber noch nicht netzwerk-isoliert" einzuordnen — die
+> qualitative Aussage (Durchsatz skaliert nicht mit Publishern -> echter Server-Deckel) ist davon
+> unberuehrt.

@@ -67,7 +67,24 @@ import java.util.concurrent.atomic.LongAdder;
  *   seconds=10           steady-state measurement duration per point
  *   warmupSeconds=5      warm-up duration per point (results discarded)
  *   rate=0               per-publisher target publish rate; 0 = unbounded (throughput mode)
+ *   connect=host:port    connect to an EXTERNAL server instead of booting one in-proc
+ *   serverHost=127.0.0.1 alternative to connect=: external server host
+ *   serverPort=4180       alternative to connect=: external server port
  * </pre>
+ *
+ * <h2>In-process vs. out-of-process mode</h2>
+ * By default (no {@code connect}/{@code serverPort}) the harness boots a {@link SingleNodeServer}
+ * <em>in the same JVM</em> as the load generator. That is convenient but makes the measurement
+ * invalid for capacity questions: load generator and server share the same CPU cores, GC and JIT,
+ * so the machine saturates while measuring <em>load + server</em> together rather than the server's
+ * standalone capacity.
+ * <p>
+ * Passing {@code connect=host:port} (or {@code serverHost=}/{@code serverPort=}) switches to
+ * <b>out-of-process mode</b>: the harness does <em>not</em> boot a server and instead connects all
+ * publishers and subscribers to an already-running external {@link BenchServer}. Everything else
+ * (warm-up, separated rates, latency pacing, {@code SubscribeAck} readiness, teardown, output) is
+ * identical. Use {@code scripts/bench-split.sh} to start {@code BenchServer} and this harness in two
+ * separate JVMs.
  *
  * <h2>How to run</h2>
  * From the repository root:
@@ -95,10 +112,11 @@ import java.util.concurrent.atomic.LongAdder;
  */
 public final class LoadHarness {
 
-    private static final String HOST = "127.0.0.1";
-    private static final String SECRET = "bench-secret";
-    private static final String TOKEN = "bench-token";
-    private static final int PACKET_SIZE = 1 << 20; // 1 MiB, large enough for any swept payload
+    /** Default loopback host used for the in-proc server (and as the default external host). */
+    private static final String DEFAULT_HOST = "127.0.0.1";
+    static final String SECRET = "bench-secret";
+    static final String TOKEN = "bench-token";
+    static final int PACKET_SIZE = 1 << 20; // 1 MiB, large enough for any swept payload
 
     private LoadHarness() {
     }
@@ -112,16 +130,20 @@ public final class LoadHarness {
         long rate = longArg(args, "rate", 0);
         int[] msgSizes = msgSizesArg(args);
 
+        // Out-of-process target, if any. connect=host:port wins, otherwise serverHost/serverPort.
+        Endpoint external = externalEndpoint(args);
+
         boolean latencyMode = rate > 0;
 
         System.out.printf(Locale.ROOT,
-                "LoadHarness: publishers=%d subscribers=%d topics=%d seconds=%d warmupSeconds=%d rate=%d mode=%s%n",
+                "LoadHarness: publishers=%d subscribers=%d topics=%d seconds=%d warmupSeconds=%d rate=%d mode=%s target=%s%n",
                 publishers, subscribers, topics, seconds, warmupSeconds, rate,
-                latencyMode ? "LATENCY" : "THROUGHPUT");
+                latencyMode ? "LATENCY" : "THROUGHPUT",
+                external != null ? "EXTERNAL " + external.host + ":" + external.port : "IN-PROC");
 
         List<Result> results = new ArrayList<>();
         for (int msgSize : msgSizes) {
-            results.add(runPoint(publishers, subscribers, topics, msgSize, seconds, warmupSeconds, rate));
+            results.add(runPoint(publishers, subscribers, topics, msgSize, seconds, warmupSeconds, rate, external));
         }
 
         printResultTable(results, latencyMode);
@@ -129,26 +151,41 @@ public final class LoadHarness {
     }
 
     /**
-     * Runs one full measurement point (one payload size): boots a fresh server, wires the topology,
-     * runs warm-up then the steady-state window, and tears everything down. A fresh server per point
-     * keeps the points independent (no leftover queue state bleeds between sizes).
+     * Runs one full measurement point (one payload size): in in-proc mode boots a fresh server and
+     * wires the topology against it; in out-of-process mode ({@code external != null}) it skips the
+     * server boot entirely and wires the topology against the external endpoint. Either way it runs
+     * warm-up then the steady-state window and tears the clients down. A fresh in-proc server per
+     * point keeps the points independent (no leftover queue state bleeds between sizes); the external
+     * server is long-lived and shared across points (it is owned by the separate process).
      */
     private static Result runPoint(int publishers, int subscribers, int topics, int msgSize,
-                                   int seconds, int warmupSeconds, long rate) throws Exception {
+                                   int seconds, int warmupSeconds, long rate, Endpoint external)
+            throws Exception {
         boolean latencyMode = rate > 0;
 
-        AvenueConfig config = new AvenueConfig(
-                PACKET_SIZE,
-                false,            // never drop a slow consumer mid-benchmark
-                SECRET,
-                TOKEN,
-                0,                // ephemeral port
-                1_000_000,        // large outbound queue: measure the path, not backpressure drops
-                1000
-        );
-        SingleNodeServer server = new SingleNodeServer(config);
-        server.start();
-        int port = server.getPort();
+        // In out-of-process mode no in-proc server is started; publishers/subscribers connect to the
+        // external BenchServer. In in-proc mode we boot a fresh ephemeral-port server per point.
+        SingleNodeServer server = null;
+        String host;
+        int port;
+        if (external != null) {
+            host = external.host;
+            port = external.port;
+        } else {
+            AvenueConfig config = new AvenueConfig(
+                    PACKET_SIZE,
+                    false,            // never drop a slow consumer mid-benchmark
+                    SECRET,
+                    TOKEN,
+                    0,                // ephemeral port
+                    1_000_000,        // large outbound queue: measure the path, not backpressure drops
+                    1000
+            );
+            server = new SingleNodeServer(config);
+            server.start();
+            host = DEFAULT_HOST;
+            port = server.getPort();
+        }
 
         String[] topicNames = new String[topics];
         for (int t = 0; t < topics; t++) {
@@ -166,7 +203,7 @@ public final class LoadHarness {
         List<Sub> subs = new ArrayList<>();
         for (String topic : topicNames) {
             for (int i = 0; i < subscribers; i++) {
-                Sub sub = new Sub(port, topic, deliveredTotal, latency, recording);
+                Sub sub = new Sub(host, port, topic, deliveredTotal, latency, recording);
                 sub.connectAndSubscribe();
                 subs.add(sub);
             }
@@ -180,7 +217,7 @@ public final class LoadHarness {
         CountDownLatch readyLatch = new CountDownLatch(publishers);
         for (int p = 0; p < publishers; p++) {
             String topic = topicNames[p % topics];
-            Pub pub = new Pub(port, topic, msgSize, rate, publishedTotal, latencyMode,
+            Pub pub = new Pub(host, port, topic, msgSize, rate, publishedTotal, latencyMode,
                     goLatch, readyLatch);
             pub.connect();
             pubs.add(pub);
@@ -245,7 +282,10 @@ public final class LoadHarness {
         for (Pub p : pubs) {
             p.close();
         }
-        server.stop();
+        // Only the in-proc server is owned here; the external BenchServer outlives the harness.
+        if (server != null) {
+            server.stop();
+        }
 
         return result;
     }
@@ -299,9 +339,9 @@ public final class LoadHarness {
         private volatile boolean running = true;
         private Thread thread;
 
-        Pub(int port, String topic, int msgSize, long rate, LongAdder publishedTotal,
+        Pub(String host, int port, String topic, int msgSize, long rate, LongAdder publishedTotal,
             boolean latencyMode, CountDownLatch goLatch, CountDownLatch readyLatch) throws IOException {
-            this.socket = new Socket(HOST, port);
+            this.socket = new Socket(host, port);
             this.socket.setTcpNoDelay(true);
             this.out = new DataOutputStream(socket.getOutputStream());
             this.in = new DataInputStream(socket.getInputStream());
@@ -443,9 +483,9 @@ public final class LoadHarness {
         private final CountDownLatch ackLatch = new CountDownLatch(1);
         private volatile boolean running = true;
 
-        Sub(int port, String topic, LongAdder deliveredTotal, LatencyRecorder latency,
+        Sub(String host, int port, String topic, LongAdder deliveredTotal, LatencyRecorder latency,
             FlagBox recording) throws IOException {
-            this.socket = new Socket(HOST, port);
+            this.socket = new Socket(host, port);
             this.socket.setTcpNoDelay(true);
             this.out = new DataOutputStream(socket.getOutputStream());
             this.in = new DataInputStream(socket.getInputStream());
@@ -626,6 +666,48 @@ public final class LoadHarness {
         int idx = (int) Math.ceil(p / 100.0 * sortedNanos.length) - 1;
         idx = Math.max(0, Math.min(sortedNanos.length - 1, idx));
         return sortedNanos[idx] / 1_000_000.0;
+    }
+
+    /** External-server endpoint (host + port) for out-of-process mode. */
+    private record Endpoint(String host, int port) {
+    }
+
+    /**
+     * Resolves the external server endpoint from the CLI flags, or {@code null} for in-proc mode.
+     * Precedence: {@code connect=host:port} first, otherwise {@code serverHost=}/{@code serverPort=}
+     * (an external target exists as soon as either of those is given). The host defaults to
+     * {@link #DEFAULT_HOST}.
+     */
+    private static Endpoint externalEndpoint(String[] args) {
+        String connect = stringArg(args, "connect", null);
+        if (connect != null && !connect.isBlank()) {
+            int colon = connect.lastIndexOf(':');
+            if (colon <= 0 || colon == connect.length() - 1) {
+                throw new IllegalArgumentException("connect must be host:port, got: " + connect);
+            }
+            String host = connect.substring(0, colon).trim();
+            int port = Integer.parseInt(connect.substring(colon + 1).trim());
+            return new Endpoint(host, port);
+        }
+        String serverHost = stringArg(args, "serverHost", null);
+        long serverPort = longArg(args, "serverPort", -1);
+        if (serverHost != null || serverPort > 0) {
+            String host = serverHost != null && !serverHost.isBlank() ? serverHost.trim() : DEFAULT_HOST;
+            if (serverPort <= 0) {
+                throw new IllegalArgumentException("serverPort must be set (>0) when using out-of-process mode");
+            }
+            return new Endpoint(host, (int) serverPort);
+        }
+        return null;
+    }
+
+    private static String stringArg(String[] args, String key, String def) {
+        for (String a : args) {
+            if (a.startsWith(key + "=")) {
+                return a.substring(key.length() + 1).trim();
+            }
+        }
+        return def;
     }
 
     private static long longArg(String[] args, String key, long def) {
