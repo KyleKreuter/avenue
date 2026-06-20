@@ -9,8 +9,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.UnknownHostException;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -52,6 +54,9 @@ public class ClusterManager implements ClusterForwarder {
 
     /** Per-node monotonic publish sequencer; one instance per node. */
     private final OriginSequencer originSequencer = new OriginSequencer();
+
+    /** HMAC helper keyed by {@code cluster.secret}; drives the challenge-response handshake. */
+    private final HmacAuthenticator authenticator;
 
     /** Per-origin ordered dedup trackers, keyed by {@code originNodeId:originEpoch}. */
     private final ConcurrentHashMap<String, OriginSequenceTracker> originTrackers = new ConcurrentHashMap<>();
@@ -103,6 +108,7 @@ public class ClusterManager implements ClusterForwarder {
         this.config = config;
         this.topicSubscriptionHandler = topicSubscriptionHandler;
         this.socketFactory = socketFactory;
+        this.authenticator = new HmacAuthenticator(config.getClusterSecret());
     }
 
     // -------------------------------------------------------------------------
@@ -299,13 +305,20 @@ public class ClusterManager implements ClusterForwarder {
             // ServerSocket cannot pre-set this on the child socket).
             peerSocket.setTcpNoDelay(true);
 
-            // Acceptor-side handshake: read peer's hello, then send ours.
-            String remoteNodeId = ClusterHandshake.acceptorHandshake(
+            // Acceptor-side HMAC challenge-response handshake. The advertised host/port/incarnation
+            // in the result are carried for the future SWIM layer; we only use remoteNodeId today.
+            ClusterHandshake.AuthResult auth = ClusterHandshake.acceptorHandshake(
                     peerSocket,
                     config.getNodeId(),
-                    config.getClusterSecret(),
-                    config.getPacketSize()
+                    advertisedHost(),
+                    getClusterPort(),
+                    originSequencer.epoch(),
+                    authenticator,
+                    config.getPacketSize(),
+                    ClusterHandshake.DEFAULT_HANDSHAKE_TIMEOUT_MS,
+                    clusterMetrics
             );
+            String remoteNodeId = auth.remoteNodeId();
 
             if (blockedPeers.contains(remoteNodeId)) {
                 log.info("Peer {} is blocked, rejecting incoming connection", remoteNodeId);
@@ -360,13 +373,19 @@ public class ClusterManager implements ClusterForwarder {
                 log.debug("Connecting to cluster peer at {}:{}", host, port);
                 Socket socket = socketFactory.createSocket(host, port);
 
-                // Initiator-side handshake: send our hello first, then read peer's hello.
-                String remoteNodeId = ClusterHandshake.initiatorHandshake(
+                // Initiator-side HMAC challenge-response handshake.
+                ClusterHandshake.AuthResult auth = ClusterHandshake.initiatorHandshake(
                         socket,
                         config.getNodeId(),
-                        config.getClusterSecret(),
-                        config.getPacketSize()
+                        advertisedHost(),
+                        getClusterPort(),
+                        originSequencer.epoch(),
+                        authenticator,
+                        config.getPacketSize(),
+                        ClusterHandshake.DEFAULT_HANDSHAKE_TIMEOUT_MS,
+                        clusterMetrics
                 );
+                String remoteNodeId = auth.remoteNodeId();
 
                 if (blockedPeers.contains(remoteNodeId)) {
                     log.info("Peer {} is blocked, closing outbound connection", remoteNodeId);
@@ -452,6 +471,20 @@ public class ClusterManager implements ClusterForwarder {
         }
         clusterMetrics.incrementActivePeerLinks();
         return link;
+    }
+
+    /**
+     * Best-effort advertised host for this node, carried in the handshake for the future SWIM
+     * layer. Resolves the local host address, falling back to the loopback literal. The value is
+     * not security-relevant (it is not part of the HMAC transcript on its own merit) and is
+     * currently ignored by peers.
+     */
+    private String advertisedHost() {
+        try {
+            return InetAddress.getLocalHost().getHostAddress();
+        } catch (UnknownHostException e) {
+            return "127.0.0.1";
+        }
     }
 
     private void waitForLinkClose(String nodeId) throws InterruptedException {

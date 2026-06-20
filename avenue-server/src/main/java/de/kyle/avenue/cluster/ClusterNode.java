@@ -101,4 +101,13 @@ public class ClusterNode {
     public int getActivePeerCount() {
         return clusterManager.getActivePeerCount();
     }
+
+    /**
+     * Exposes the cluster transport metrics (active peer links, forwarded/received counters and
+     * the handshake auth-failure counter). Used by integration tests to assert on the handshake
+     * outcome without reaching into the {@link ClusterManager} internals.
+     */
+    public de.kyle.avenue.metrics.ClusterMetrics getClusterMetrics() {
+        return clusterManager.getClusterMetrics();
+    }
 }
