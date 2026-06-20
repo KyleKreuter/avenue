@@ -58,6 +58,14 @@ public class AvenueConfig {
      */
     private final ClusterTuning clusterTuning;
 
+    /**
+     * Phase F admin HTTP introspection settings. Bundled into a record (like {@link ClusterTuning})
+     * so the legacy constructors stay source-compatible by delegating to {@link AdminConfig#disabled()}.
+     * Only the file/{@code .env} constructor reads the {@code admin.http.*} properties; cluster tests
+     * pin it via the dedicated tuning+admin overload.
+     */
+    private final AdminConfig adminConfig;
+
     // -------------------------------------------------------------------------
     // Wave 5 — Security & Ops fields (all optional, safe defaults)
     // -------------------------------------------------------------------------
@@ -250,6 +258,51 @@ public class AvenueConfig {
             String clusterTlsTruststorePassword,
             ClusterTuning clusterTuning
     ) {
+        this(packetSize, dropUnknownPackets, authenticationSecret, authenticationToken, port,
+                outboundQueueCapacity, outboundQueueOfferTimeoutMillis, clusterEnabled, nodeId,
+                clusterPort, clusterPeers, clusterSecret, clusterHeartbeatIntervalMs,
+                clientIdleTimeoutMillis, maxConnections, backpressurePolicy, metricsLogIntervalSeconds,
+                serverTlsEnabled, serverTlsKeystorePath, serverTlsKeystorePassword,
+                clusterTlsEnabled, clusterTlsKeystorePath, clusterTlsKeystorePassword,
+                clusterTlsTruststorePath, clusterTlsTruststorePassword,
+                clusterTuning, AdminConfig.disabled());
+    }
+
+    /**
+     * Tuning- and admin-aware full direct-value constructor (Phase F). Identical to the
+     * tuning-aware overload but also accepts an explicit {@link AdminConfig}, so the admin
+     * introspection integration test can enable a read-only HTTP endpoint on an ephemeral port
+     * without file/{@code .env} loading. Production code never calls this directly.
+     */
+    public AvenueConfig(
+            int packetSize,
+            boolean dropUnknownPackets,
+            String authenticationSecret,
+            String authenticationToken,
+            int port,
+            int outboundQueueCapacity,
+            long outboundQueueOfferTimeoutMillis,
+            boolean clusterEnabled,
+            String nodeId,
+            int clusterPort,
+            List<String> clusterPeers,
+            String clusterSecret,
+            long clusterHeartbeatIntervalMs,
+            long clientIdleTimeoutMillis,
+            int maxConnections,
+            BackpressurePolicy backpressurePolicy,
+            long metricsLogIntervalSeconds,
+            boolean serverTlsEnabled,
+            String serverTlsKeystorePath,
+            String serverTlsKeystorePassword,
+            boolean clusterTlsEnabled,
+            String clusterTlsKeystorePath,
+            String clusterTlsKeystorePassword,
+            String clusterTlsTruststorePath,
+            String clusterTlsTruststorePassword,
+            ClusterTuning clusterTuning,
+            AdminConfig adminConfig
+    ) {
         this.packetSize = packetSize;
         this.dropUnknownPackets = dropUnknownPackets;
         this.authenticationSecret = authenticationSecret;
@@ -267,6 +320,7 @@ public class AvenueConfig {
         this.clusterSecret = clusterSecret != null ? clusterSecret : "";
         this.clusterHeartbeatIntervalMs = clusterHeartbeatIntervalMs;
         this.clusterTuning = clusterTuning != null ? clusterTuning : ClusterTuning.defaults();
+        this.adminConfig = adminConfig != null ? adminConfig : AdminConfig.disabled();
         this.clientIdleTimeoutMillis = clientIdleTimeoutMillis;
         this.maxConnections = maxConnections;
         this.backpressurePolicy = backpressurePolicy != null
@@ -427,6 +481,21 @@ public class AvenueConfig {
                 swimProbeIntervalMs, swimProbeTimeoutMs, swimIndirectProbeCount,
                 swimSuspicionTimeoutMs, swimGossipFanout, swimDeadMemberTimeoutMs,
                 advertisedHost, clusterPacketMaxSize);
+
+        // Phase F — admin HTTP introspection (read-only). Disabled by default, loopback bind.
+        boolean adminEnabled = Boolean.parseBoolean(
+                dotenv.get("ADMIN_HTTP_ENABLED",
+                        properties.getProperty("admin.http.enabled", "false"))
+        );
+        int adminPort = Integer.parseInt(
+                dotenv.get("ADMIN_HTTP_PORT",
+                        properties.getProperty("admin.http.port", "0"))
+        );
+        String adminBindAddress = dotenv.get("ADMIN_HTTP_BIND_ADDRESS",
+                properties.getProperty("admin.http.bind-address", AdminConfig.DEFAULT_BIND_ADDRESS));
+        String adminSecret = dotenv.get("ADMIN_HTTP_SECRET",
+                properties.getProperty("admin.http.secret", ""));
+        adminConfig = new AdminConfig(adminEnabled, adminPort, adminBindAddress, adminSecret);
 
         // Phase E — fail fast on a misconfigured cluster node id. Only enforced in the file/.env path
         // (direct-value constructors always pass an explicit nodeId), and only when clustering is on.
@@ -612,6 +681,14 @@ public class AvenueConfig {
      */
     public ClusterTuning getClusterTuning() {
         return clusterTuning;
+    }
+
+    /**
+     * Returns the Phase F admin HTTP introspection settings (enabled flag / port / bind address /
+     * secret). Never {@code null}; non-file constructors return {@link AdminConfig#disabled()}.
+     */
+    public AdminConfig getAdminConfig() {
+        return adminConfig;
     }
 
     // -------------------------------------------------------------------------

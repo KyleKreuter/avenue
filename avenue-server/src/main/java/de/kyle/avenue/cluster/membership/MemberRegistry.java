@@ -1,5 +1,7 @@
 package de.kyle.avenue.cluster.membership;
 
+import de.kyle.avenue.admin.dto.MemberRegistrySnapshot;
+import de.kyle.avenue.admin.dto.MemberSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,6 +53,38 @@ public final class MemberRegistry {
     /** Snapshot of all tracked members. */
     public List<Member> snapshot() {
         return new ArrayList<>(members.values());
+    }
+
+    /**
+     * Immutable, leak-free snapshot of all tracked members plus the aggregate state counts, for
+     * admin introspection (Phase F). Each member is copied into a {@link MemberSnapshot} value while
+     * holding its monitor, so the admin layer never sees a partially-updated member or holds a
+     * reference to live mutable state. The counts are derived from the very same copies, so the
+     * member list and the aggregate counts are always internally consistent.
+     */
+    public MemberRegistrySnapshot snapshotDto() {
+        List<MemberSnapshot> snaps = new ArrayList<>(members.size());
+        int alive = 0;
+        int suspect = 0;
+        int dead = 0;
+        for (Member m : members.values()) {
+            MemberState state;
+            long incarnation;
+            long changedAt;
+            synchronized (m) {
+                state = m.getState();
+                incarnation = m.getIncarnation();
+                changedAt = m.getStateChangedAtMillis();
+            }
+            snaps.add(new MemberSnapshot(
+                    m.getNodeId(), state.name(), incarnation, m.getHost(), m.getClusterPort(), changedAt));
+            switch (state) {
+                case ALIVE -> alive++;
+                case SUSPECT -> suspect++;
+                case DEAD, LEFT -> dead++;
+            }
+        }
+        return new MemberRegistrySnapshot(alive, suspect, dead, List.copyOf(snaps));
     }
 
     /** Number of members currently in {@link MemberState#ALIVE}. */

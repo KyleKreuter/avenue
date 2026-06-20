@@ -101,6 +101,89 @@ to untrusted clients.
 
 ---
 
+## Cluster Peer Authentication — HMAC Challenge–Response (Phase B)
+
+Cluster peer links are authenticated with a mutual **HMAC-SHA-256 challenge–response** handshake
+over the (optionally TLS-protected) TCP connection, performed by
+`de.kyle.avenue.cluster.ClusterHandshake` / `HmacAuthenticator` before any cluster traffic flows.
+Both sides must possess the shared `cluster.secret`; the secret itself is **never sent on the
+wire**.
+
+### Flow
+
+```
+initiator                                   acceptor
+   |  Hello(nodeId_i, nonce_i, host, port, inc) --->                       |
+   |                       <--- Challenge(nodeId_a, nonce_a, host, port, inc, proof_a)
+   |  Response(proof_i)                          --->                       |
+   |                       (both verify; link established)                 |
+```
+
+1. The **initiator** sends a `Hello` carrying its node id, a fresh random `nonce_i` and its
+   advertised contact info (host / cluster port / incarnation).
+2. The **acceptor** replies with a `Challenge` carrying its own node id, a fresh random `nonce_a`,
+   its contact info and a `proof_a = HMAC(secret, transcript)`.
+3. The **initiator** verifies `proof_a`, then sends a `Response` with
+   `proof_i = HMAC(secret, transcript)` over the same transcript with a different domain-separation
+   tag.
+4. The acceptor verifies `proof_i`. Only if both proofs verify is the link established and the peer
+   registered as `ALIVE`.
+
+### Transcript & domain separation
+
+Each proof is an HMAC over a **transcript** that binds both nonces and both node identities
+(`nonce_i`, `nonce_a`, `nodeId_i`, `nodeId_a`), so a proof cannot be replayed across handshakes or
+reflected back to its sender. The initiator's and acceptor's proofs use **distinct
+domain-separation tags** (a fixed label mixed into the HMAC input), so the two directions produce
+different MACs over the same transcript — preventing a reflection attack where an attacker echoes
+the acceptor's proof back as the initiator's.
+
+### Properties
+
+- **Secret never on the wire** — only HMAC proofs are transmitted; the secret is the HMAC key.
+- **Mutual** — both sides prove knowledge of the secret; a node that lacks it cannot complete
+  either direction.
+- **Replay-resistant** — the fresh per-handshake nonces make every transcript unique.
+- **Constant-time verification** — proofs are compared with `MessageDigest.isEqual`.
+- **Counted** — a failed proof increments `cluster_handshakeAuthFailures` and is logged as the
+  structured event `event=handshake-auth-failure`.
+
+### Relationship to TLS
+
+The HMAC handshake and cluster TLS are **complementary, defence-in-depth** layers and are
+configured independently:
+
+- **TLS** (`cluster.tls.*`) secures the *channel*: confidentiality + integrity on the wire and,
+  via the truststore, certificate-based authentication of the endpoint.
+- **HMAC** authenticates the *cluster membership identity*: it proves the peer holds the shared
+  cluster secret, independent of the transport.
+
+Running both is recommended for production: TLS stops passive eavesdropping and active tampering,
+while the HMAC secret stops an unauthorized node (that somehow reaches the port) from joining the
+mesh. With TLS off, the HMAC handshake still authenticates peers but the channel is cleartext.
+
+---
+
+## Admin HTTP Introspection Secret (Phase F)
+
+The read-only admin HTTP endpoint (see *Clustering* docs) is **disabled by default** and binds to
+loopback (`127.0.0.1`) only. When enabled it can optionally be gated behind a shared secret:
+
+```properties
+admin.http.enabled=true
+admin.http.bind-address=127.0.0.1
+admin.http.port=9180
+admin.http.secret=<admin-secret>     # empty = no auth
+```
+
+When `admin.http.secret` is set, **every** request must carry it in the `X-Admin-Secret` header.
+The value is compared in **constant time** via `MessageDigest.isEqual`; a missing or wrong secret
+returns `401`. As the endpoint is strictly read-only (only `GET`, no state mutation) and
+loopback-bound by default, the secret is a second line of defence rather than the primary control —
+keep the bind address on loopback or a management interface and do not expose it publicly.
+
+---
+
 ## Backpressure Policy (E17)
 
 Each client has a bounded outbound queue drained by a dedicated virtual-thread writer, so one
@@ -199,3 +282,6 @@ Exposed values (all also available via public getters for tooling/tests):
 | `server.max-connections`           | `10000`                     | Up to 10k concurrent clients |
 | `server.backpressure.policy`       | `DISCONNECT_SLOW_CONSUMER`  | Drop slow consumers          |
 | `server.metrics.log-interval-seconds` | `30`                     | Log a metrics snapshot every 30s |
+| `admin.http.enabled`               | `false`                     | No admin HTTP endpoint       |
+| `admin.http.bind-address`          | `127.0.0.1`                 | Loopback-only bind           |
+| `admin.http.secret`                | *(empty)*                   | No `X-Admin-Secret` required |
