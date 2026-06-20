@@ -1,0 +1,61 @@
+@startuml
+' Avenue architecture overview — rendered to docs/architecture.png
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 8
+skinparam defaultFontName "Inter, Helvetica, Arial, sans-serif"
+skinparam defaultFontSize 12
+skinparam ArrowColor #18181B
+skinparam ArrowFontColor #52525B
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam NoteBackgroundColor #F4F4F5
+skinparam NoteBorderColor #A1A1AA
+
+title Avenue — masterless clustered pub/sub
+
+actor "Publisher" as PubA
+actor "Subscriber" as SubA
+
+package "Node A" as NodeA {
+  [Transport\nblocking / NIO\nlength-prefix framing] as TA
+  [Dispatch\nProtobuf oneof\n+ auth / topic gate] as DA
+  [Subscription & Delivery\nencode-once fan-out] as SA
+  [Cluster\nSWIM membership\ninterest routing\nat-least-once] as CA
+  TA --> DA
+  DA --> SA : local publish
+  DA --> CA : forward to\ninterested peers
+  CA --> SA : remote publish
+  SA --> TA : fan-out frames
+}
+
+package "Node B" as NodeB {
+  [Transport] as TB
+  [Dispatch] as DB2
+  [Subscription & Delivery] as SB
+  [Cluster] as CB
+  TB --> DB2
+  DB2 --> SB
+  DB2 --> CB
+  CB --> SB
+  SB --> TB
+}
+
+actor "Subscriber" as SubB
+
+PubA --> TA : publish
+SubA --> TA : subscribe
+TA --> SubA : deliver
+SubB --> TB : subscribe
+TB --> SubB : deliver
+
+CA <-> CB : cluster link\nHMAC handshake · interest-routed\nat-least-once (replay / ACK / backfill)
+
+note bottom of NodeB
+  Every node runs the same code (no leader).
+  Clustering is off by default — a single
+  node works standalone.
+end note
+
+@enduml

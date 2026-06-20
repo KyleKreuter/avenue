@@ -217,14 +217,9 @@ mvn -q -pl avenue-server exec:java -Dexec.classpathScope=test \
 
 ## Architecture at a glance
 
-```
-            client port                          client port
-   clients ───►  node-A  ◄──── authenticated ────►  node-B  ◄─── clients
-                   │            cluster link            │
-                   │  (SWIM gossip + interest routing   │
-                   │   + at-least-once replay)          │
-                   └───────────── full mesh ────────────┘
-```
+![Avenue architecture — masterless clustered pub/sub](docs/architecture.png)
+
+> Diagram source: [`docs/architecture.puml`](docs/architecture.puml) (PlantUML).
 
 - **Transport** (`blocking` or `nio`) frames bytes and hands raw Protobuf frames to the handlers.
 - **Dispatch** decodes a `ClientEnvelope` and routes by oneof case after typed auth/topic gating.
