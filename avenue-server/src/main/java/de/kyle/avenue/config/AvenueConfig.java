@@ -28,6 +28,39 @@ public class AvenueConfig {
     private final int outboundQueueCapacity;
     private final long outboundQueueOfferTimeoutMillis;
 
+    /**
+     * Direct-value constructor used for tests (and any embedding that already holds its
+     * configuration in memory). It bypasses the file/{@code .env} loading entirely so that
+     * a test can spin up a server with known {@code secret}/{@code token}/{@code port}/etc.
+     * without touching the working directory or environment. The production
+     * {@link #AvenueConfig()} constructor is left untouched.
+     *
+     * @param packetSize                      maximum allowed payload size in bytes
+     * @param dropUnknownPackets              whether malformed/unknown packets disconnect the client
+     * @param authenticationSecret            the shared secret a client must present to obtain a token
+     * @param authenticationToken             the token issued on a valid secret and required by secured handlers
+     * @param port                            the TCP port to bind ({@code 0} = ephemeral)
+     * @param outboundQueueCapacity           per-client outbound queue capacity
+     * @param outboundQueueOfferTimeoutMillis backpressure offer timeout in milliseconds
+     */
+    public AvenueConfig(
+            int packetSize,
+            boolean dropUnknownPackets,
+            String authenticationSecret,
+            String authenticationToken,
+            int port,
+            int outboundQueueCapacity,
+            long outboundQueueOfferTimeoutMillis
+    ) {
+        this.packetSize = packetSize;
+        this.dropUnknownPackets = dropUnknownPackets;
+        this.authenticationSecret = authenticationSecret;
+        this.authenticationToken = authenticationToken;
+        this.port = port;
+        this.outboundQueueCapacity = outboundQueueCapacity;
+        this.outboundQueueOfferTimeoutMillis = outboundQueueOfferTimeoutMillis;
+    }
+
     public AvenueConfig() throws IOException {
         Dotenv dotenv = Dotenv.configure().ignoreIfMissing().load();
         Properties properties = loadProperties();
