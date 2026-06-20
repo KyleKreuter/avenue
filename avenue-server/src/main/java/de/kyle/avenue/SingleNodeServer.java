@@ -108,7 +108,8 @@ public class SingleNodeServer {
                 topicSubscriptionHandler,
                 executorService,
                 clusterForwarder,
-                this.metrics
+                this.metrics,
+                this.avenueConfig
         );
         this.socketFactoryProvider = SocketFactoryProvider.forServer(
                 avenueConfig.isServerTlsEnabled(),

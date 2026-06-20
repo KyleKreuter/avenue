@@ -10,6 +10,7 @@ import de.kyle.avenue.serialization.WireCodec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -33,10 +34,14 @@ import java.util.concurrent.TimeUnit;
  * fan-out to all other subscribers. Only the writer thread touches the {@link DataOutputStream},
  * which is why no write lock is needed any more.
  * <p>
- * Wire format: the queue carries typed {@link ClientEnvelope} protobuf messages; the writer
- * serializes each via {@link WireCodec#encodeClient} and frames it with
- * {@link PacketFraming#writeFrame}. Inbound frames are read raw and handed to the
- * {@link InboundPacketHandler}, which decodes and dispatches them.
+ * Wire format: the queue carries {@link OutboundFrame}s. High-rate publish fan-out enqueues a
+ * {@link OutboundFrame.PreSerialized} whose payload bytes were serialized <em>once</em> in
+ * {@link TopicSubscriptionHandler#deliverPacketToSubscribers} and shared across every subscriber
+ * (encode-once fan-out, O(1) instead of O(N) serialization); the writer just frames the bytes via
+ * {@link PacketFraming#writeFrameNoFlush}. Low-rate request/response answers (auth-token response,
+ * subscribe-ack) enqueue a {@link OutboundFrame.Envelope} via {@link #enqueue(ClientEnvelope)};
+ * the writer serializes those lazily via {@link WireCodec#encodeClient}. Inbound frames are read
+ * raw and handed to the {@link InboundPacketHandler}, which decodes and dispatches them.
  * <p>
  * Liveness (E16): when {@code server.client.idle-timeout-ms > 0} a {@link Socket#setSoTimeout
  * read timeout} is applied. If no byte arrives from the client within that window the read
@@ -56,6 +61,15 @@ public class ClientConnectionHandler implements Runnable {
      */
     private static final int OUTPUT_BUFFER_BYTES = 64 * 1024;
 
+    /**
+     * Size of the {@link BufferedInputStream} layered under the {@link DataInputStream}. Symmetric to
+     * the buffered write side: it coalesces many small length-prefixed frames into far fewer read
+     * syscalls under load, while still surfacing the {@link SocketTimeoutException} that drives the
+     * idle-timeout cutoff (the buffer only fills on an actual read, so a truly idle socket still
+     * blocks in {@code read()} and times out exactly as before).
+     */
+    private static final int INPUT_BUFFER_BYTES = 64 * 1024;
+
     private final Socket client;
     private final InputStream inputStream;
     private final OutputStream outputStream;
@@ -67,7 +81,7 @@ public class ClientConnectionHandler implements Runnable {
     private final Runnable onDisconnect;
 
     /** Bounded outbound queue. Backpressure is applied via offer() with a short timeout. */
-    private final BlockingQueue<ClientEnvelope> outboundQueue;
+    private final BlockingQueue<OutboundFrame> outboundQueue;
     private final long offerTimeoutMillis;
     private final BackpressurePolicy backpressurePolicy;
     private final long idleTimeoutMillis;
@@ -130,7 +144,12 @@ public class ClientConnectionHandler implements Runnable {
         if (idleTimeoutMillis > 0) {
             this.client.setSoTimeout((int) Math.min(idleTimeoutMillis, Integer.MAX_VALUE));
         }
-        try (DataInputStream dataInputStream = new DataInputStream(this.inputStream)) {
+        // Buffered read: coalesce many small frames into fewer read syscalls, symmetric to the
+        // already-buffered write side. The idle-timeout still works: a buffered read only blocks (and
+        // thus only throws SocketTimeoutException) when the buffer is empty and the socket has no
+        // bytes — exactly the dead/idle case the timeout is meant to reap.
+        try (DataInputStream dataInputStream =
+                     new DataInputStream(new BufferedInputStream(this.inputStream, INPUT_BUFFER_BYTES))) {
             // Length-prefix framing: read frames in a loop so a single connection can
             // carry many messages instead of blocking on readAllBytes() until EOF.
             while (this.running) {
@@ -171,10 +190,10 @@ public class ClientConnectionHandler implements Runnable {
         // Reused per-batch scratch list so a single iteration coalesces every already-queued frame
         // into one buffered flush (write-batching). batchMaxFrames - 1 because the blocking poll
         // already took the first frame of the batch.
-        List<ClientEnvelope> batch = new ArrayList<>(batchMaxFrames);
+        List<OutboundFrame> batch = new ArrayList<>(batchMaxFrames);
         try {
             while (this.running || !outboundQueue.isEmpty()) {
-                ClientEnvelope first = outboundQueue.poll(200, TimeUnit.MILLISECONDS);
+                OutboundFrame first = outboundQueue.poll(200, TimeUnit.MILLISECONDS);
                 if (first == null) {
                     continue;
                 }
@@ -185,8 +204,8 @@ public class ClientConnectionHandler implements Runnable {
                 if (batchMaxFrames > 1) {
                     batch.clear();
                     outboundQueue.drainTo(batch, batchMaxFrames - 1);
-                    for (ClientEnvelope envelope : batch) {
-                        writeFrameNoFlush(envelope);
+                    for (OutboundFrame frame : batch) {
+                        writeFrameNoFlush(frame);
                     }
                 }
                 // Exactly one flush per batch pushes the coalesced bytes in a single syscall. When the
@@ -203,9 +222,19 @@ public class ClientConnectionHandler implements Runnable {
         }
     }
 
-    /** Serializes one envelope and writes its framed bytes into the buffered stream WITHOUT flushing. */
-    private void writeFrameNoFlush(ClientEnvelope envelope) throws IOException {
-        byte[] payload = WireCodec.encodeClient(envelope, avenueConfig.getPacketSize());
+    /**
+     * Writes one outbound frame's bytes into the buffered stream WITHOUT flushing.
+     * <p>
+     * A {@link OutboundFrame.PreSerialized} (the publish fan-out path) is written verbatim — its
+     * payload was already serialized once and shared across all subscribers. A
+     * {@link OutboundFrame.Envelope} (the low-rate auth/subscribe-ack path) is serialized lazily here.
+     */
+    private void writeFrameNoFlush(OutboundFrame frame) throws IOException {
+        byte[] payload = switch (frame) {
+            case OutboundFrame.PreSerialized pre -> pre.payload();
+            case OutboundFrame.Envelope env ->
+                    WireCodec.encodeClient(env.envelope(), avenueConfig.getPacketSize());
+        };
         PacketFraming.writeFrameNoFlush(dataOutputStream, payload);
     }
 
@@ -220,11 +249,34 @@ public class ClientConnectionHandler implements Runnable {
      * </ul>
      */
     public void enqueue(ClientEnvelope envelope) {
+        // Low-rate path (auth response / subscribe-ack): keep the typed envelope and let the writer
+        // serialize it lazily. Per-frame serialization cost is irrelevant at this rate.
+        enqueueFrame(new OutboundFrame.Envelope(envelope));
+    }
+
+    /**
+     * Enqueues an already-serialized client frame for asynchronous delivery (encode-once fan-out).
+     * The supplied bytes are the bare protobuf payload (no length prefix) of a {@link ClientEnvelope}
+     * and are written verbatim by the writer. Used by
+     * {@link TopicSubscriptionHandler#deliverPacketToSubscribers}, which serializes the
+     * {@code PublishOutbound} envelope exactly once and hands the same immutable {@code byte[]} to
+     * every subscriber. The bytes must never be mutated after being passed in, as they are shared.
+     */
+    public void enqueuePreSerialized(byte[] payload) {
+        enqueueFrame(new OutboundFrame.PreSerialized(payload));
+    }
+
+    /**
+     * Common enqueue with the configured backpressure policy. Never blocks the caller on the socket;
+     * applies the bounded-queue offer timeout and the {@link BackpressurePolicy} on overflow, and
+     * updates the delivery / drop / disconnect metrics exactly as before.
+     */
+    private void enqueueFrame(OutboundFrame frame) {
         if (!this.running) {
             return;
         }
         try {
-            boolean accepted = outboundQueue.offer(envelope, offerTimeoutMillis, TimeUnit.MILLISECONDS);
+            boolean accepted = outboundQueue.offer(frame, offerTimeoutMillis, TimeUnit.MILLISECONDS);
             if (accepted) {
                 metrics.incrementMessagesDelivered();
                 metrics.recordOutboundQueueDepth(outboundQueue.size());
@@ -253,6 +305,21 @@ public class ClientConnectionHandler implements Runnable {
      */
     public void send(ClientEnvelope envelope) {
         enqueue(envelope);
+    }
+
+    /**
+     * Serializes a {@link ClientEnvelope} into its bare protobuf payload bytes (no length prefix)
+     * once, applying the same oversized-payload guard the writer used to apply per frame. The
+     * returned immutable {@code byte[]} is meant to be shared across all subscribers of a fan-out via
+     * {@link #enqueuePreSerialized(byte[])}, so the publish envelope is serialized exactly once per
+     * publish instead of once per subscriber.
+     *
+     * @param envelope the envelope to serialize
+     * @param maxSize  the configured maximum payload size in bytes
+     * @return the encoded payload bytes
+     */
+    public static byte[] encodeForFanOut(ClientEnvelope envelope, int maxSize) {
+        return WireCodec.encodeClient(envelope, maxSize);
     }
 
     public synchronized void shutdown() {

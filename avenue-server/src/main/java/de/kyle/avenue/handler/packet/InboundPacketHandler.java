@@ -1,6 +1,7 @@
 package de.kyle.avenue.handler.packet;
 
 import de.kyle.avenue.cluster.ClusterForwarder;
+import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.handler.packet.auth.AuthTokenRequestInboundPacketHandler;
@@ -72,8 +73,9 @@ public class InboundPacketHandler {
     }
 
     /**
-     * Full constructor. The supplied {@code clusterForwarder} and shared {@code metrics} are
-     * injected into the {@link PublishMessageInboundPacketHandler}.
+     * Full constructor without an explicit {@link AvenueConfig}: the publish handler uses default
+     * tuning values (packet size and inline-delivery fan-out threshold). Kept for backwards
+     * compatibility.
      */
     public InboundPacketHandler(
             AuthenticationTokenHandler authenticationTokenHandler,
@@ -86,6 +88,27 @@ public class InboundPacketHandler {
         this.authHandler = new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler);
         this.publishHandler = new PublishMessageInboundPacketHandler(
                 topicSubscriptionHandler, executorService, clusterForwarder, metrics);
+        this.subscribeHandler = new SubscribeInboundPacketHandler(topicSubscriptionHandler);
+    }
+
+    /**
+     * Config-aware full constructor. Pins the publish handler's encode-once packet-size guard and the
+     * inline-delivery fan-out threshold from {@code avenueConfig}. This is the constructor production
+     * code ({@link de.kyle.avenue.SingleNodeServer}) uses.
+     */
+    public InboundPacketHandler(
+            AuthenticationTokenHandler authenticationTokenHandler,
+            TopicSubscriptionHandler topicSubscriptionHandler,
+            ExecutorService executorService,
+            ClusterForwarder clusterForwarder,
+            AvenueMetrics metrics,
+            AvenueConfig avenueConfig
+    ) {
+        this.authenticationTokenHandler = authenticationTokenHandler;
+        this.authHandler = new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler);
+        this.publishHandler = new PublishMessageInboundPacketHandler(
+                topicSubscriptionHandler, executorService, clusterForwarder, metrics,
+                avenueConfig.getPacketSize(), avenueConfig.getInlineDeliveryMaxFanout());
         this.subscribeHandler = new SubscribeInboundPacketHandler(topicSubscriptionHandler);
     }
 

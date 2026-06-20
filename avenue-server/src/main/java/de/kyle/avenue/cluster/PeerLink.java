@@ -469,7 +469,7 @@ public class PeerLink {
         // message a locally-published message produces).
         ClientEnvelope outbound = ClientEnvelopes.publishOutbound(
                 packet.getTopic(), packet.getSource(), packet.getData());
-        topicSubscriptionHandler.deliverPacketToSubscribers(packet.getTopic(), outbound);
+        topicSubscriptionHandler.deliverPacketToSubscribers(packet.getTopic(), outbound, maxPacketSize);
     }
 
     /** Cumulative ACK from the remote: evict everything up to the acked {@code linkSeq} from our ring. */

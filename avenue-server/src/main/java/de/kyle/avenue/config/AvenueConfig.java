@@ -50,6 +50,19 @@ public class AvenueConfig {
     /** Default for {@link #serverBatchMaxFrames}, mirroring the cluster writer's batch cap. */
     public static final int DEFAULT_SERVER_BATCH_MAX_FRAMES = 64;
 
+    /**
+     * Subscriber-count threshold above which a local publish is fanned out on the shared executor
+     * instead of inline on the publisher's reader thread. Inline delivery (the normal, small-fan-out
+     * case) saves a task allocation and a thread hop per publish; above this threshold the work is
+     * handed to the executor so a single huge fan-out cannot monopolize one reader thread. Defaults
+     * to {@value #DEFAULT_INLINE_DELIVERY_MAX_FANOUT}. Direct-value (test) constructors use the
+     * default; only the file/{@code .env} constructor reads {@code server.inline-delivery.max-fanout}.
+     */
+    private final int inlineDeliveryMaxFanout;
+
+    /** Default for {@link #inlineDeliveryMaxFanout}. */
+    public static final int DEFAULT_INLINE_DELIVERY_MAX_FANOUT = 1024;
+
     // -------------------------------------------------------------------------
     // Cluster fields (all optional; cluster is disabled by default)
     // -------------------------------------------------------------------------
@@ -326,6 +339,7 @@ public class AvenueConfig {
         // these fields itself from the server.tcp-nodelay / server.batch.max-frames properties.
         this.serverTcpNoDelay = true;
         this.serverBatchMaxFrames = DEFAULT_SERVER_BATCH_MAX_FRAMES;
+        this.inlineDeliveryMaxFanout = DEFAULT_INLINE_DELIVERY_MAX_FANOUT;
         this.clusterEnabled = clusterEnabled;
         this.nodeId = nodeId;
         this.clusterPort = clusterPort;
@@ -388,6 +402,15 @@ public class AvenueConfig {
         );
         serverBatchMaxFrames = parsedServerBatchMaxFrames > 0
                 ? parsedServerBatchMaxFrames : DEFAULT_SERVER_BATCH_MAX_FRAMES;
+        // Inline-delivery fan-out guard: above this subscriber count a publish is delivered via the
+        // executor instead of inline on the reader thread.
+        int parsedInlineDeliveryMaxFanout = Integer.parseInt(
+                dotenv.get("SERVER_INLINE_DELIVERY_MAX_FANOUT",
+                        properties.getProperty("server.inline-delivery.max-fanout",
+                                Integer.toString(DEFAULT_INLINE_DELIVERY_MAX_FANOUT)))
+        );
+        inlineDeliveryMaxFanout = parsedInlineDeliveryMaxFanout > 0
+                ? parsedInlineDeliveryMaxFanout : DEFAULT_INLINE_DELIVERY_MAX_FANOUT;
 
         // Cluster settings — all optional, clustering is off by default.
         clusterEnabled = Boolean.parseBoolean(
@@ -674,6 +697,15 @@ public class AvenueConfig {
      */
     public int getServerBatchMaxFrames() {
         return serverBatchMaxFrames;
+    }
+
+    /**
+     * Subscriber-count threshold above which a local publish is fanned out on the shared executor
+     * instead of inline on the publisher's reader thread. Defaults to
+     * {@value #DEFAULT_INLINE_DELIVERY_MAX_FANOUT}.
+     */
+    public int getInlineDeliveryMaxFanout() {
+        return inlineDeliveryMaxFanout;
     }
 
     // -------------------------------------------------------------------------
