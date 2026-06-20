@@ -103,6 +103,27 @@ public class ClusterNode {
     }
 
     /**
+     * Closes the link to the given peer (test seam for reconnect / partition simulation). The
+     * owning connect loop will reconnect unless the peer is also blocked.
+     */
+    // @VisibleForTesting
+    public void dropPeer(String nodeId) {
+        clusterManager.dropPeer(nodeId);
+    }
+
+    /** Blocks (re)connecting to the given peer and drops any current link (test seam). */
+    // @VisibleForTesting
+    public void blockPeer(String nodeId) {
+        clusterManager.blockPeer(nodeId);
+    }
+
+    /** Allows connecting to the given peer again (test seam). */
+    // @VisibleForTesting
+    public void unblockPeer(String nodeId) {
+        clusterManager.unblockPeer(nodeId);
+    }
+
+    /**
      * Exposes the cluster transport metrics (active peer links, forwarded/received counters and
      * the handshake auth-failure counter). Used by integration tests to assert on the handshake
      * outcome without reaching into the {@link ClusterManager} internals.
