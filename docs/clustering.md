@@ -155,6 +155,21 @@ Backpressure is absorbed **only** on each link's writer thread via its ReplayBuf
 (`cluster.replay.backpressure.policy` = `BLOCK` then degrade to a gap, or `DROP_GAP`). The local
 publish path is **never** blocked by a slow or partitioned peer.
 
+### Write coalescing (batching)
+
+Each writer (cluster peer link **and** client connection) wraps its socket output in a
+`BufferedOutputStream` and coalesces frames: it writes the first frame, opportunistically
+`drainTo`s every frame already waiting in its queue (up to `cluster.batch.max-frames` /
+`server.batch.max-frames`), writes them all **without flushing**, and issues a **single** `flush()`
+per batch. This amortizes one syscall and one TCP segment across many small frames under high load.
+
+The coalescing is **opportunistic — it never lingers**: at low load a batch is a single frame, so
+there is no added latency (the default `cluster.batch.max-delay-micros=0`). On the cluster writer,
+coalescing only pulls additional publishes while the ReplayBuffer has headroom, so a slow/back-pressured
+peer never lets the writer monopolize the thread and **heartbeats/ACKs keep flowing**. Setting
+`max-frames=1` restores the old flush-per-frame behaviour. Batching is **on by default** and was the
+single largest throughput lever after the Protobuf cutover (see [Measured performance](#measured-performance)).
+
 ---
 
 ## Interest-Based Routing (Phase D)
@@ -235,6 +250,10 @@ All keys live in `default.properties` (or a `config/*.properties` file, or the m
 | `cluster.ack-interval-ms`              | `200`       | Cumulative ACK send interval.                                       |
 | `cluster.strict-ordering`              | `false`     | Hold out-of-order `linkSeq`s until contiguous before delivery.      |
 | `cluster.origin.expiry-ms`             | `300000`    | How long a replay buffer survives without a link before being freed.|
+| **Write batching**                     |             | Opportunistic write-coalescing (on by default).                     |
+| `cluster.batch.max-frames`             | `64`        | Max frames coalesced per cluster-writer flush (`1` = flush per frame). |
+| `cluster.batch.max-delay-micros`       | `0`         | Optional linger to accumulate more frames (`0` = pure opportunistic, no added latency). |
+| `server.batch.max-frames`              | `64`        | Max frames coalesced per client-connection-writer flush.            |
 | **Interest routing (Phase D)**         |             |                                                                      |
 | `cluster.interest.sync-interval-ms`    | `10000`     | Anti-entropy full interest-state sync period.                       |
 | `cluster.interest.broadcast-grace-ms`  | `0`         | Grace window flooding a topic to all peers after a topology change (`0` = off). |
@@ -346,6 +365,26 @@ A reusable `de.kyle.avenue.integration.cluster.ClusterTestHarness` provides N-no
 polling-based convergence helpers and the partition/heal/slowPeer/crash/restart fault helpers for new
 tests.
 
+### Measured performance
+
+Indicative numbers on an Apple-Silicon laptop (loopback, 200k messages, `nodelay=true`, single
+publisher thread, no warm-up separation — throughput is the meaningful signal, the cluster p99 under a
+200k firehose is queueing latency, not steady-state). Each step was measured same-machine.
+
+| Scenario | JSON (original) | Protobuf | Protobuf + batching |
+|---|---|---|---|
+| Single-node deliveries/s (fan-out 4) | ~134k | ~196k | **~588k** |
+| Cluster 2-node cross-node msg/s | ~59k | ~85k | ~83k (p50 ~2–7 ms, p99 ~75 ms) |
+| Cluster 3-node cross-node msg/s | ~76k | ~115k | **~138k** (p50 ~3–5 ms, p99 ~65–130 ms) |
+| Wire bytes / client message | 175 B | 94 B | 94 B |
+| Wire bytes / cluster message | 266 B | 125 B | 125 B |
+
+Two protocol changes drove this: **Protobuf** roughly halved wire size and added ~45 % throughput;
+**opportunistic write-batching** then tripled single-node throughput by amortizing the per-frame
+`flush()`/syscall. The cluster cross-node path is ACK/replay-window-gated rather than syscall-gated, so
+batching is neutral-to-positive there (clearly positive at 3 nodes). The next lever for the cluster
+path would be a larger ACK window / pipelining, not encoding.
+
 ---
 
 ## Known Limits & Future Work
@@ -362,8 +401,7 @@ tests.
   Fine for small/medium clusters; a relay/super-peer topology would be needed at very large scale.
 - **Shared cluster secret.** All nodes share one `cluster.secret` (no per-node credentials / cert
   pinning beyond optional TLS).
-- **Write-coalescing (`cluster.batch.*`)** — *future work.* Per-link write-coalescing/batching to
-  amortize syscalls and framing under very high publish rates is intentionally **not** implemented in
-  Phase F (default-off design, deferred to keep the hot path simple and the change risk-free). The
-  per-link writer + pre-serialized frames already make adding it localized.
 - **`source` is client-declared** and spoofable (see security.md, E15).
+- **Cluster path is ACK-window-gated.** Cross-node throughput is bounded by the cumulative-ACK
+  cadence and replay-window size rather than encoding or syscalls; raising `cluster.ack-interval-ms`
+  responsiveness / pipelining the ACK window is the next throughput lever (not yet done).
