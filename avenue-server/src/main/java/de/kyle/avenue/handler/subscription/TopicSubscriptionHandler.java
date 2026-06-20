@@ -1,5 +1,6 @@
 package de.kyle.avenue.handler.subscription;
 
+import de.kyle.avenue.handler.client.ClientConnection;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.metrics.AvenueMetrics;
 import de.kyle.avenue.proto.ClientEnvelope;
@@ -60,7 +61,7 @@ public class TopicSubscriptionHandler {
         this.interestListener = listener != null ? listener : InterestListener.NOOP;
     }
 
-    private final Map<String, Set<ClientConnectionHandler>> topicSubscriptions = new ConcurrentHashMap<>();
+    private final Map<String, Set<ClientConnection>> topicSubscriptions = new ConcurrentHashMap<>();
 
     /** Running total of active (client, topic) subscriptions, mirrored into the metrics gauge. */
     private final AtomicLong subscriptionTotal = new AtomicLong();
@@ -123,12 +124,12 @@ public class TopicSubscriptionHandler {
      * or re-looking-up inside delivery. {@code 0} when the topic has no subscribers.
      */
     public int subscriberCount(String normalizedTopic) {
-        Set<ClientConnectionHandler> subscribers = topicSubscriptions.get(normalizedTopic);
+        Set<ClientConnection> subscribers = topicSubscriptions.get(normalizedTopic);
         return subscribers == null ? 0 : subscribers.size();
     }
 
     public void deliverToSubscribers(String normalizedTopic, ClientEnvelope envelope, int maxSize) {
-        Set<ClientConnectionHandler> subscribers = topicSubscriptions.get(normalizedTopic);
+        Set<ClientConnection> subscribers = topicSubscriptions.get(normalizedTopic);
         if (subscribers == null || subscribers.isEmpty()) {
             log.warn("Packet was not delivered to other clients because no subscriptions are registered");
             return;
@@ -155,7 +156,7 @@ public class TopicSubscriptionHandler {
      *                        prefix); must never be mutated after this call as it is shared
      */
     public void deliverPreSerializedToSubscribers(String normalizedTopic, byte[] payload) {
-        Set<ClientConnectionHandler> subscribers = topicSubscriptions.get(normalizedTopic);
+        Set<ClientConnection> subscribers = topicSubscriptions.get(normalizedTopic);
         if (subscribers == null || subscribers.isEmpty()) {
             log.warn("Packet was not delivered to other clients because no subscriptions are registered");
             return;
@@ -168,13 +169,13 @@ public class TopicSubscriptionHandler {
      * tolerates concurrent subscribe/unsubscribe during iteration; delivery is non-blocking as each
      * handler only enqueues onto its own outbound queue.
      */
-    private static void fanOut(Set<ClientConnectionHandler> subscribers, byte[] payload) {
-        for (ClientConnectionHandler clientConnectionHandler : subscribers) {
-            clientConnectionHandler.enqueuePreSerialized(payload);
+    private static void fanOut(Set<ClientConnection> subscribers, byte[] payload) {
+        for (ClientConnection clientConnection : subscribers) {
+            clientConnection.enqueuePreSerialized(payload);
         }
     }
 
-    public void subscribeToTopic(String topic, ClientConnectionHandler clientConnectionHandler) {
+    public void subscribeToTopic(String topic, ClientConnection clientConnection) {
         String normalizedTopic = normalize(topic);
         // Detect the "first subscription for this topic" transition ATOMICALLY: the flag is set only
         // when the computeIfAbsent mapping function actually runs, i.e. the subscriber set did not
@@ -186,7 +187,7 @@ public class TopicSubscriptionHandler {
                     firstForTopic[0] = true;
                     return ConcurrentHashMap.newKeySet();
                 })
-                .add(clientConnectionHandler);
+                .add(clientConnection);
         if (added) {
             metrics.setSubscriptionCount(subscriptionTotal.incrementAndGet());
         }
@@ -197,7 +198,7 @@ public class TopicSubscriptionHandler {
         }
     }
 
-    public void unsubscribeFromAllTopics(ClientConnectionHandler clientConnectionHandler) {
+    public void unsubscribeFromAllTopics(ClientConnection clientConnection) {
         // Remove the client from every topic and drop now-empty topic sets to avoid leaking
         // memory for topics that no longer have any subscribers.
         long removed = 0;
@@ -205,16 +206,16 @@ public class TopicSubscriptionHandler {
         // each AFTER the loop (outside any computeIfPresent lambda). Deferring the events keeps the
         // listener off the map's internal bin lock and avoids re-entrancy surprises.
         java.util.List<String> nowEmptyTopics = new java.util.ArrayList<>();
-        for (Map.Entry<String, Set<ClientConnectionHandler>> entry : topicSubscriptions.entrySet()) {
+        for (Map.Entry<String, Set<ClientConnection>> entry : topicSubscriptions.entrySet()) {
             String topic = entry.getKey();
-            if (entry.getValue().remove(clientConnectionHandler)) {
+            if (entry.getValue().remove(clientConnection)) {
                 removed++;
                 // computeIfPresent re-checks emptiness atomically against concurrent inserts and
                 // returns null exactly when the topic set became empty and was therefore removed.
                 // A null return == "this client removed the last subscription for this topic", which
                 // is precisely the interest-removed transition; a non-null return means another
                 // subscriber raced in, so interest is retained and no event must fire.
-                Set<ClientConnectionHandler> remaining =
+                Set<ClientConnection> remaining =
                         topicSubscriptions.computeIfPresent(topic, (key, current) -> current.isEmpty() ? null : current);
                 if (remaining == null) {
                     nowEmptyTopics.add(topic);

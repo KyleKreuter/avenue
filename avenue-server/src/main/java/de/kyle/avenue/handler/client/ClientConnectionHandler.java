@@ -52,7 +52,7 @@ import java.util.concurrent.TimeUnit;
  * outbound queue stays full beyond the offer timeout — either disconnect the slow consumer
  * (default) or drop the individual message and keep the connection.
  */
-public class ClientConnectionHandler implements Runnable {
+public class ClientConnectionHandler implements ClientConnection, Runnable {
     private static final Logger log = LoggerFactory.getLogger(ClientConnectionHandler.class);
 
     /**
@@ -248,6 +248,7 @@ public class ClientConnectionHandler implements Runnable {
      *   <li>{@code DROP_MESSAGE} — the individual packet is dropped, the connection stays open.</li>
      * </ul>
      */
+    @Override
     public void enqueue(ClientEnvelope envelope) {
         // Low-rate path (auth response / subscribe-ack): keep the typed envelope and let the writer
         // serialize it lazily. Per-frame serialization cost is irrelevant at this rate.
@@ -262,6 +263,7 @@ public class ClientConnectionHandler implements Runnable {
      * {@code PublishOutbound} envelope exactly once and hands the same immutable {@code byte[]} to
      * every subscriber. The bytes must never be mutated after being passed in, as they are shared.
      */
+    @Override
     public void enqueuePreSerialized(byte[] payload) {
         enqueueFrame(new OutboundFrame.PreSerialized(payload));
     }
@@ -303,6 +305,7 @@ public class ClientConnectionHandler implements Runnable {
      * Backwards-compatible direct-send entry point used by handlers that answer a request
      * inline (e.g. the auth-token response). Delegates to the asynchronous queue.
      */
+    @Override
     public void send(ClientEnvelope envelope) {
         enqueue(envelope);
     }

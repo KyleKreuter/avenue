@@ -1,6 +1,6 @@
 package de.kyle.avenue.handler.packet;
 
-import de.kyle.avenue.handler.client.ClientConnectionHandler;
+import de.kyle.avenue.handler.client.ClientConnection;
 import de.kyle.avenue.proto.ClientEnvelope;
 
 /**
@@ -13,5 +13,5 @@ import de.kyle.avenue.proto.ClientEnvelope;
  * {@link InboundPacketHandler} guarantees the correct case is set before dispatch.
  */
 public interface PacketHandler {
-    void handle(ClientEnvelope envelope, ClientConnectionHandler clientConnectionHandler);
+    void handle(ClientEnvelope envelope, ClientConnection clientConnection);
 }

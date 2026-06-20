@@ -3,7 +3,7 @@ package de.kyle.avenue.handler.packet.publish;
 import com.google.protobuf.ByteString;
 import de.kyle.avenue.cluster.ClusterForwarder;
 import de.kyle.avenue.config.AvenueConfig;
-import de.kyle.avenue.handler.client.ClientConnectionHandler;
+import de.kyle.avenue.handler.client.ClientConnection;
 import de.kyle.avenue.handler.packet.PacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.AvenueMetrics;
@@ -119,7 +119,7 @@ public class PublishMessageInboundPacketHandler implements PacketHandler {
     }
 
     @Override
-    public void handle(ClientEnvelope envelope, ClientConnectionHandler clientConnectionHandler) {
+    public void handle(ClientEnvelope envelope, ClientConnection clientConnection) {
         PublishInbound publish = envelope.getPublishInbound();
 
         String topic = publish.getTopic();

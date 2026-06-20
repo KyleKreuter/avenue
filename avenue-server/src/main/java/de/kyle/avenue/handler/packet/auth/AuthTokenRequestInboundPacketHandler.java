@@ -1,7 +1,7 @@
 package de.kyle.avenue.handler.packet.auth;
 
 import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
-import de.kyle.avenue.handler.client.ClientConnectionHandler;
+import de.kyle.avenue.handler.client.ClientConnection;
 import de.kyle.avenue.handler.packet.PacketHandler;
 import de.kyle.avenue.proto.AuthTokenRequest;
 import de.kyle.avenue.proto.ClientEnvelope;
@@ -22,12 +22,12 @@ public class AuthTokenRequestInboundPacketHandler implements PacketHandler {
     }
 
     @Override
-    public void handle(ClientEnvelope envelope, ClientConnectionHandler clientConnectionHandler) {
+    public void handle(ClientEnvelope envelope, ClientConnection clientConnection) {
         AuthTokenRequest request = envelope.getAuthRequest();
         // proto3 defaults an unset string to "", which is exactly the empty-secret case; the
         // token handler validates the secret and yields the configured token (or an error token).
         String token = authenticationTokenHandler.getToken(request.getSecret());
         // Asynchronous enqueue; the dedicated writer thread performs the actual socket write.
-        clientConnectionHandler.send(ClientEnvelopes.authResponse(token));
+        clientConnection.send(ClientEnvelopes.authResponse(token));
     }
 }

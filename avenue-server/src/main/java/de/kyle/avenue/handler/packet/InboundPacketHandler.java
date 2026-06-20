@@ -3,6 +3,7 @@ package de.kyle.avenue.handler.packet;
 import de.kyle.avenue.cluster.ClusterForwarder;
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
+import de.kyle.avenue.handler.client.ClientConnection;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.handler.packet.auth.AuthTokenRequestInboundPacketHandler;
 import de.kyle.avenue.handler.packet.publish.PublishMessageInboundPacketHandler;
@@ -119,29 +120,29 @@ public class InboundPacketHandler {
      * @param frameBytes             the bare protobuf payload of one frame (length prefix already
      *                               consumed)
      * @param maxPacketSize          the configured maximum payload size (oversize -&gt; reject)
-     * @param clientConnectionHandler the connection the frame arrived on
+     * @param clientConnection       the connection the frame arrived on
      * @throws IllegalArgumentException if the payload is malformed, oversized, an unexpected case,
      *                                  or fails the token/topic gate
      */
     public void handleInboundPacket(
             byte[] frameBytes,
             int maxPacketSize,
-            ClientConnectionHandler clientConnectionHandler
+            ClientConnection clientConnection
     ) throws IOException {
         ClientEnvelope envelope = WireCodec.decodeClient(frameBytes, maxPacketSize);
         switch (envelope.getMsgCase()) {
-            case AUTH_REQUEST -> authHandler.handle(envelope, clientConnectionHandler);
+            case AUTH_REQUEST -> authHandler.handle(envelope, clientConnection);
             case SUBSCRIBE -> {
                 // @Secured + @TopicHandler equivalent: a valid token and a non-empty topic.
                 verifyToken(envelope.getSubscribe().getToken());
                 requireTopic(envelope.getSubscribe().getTopic());
-                subscribeHandler.handle(envelope, clientConnectionHandler);
+                subscribeHandler.handle(envelope, clientConnection);
             }
             case PUBLISH_INBOUND -> {
                 // @Secured + @TopicHandler equivalent: a valid token and a non-empty topic.
                 verifyToken(envelope.getPublishInbound().getToken());
                 requireTopic(envelope.getPublishInbound().getTopic());
-                publishHandler.handle(envelope, clientConnectionHandler);
+                publishHandler.handle(envelope, clientConnection);
             }
             // Server-to-client cases and an unset oneof never legitimately originate from a
             // client. Treat them as a desynced/hostile peer and reject (drop/close downstream).

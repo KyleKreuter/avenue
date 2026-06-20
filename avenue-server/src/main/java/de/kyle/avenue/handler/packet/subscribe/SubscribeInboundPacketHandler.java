@@ -1,6 +1,6 @@
 package de.kyle.avenue.handler.packet.subscribe;
 
-import de.kyle.avenue.handler.client.ClientConnectionHandler;
+import de.kyle.avenue.handler.client.ClientConnection;
 import de.kyle.avenue.handler.packet.PacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.proto.ClientEnvelope;
@@ -29,17 +29,17 @@ public class SubscribeInboundPacketHandler implements PacketHandler {
     }
 
     @Override
-    public void handle(ClientEnvelope envelope, ClientConnectionHandler clientConnectionHandler) {
+    public void handle(ClientEnvelope envelope, ClientConnection clientConnection) {
         Subscribe subscribe = envelope.getSubscribe();
         String topic = subscribe.getTopic();
         // Register the subscription FIRST so it is guaranteed to exist before the client is
         // told it is active. This establishes the ordering: registration happens-before the
         // ack is enqueued, so a publish the client sends after receiving the ack can never
         // race ahead of its own subscription.
-        topicSubscriptionHandler.subscribeToTopic(topic, clientConnectionHandler);
+        topicSubscriptionHandler.subscribeToTopic(topic, clientConnection);
         // Echo back the exact normalized key the subscription was stored under, so the client
         // can correlate the ack with the topic it asked for.
         String normalizedTopic = topicSubscriptionHandler.normalize(topic);
-        clientConnectionHandler.send(ClientEnvelopes.subscribeAck(normalizedTopic));
+        clientConnection.send(ClientEnvelopes.subscribeAck(normalizedTopic));
     }
 }
