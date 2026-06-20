@@ -40,6 +40,9 @@ public final class AvenueMetrics {
 
     private volatile ScheduledExecutorService reporter;
 
+    /** Optional cluster metrics; folded into the periodic snapshot log when present. */
+    private volatile ClusterMetrics clusterMetrics;
+
     // ------------------------------------------------------------------
     // Counter mutations
     // ------------------------------------------------------------------
@@ -141,6 +144,20 @@ public final class AvenueMetrics {
         return maxOutboundQueueDepth.get();
     }
 
+    /**
+     * Attaches a {@link ClusterMetrics} instance so the periodic snapshot log includes cluster
+     * counters. Optional and null-safe: when clustering is disabled this is never called and the
+     * snapshot simply omits the cluster line.
+     */
+    public void setClusterMetrics(ClusterMetrics clusterMetrics) {
+        this.clusterMetrics = clusterMetrics;
+    }
+
+    /** Returns the attached cluster metrics, or {@code null} if clustering is disabled. */
+    public ClusterMetrics getClusterMetrics() {
+        return clusterMetrics;
+    }
+
     // ------------------------------------------------------------------
     // Periodic reporting
     // ------------------------------------------------------------------
@@ -179,5 +196,14 @@ public final class AvenueMetrics {
                 getActiveConnections(), getTotalConnectionsAccepted(), getConnectionsRejected(),
                 getMessagesPublished(), getMessagesDelivered(), getDroppedMessages(),
                 getSlowConsumerDisconnects(), getSubscriptionCount(), getMaxOutboundQueueDepth());
+
+        ClusterMetrics cluster = this.clusterMetrics;
+        if (cluster != null) {
+            log.info("Avenue cluster metrics | activePeerLinks={} forwarded={} received={} "
+                            + "deduped={} dropped={}",
+                    cluster.getActivePeerLinks(), cluster.getMessagesForwarded(),
+                    cluster.getMessagesReceived(), cluster.getMessagesDeduped(),
+                    cluster.getMessagesDropped());
+        }
     }
 }
