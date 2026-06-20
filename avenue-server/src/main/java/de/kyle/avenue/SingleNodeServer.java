@@ -7,6 +7,7 @@ import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.handler.packet.InboundPacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.AvenueMetrics;
+import de.kyle.avenue.net.NioServerTransport;
 import de.kyle.avenue.net.SocketFactoryProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,9 +59,20 @@ public class SingleNodeServer {
     /** Signals that the server socket has been bound (and {@link #getPort()} is meaningful). */
     private final CountDownLatch boundLatch = new CountDownLatch(1);
 
+    /**
+     * Whether this server runs the NIO selector transport ({@code server.io-mode=nio}) instead of the
+     * blocking accept loop. Resolved once in the constructor: NIO is honoured only when TLS is off
+     * (SSLEngine-over-NIO is future work); with TLS enabled we log a WARN and fall back to blocking so
+     * the TLS path stays on the proven blocking transport.
+     */
+    private final boolean nioMode;
+
     private volatile boolean running;
     private volatile ServerSocket serverSocket;
     private Thread acceptThread;
+
+    /** Non-null only in NIO mode; owns the acceptor + I/O workers. */
+    private volatile NioServerTransport nioTransport;
 
     /**
      * Production constructor: loads the file/env configuration, starts the accept loop and
@@ -116,6 +128,18 @@ public class SingleNodeServer {
                 avenueConfig.getServerTlsKeystorePath(),
                 avenueConfig.getServerTlsKeystorePassword()
         );
+        // Resolve the transport once. NIO is honoured only without TLS: the hand-rolled selector loop
+        // does plaintext framing, and SSLEngine-over-NIO is deliberately out of scope (future work).
+        // With TLS + nio requested we warn and fall back to the blocking transport so the proven TLS
+        // path is unaffected.
+        boolean requestedNio = avenueConfig.isNioIoMode();
+        if (requestedNio && avenueConfig.isServerTlsEnabled()) {
+            log.warn("server.io-mode=nio is not supported together with server.tls.enabled=true "
+                    + "(SSLEngine-over-NIO is future work); falling back to the blocking transport");
+            this.nioMode = false;
+        } else {
+            this.nioMode = requestedNio;
+        }
         Runtime.getRuntime().addShutdownHook(new Thread(this::stop));
     }
 
@@ -135,12 +159,36 @@ public class SingleNodeServer {
     public void start() {
         this.running = true;
         this.metrics.startReporting(avenueConfig.getMetricsLogIntervalSeconds());
+        if (nioMode) {
+            startNio();
+            return;
+        }
         this.acceptThread = new Thread(this::acceptLoop, "avenue-accept-loop");
         this.acceptThread.start();
         try {
             boundLatch.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Boots the NIO selector transport (acceptor + I/O workers) and returns once the server channel
+     * is bound, so {@link #getPort()} is immediately meaningful — same contract as the blocking path.
+     * A bind failure tears the server down, mirroring the blocking accept loop's behaviour.
+     */
+    private void startNio() {
+        try {
+            NioServerTransport transport = new NioServerTransport(
+                    avenueConfig, inboundPacketHandler, topicSubscriptionHandler, metrics);
+            this.nioTransport = transport;
+            transport.start();
+            transport.awaitBound();
+        } catch (IOException e) {
+            log.error("Could not start NIO transport: {}", e.getMessage(), e);
+            stop();
+        } finally {
+            boundLatch.countDown();
         }
     }
 
@@ -220,6 +268,10 @@ public class SingleNodeServer {
      * @return the bound local port, or {@code -1} if the socket is not (yet) bound
      */
     public int getPort() {
+        NioServerTransport transport = this.nioTransport;
+        if (transport != null) {
+            return transport.getPort();
+        }
         ServerSocket socket = this.serverSocket;
         return (socket != null && socket.isBound()) ? socket.getLocalPort() : -1;
     }
@@ -252,6 +304,11 @@ public class SingleNodeServer {
         log.info("Stopping server");
         this.running = false;
         this.metrics.stopReporting();
+        NioServerTransport transport = this.nioTransport;
+        if (transport != null) {
+            // NIO mode: tear down the acceptor + all worker selectors + connections.
+            transport.stop();
+        }
         ServerSocket socket = this.serverSocket;
         if (socket != null && !socket.isClosed()) {
             try {

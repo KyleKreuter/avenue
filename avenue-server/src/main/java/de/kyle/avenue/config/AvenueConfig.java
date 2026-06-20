@@ -63,6 +63,31 @@ public class AvenueConfig {
     /** Default for {@link #inlineDeliveryMaxFanout}. */
     public static final int DEFAULT_INLINE_DELIVERY_MAX_FANOUT = 1024;
 
+    /**
+     * Transport I/O mode for the client-facing port. {@code "blocking"} (default) keeps the
+     * historic thread-per-connection model ({@link de.kyle.avenue.handler.client.ClientConnectionHandler}
+     * on a virtual thread per socket plus a dedicated writer thread). {@code "nio"} switches to the
+     * hand-rolled NIO selector event loop
+     * ({@link de.kyle.avenue.net.NioServerTransport}) that serves thousands of connections with a
+     * small fixed pool of I/O worker threads. Direct-value (test) constructors default to
+     * {@code "blocking"}; only the file/{@code .env} constructor reads {@code server.io-mode}.
+     */
+    private final String serverIoMode;
+
+    /** Default for {@link #serverIoMode}: the historic blocking transport. */
+    public static final String DEFAULT_SERVER_IO_MODE = "blocking";
+
+    /**
+     * Number of NIO I/O worker threads (each with its own {@link java.nio.channels.Selector}) used
+     * when {@link #serverIoMode} is {@code "nio"}. Defaults to
+     * {@link Runtime#availableProcessors()}. Direct-value (test) constructors use the default; only
+     * the file/{@code .env} constructor reads {@code server.nio.io-threads}.
+     */
+    private final int serverNioIoThreads;
+
+    /** Default for {@link #serverNioIoThreads}: one worker per available processor. */
+    public static final int DEFAULT_SERVER_NIO_IO_THREADS = Runtime.getRuntime().availableProcessors();
+
     // -------------------------------------------------------------------------
     // Cluster fields (all optional; cluster is disabled by default)
     // -------------------------------------------------------------------------
@@ -340,6 +365,11 @@ public class AvenueConfig {
         this.serverTcpNoDelay = true;
         this.serverBatchMaxFrames = DEFAULT_SERVER_BATCH_MAX_FRAMES;
         this.inlineDeliveryMaxFanout = DEFAULT_INLINE_DELIVERY_MAX_FANOUT;
+        // Direct-value (test) callers default to the historic blocking transport; only the file/.env
+        // constructor opts into NIO via server.io-mode. This keeps every existing test on the blocking
+        // path unchanged.
+        this.serverIoMode = DEFAULT_SERVER_IO_MODE;
+        this.serverNioIoThreads = DEFAULT_SERVER_NIO_IO_THREADS;
         this.clusterEnabled = clusterEnabled;
         this.nodeId = nodeId;
         this.clusterPort = clusterPort;
@@ -361,6 +391,64 @@ public class AvenueConfig {
         this.clusterTlsKeystorePassword = clusterTlsKeystorePassword != null ? clusterTlsKeystorePassword : "";
         this.clusterTlsTruststorePath = clusterTlsTruststorePath != null ? clusterTlsTruststorePath : "";
         this.clusterTlsTruststorePassword = clusterTlsTruststorePassword != null ? clusterTlsTruststorePassword : "";
+    }
+
+    /**
+     * Copy constructor that overrides only the transport I/O mode and worker count, reusing every
+     * other setting of {@code base}. This lets tests and the benchmark server take a direct-value
+     * config (which always defaults to {@code "blocking"}) and flip it to {@code "nio"} without
+     * threading an extra parameter through all the existing direct-value constructors.
+     *
+     * @param base       the configuration to copy
+     * @param ioMode     the transport I/O mode ({@code "blocking"} or {@code "nio"}; unknown -&gt; blocking)
+     * @param nioThreads the NIO worker-thread count ({@code <= 0} -&gt; {@link #DEFAULT_SERVER_NIO_IO_THREADS})
+     */
+    public AvenueConfig(AvenueConfig base, String ioMode, int nioThreads) {
+        this.packetSize = base.packetSize;
+        this.dropUnknownPackets = base.dropUnknownPackets;
+        this.authenticationSecret = base.authenticationSecret;
+        this.authenticationToken = base.authenticationToken;
+        this.port = base.port;
+        this.outboundQueueCapacity = base.outboundQueueCapacity;
+        this.outboundQueueOfferTimeoutMillis = base.outboundQueueOfferTimeoutMillis;
+        this.serverTcpNoDelay = base.serverTcpNoDelay;
+        this.serverBatchMaxFrames = base.serverBatchMaxFrames;
+        this.inlineDeliveryMaxFanout = base.inlineDeliveryMaxFanout;
+        this.serverIoMode = normalizeIoMode(ioMode);
+        this.serverNioIoThreads = nioThreads > 0 ? nioThreads : DEFAULT_SERVER_NIO_IO_THREADS;
+        this.clusterEnabled = base.clusterEnabled;
+        this.nodeId = base.nodeId;
+        this.clusterPort = base.clusterPort;
+        this.clusterPeers = base.clusterPeers;
+        this.clusterSecret = base.clusterSecret;
+        this.clusterHeartbeatIntervalMs = base.clusterHeartbeatIntervalMs;
+        this.clusterTuning = base.clusterTuning;
+        this.adminConfig = base.adminConfig;
+        this.clientIdleTimeoutMillis = base.clientIdleTimeoutMillis;
+        this.maxConnections = base.maxConnections;
+        this.backpressurePolicy = base.backpressurePolicy;
+        this.metricsLogIntervalSeconds = base.metricsLogIntervalSeconds;
+        this.serverTlsEnabled = base.serverTlsEnabled;
+        this.serverTlsKeystorePath = base.serverTlsKeystorePath;
+        this.serverTlsKeystorePassword = base.serverTlsKeystorePassword;
+        this.clusterTlsEnabled = base.clusterTlsEnabled;
+        this.clusterTlsKeystorePath = base.clusterTlsKeystorePath;
+        this.clusterTlsKeystorePassword = base.clusterTlsKeystorePassword;
+        this.clusterTlsTruststorePath = base.clusterTlsTruststorePath;
+        this.clusterTlsTruststorePassword = base.clusterTlsTruststorePassword;
+    }
+
+    /**
+     * Normalizes a configured I/O mode to one of the two supported values. Any unrecognized,
+     * {@code null} or blank value falls back to {@link #DEFAULT_SERVER_IO_MODE} so a typo can never
+     * silently change the transport.
+     */
+    private static String normalizeIoMode(String raw) {
+        if (raw == null) {
+            return DEFAULT_SERVER_IO_MODE;
+        }
+        String mode = raw.trim().toLowerCase();
+        return mode.equals("nio") ? "nio" : DEFAULT_SERVER_IO_MODE;
     }
 
     public AvenueConfig() throws IOException {
@@ -411,6 +499,19 @@ public class AvenueConfig {
         );
         inlineDeliveryMaxFanout = parsedInlineDeliveryMaxFanout > 0
                 ? parsedInlineDeliveryMaxFanout : DEFAULT_INLINE_DELIVERY_MAX_FANOUT;
+
+        // Transport I/O mode: blocking (default, thread-per-connection) or nio (selector event loop).
+        // Unknown values fall back to blocking so a typo never silently changes the transport.
+        String parsedIoMode = dotenv.get("SERVER_IO_MODE",
+                properties.getProperty("server.io-mode", DEFAULT_SERVER_IO_MODE));
+        serverIoMode = normalizeIoMode(parsedIoMode);
+        String rawNioIoThreads = dotenv.get("SERVER_NIO_IO_THREADS",
+                properties.getProperty("server.nio.io-threads", ""));
+        // Blank = auto (one worker per available processor). A non-positive override also falls back
+        // to the default so a misconfiguration never starts the event loop with zero workers.
+        int parsedNioIoThreads = (rawNioIoThreads == null || rawNioIoThreads.isBlank())
+                ? DEFAULT_SERVER_NIO_IO_THREADS : Integer.parseInt(rawNioIoThreads.trim());
+        serverNioIoThreads = parsedNioIoThreads > 0 ? parsedNioIoThreads : DEFAULT_SERVER_NIO_IO_THREADS;
 
         // Cluster settings — all optional, clustering is off by default.
         clusterEnabled = Boolean.parseBoolean(
@@ -706,6 +807,27 @@ public class AvenueConfig {
      */
     public int getInlineDeliveryMaxFanout() {
         return inlineDeliveryMaxFanout;
+    }
+
+    /**
+     * Transport I/O mode for the client-facing port: {@code "blocking"} (default,
+     * thread-per-connection) or {@code "nio"} (selector event loop). Never {@code null}.
+     */
+    public String getServerIoMode() {
+        return serverIoMode;
+    }
+
+    /** Returns {@code true} if the NIO selector transport is selected ({@code server.io-mode=nio}). */
+    public boolean isNioIoMode() {
+        return "nio".equals(serverIoMode);
+    }
+
+    /**
+     * Number of NIO I/O worker threads (each with its own selector) used in {@code nio} mode.
+     * Defaults to {@link Runtime#availableProcessors()}.
+     */
+    public int getServerNioIoThreads() {
+        return serverNioIoThreads;
     }
 
     // -------------------------------------------------------------------------
