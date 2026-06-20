@@ -89,15 +89,42 @@ CSV: `4,4,64,107941,434893,25.876,271.672,311.846,322.582,4000000`
 > arbeitet und die hohen 50k-Zahlen tatsaechlich die Saettigungsgrenze des aktuellen Hot-Paths
 > markieren.
 
-## Stufen-Fortschritt
+## Nordstern-Metrik: 1:1, ~100 B, Durchsatz bei p99 < 1 ms
 
-Folgestufen tragen ihre Zahlen hier nach (gleiche Topologie `4/4/64`; Latenz aus dem
-50k-Lauf, damit die Stufen am selben Saettigungs-Arbeitspunkt vergleichbar sind).
+Die Delivery-Rate mit Fan-out ist eine Vanity-Zahl (durch mehr Subscriber beliebig aufblasbar).
+Die **echte, Redis-vergleichbare** Metrik ist **1 Publisher -> 1 Subscriber (Fan-out 1)**, ~100 B,
+gemessen als **Publishes/s bei p99 < 1 ms**. Bei Fan-out 1 sind Publish- und Delivery-Rate
+identisch — keine Mehrdeutigkeit.
 
-| Stufe | Publish (msg/s) | Delivery (msg/s) | p50 (ms) | p99 (ms) |
+Gemessen (`publishers=1 subscribers=1 topics=1 msgSize=100`):
+
+| Last (1:1) | Publish/s | p50 (ms) | p99 (ms) | p999 (ms) |
 | --- | --- | --- | --- | --- |
-| 0 — Baseline | 156 087 | 378 024 | 25.876 | 271.672 |
-| 1 — Mechanische Hot-Path-Wins | | | | |
-| 2 — Protokoll-Pipelining / Batched Publish | | | | |
-| 3 — Event-Loop-IO-Rewrite | | | | |
-| 4 — Allokations-/GC-Disziplin | | | | |
+| Saettigung (`rate=0`) | **253 556** | — | — | — |
+| 20 000/s | 19 953 | 0.033 | 0.081 | 1.313 |
+| 50 000/s | 49 905 | 0.034 | 0.090 | 0.286 |
+| 80 000/s | 79 460 | 0.038 | 0.106 | 1.135 |
+| 120 000/s | 119 168 | 0.046 | **0.114** | 0.301 |
+
+**Erkenntnis:** Latenz ist NICHT das Problem — p99 bleibt bis 120 k/s bei ~0.1 ms (10x Reserve zur
+1-ms-Schranke; die p999-Ausreisser ~1 ms sind GC -> Stufe 4). Der einzige echte Hebel ist der
+**Durchsatz-Deckel von ~253 k/s = ~3.9 us pro Nachricht** durch die Pipe.
+
+**Ziel (Redis-Liga):** ~1M msg/s 1:1 bei p99 < 1 ms = **~1 us/Nachricht**. Heutige Luecke: **~4x
+Durchsatz**, bei bereits vorhandener Latenz-Reserve.
+
+## Stufen-Fortschritt (Nordstern: 1:1, 100 B)
+
+Folgestufen tragen die 1:1-Headline hier nach: Saettigungs-Durchsatz, der p99 bei einem festen
+Arbeitspunkt (`rate=120000`), und die abgeleiteten ns/Nachricht (= 1e9 / Saettigungsrate).
+
+| Stufe | 1:1 Saettigung (msg/s) | ns/msg | p99 @120k (ms) |
+| --- | --- | --- | --- |
+| 0 — Baseline | 253 556 | ~3944 | 0.114 |
+| 1 — Mechanische Hot-Path-Wins | | | |
+| 2 — Protokoll-Pipelining / Batched Publish | | | |
+| 3 — Event-Loop-IO-Rewrite | | | |
+| 4 — Allokations-/GC-Disziplin | | | |
+
+> Zusatz-Diagnose (kein Erfolgskriterium): die Fan-out-4-Werte aus dem 50k-Lauf oben bleiben als
+> Sekundaermessung erhalten, um Fan-out-Skalierung zu beobachten.
