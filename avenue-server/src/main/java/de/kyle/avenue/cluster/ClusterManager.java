@@ -15,11 +15,7 @@ import de.kyle.avenue.config.ClusterTuning;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.ClusterMetrics;
 import de.kyle.avenue.net.SocketFactoryProvider;
-import de.kyle.avenue.packet.cluster.ClusterInterestPacket;
-import de.kyle.avenue.packet.cluster.ClusterInterestSyncPacket;
-import de.kyle.avenue.packet.cluster.ClusterPublishPacket;
-import de.kyle.avenue.packet.cluster.ClusterResumePacket;
-import de.kyle.avenue.packet.cluster.SwimJoinPacket;
+import de.kyle.avenue.proto.ClusterEnvelope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -67,8 +63,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li><b>Interest propagation.</b> A local {@link TopicSubscriptionHandler.InterestListener} fires
  *       on the first/last local subscription of a topic. Each transition bumps a monotonic
  *       {@link #interestVersion}, updates {@link #localInterest}, and floods a best-effort
- *       {@link ClusterInterestPacket} delta to all peers. A periodic full-state
- *       {@link ClusterInterestSyncPacket} (anti-entropy) heals any lost delta. A new link also gets
+ *       {@code ClusterInterestPacket} delta to all peers. A periodic full-state
+ *       {@code ClusterInterestSyncPacket} (anti-entropy) heals any lost delta. A new link also gets
  *       an immediate full-state sync on connect.</li>
  *   <li><b>Receiving-side reliability split.</b> {@link #linkTrackers} tracks contiguous
  *       {@code linkSeq} per <em>sending</em> peer (drives ACK / resume / gap), while
@@ -293,8 +289,8 @@ public class ClusterManager implements ClusterForwarder {
         boolean flood = isInBroadcastGrace(topic);
 
         long originSeq = originSequencer.nextSeq();
-        ClusterPublishPacket base = new ClusterPublishPacket(
-                topic, source, config.getNodeId(), originSequencer.epoch(), originSeq, data);
+        String originNodeId = config.getNodeId();
+        long originEpoch = originSequencer.epoch();
 
         long skipped = 0;
         for (var targetEntry : targets.entrySet()) {
@@ -309,9 +305,13 @@ public class ClusterManager implements ClusterForwarder {
                 }
                 continue;
             }
-            // Assign this target's own dense reliability sequence and serialize the frame for it.
+            // Assign this target's own dense reliability sequence and serialize the ClusterPublish
+            // envelope for it. The origin identity (originNodeId, originEpoch, originSeq) is shared
+            // across all targets for dedup; only linkSeq differs per target, so the envelope must be
+            // built (and serialized) per target — same O(N) shape as the JSON path it replaces.
             long linkSeq = target.nextLinkSeq();
-            byte[] payload = PeerLink.serializeEnvelope(base.withLinkSeq(linkSeq));
+            byte[] payload = PeerLink.serializeEnvelope(ClusterEnvelopes.publish(
+                    topic, source, originNodeId, originEpoch, originSeq, linkSeq, data));
             ReplayBuffer.Entry entry = new ReplayBuffer.Entry(linkSeq, payload);
             if (target.ingest.offer(entry)) {
                 clusterMetrics.incrementMessagesForwarded();
@@ -341,7 +341,7 @@ public class ClusterManager implements ClusterForwarder {
         long version = interestVersion.incrementAndGet();
         openBroadcastGrace(topic);
 
-        ClusterInterestPacket delta = new ClusterInterestPacket(
+        ClusterEnvelope delta = ClusterEnvelopes.interest(
                 config.getNodeId(), version, added ? "ADD" : "REMOVE", topic);
         for (PeerLink link : activePeers.values()) {
             if (link.enqueueControl(delta)) {
@@ -350,11 +350,11 @@ public class ClusterManager implements ClusterForwarder {
         }
     }
 
-    /** Builds the full local interest snapshot for an initial / periodic anti-entropy sync. */
-    private ClusterInterestSyncPacket buildInterestSync() {
+    /** Builds the full local interest snapshot envelope for an initial / periodic anti-entropy sync. */
+    private ClusterEnvelope buildInterestSync() {
         // Snapshot under the current version. A concurrent change bumps the version again and sends
         // its own delta + the next periodic sync, so a momentarily stale snapshot self-heals.
-        return new ClusterInterestSyncPacket(
+        return ClusterEnvelopes.interestSync(
                 config.getNodeId(), interestVersion.get(), Set.copyOf(localInterest));
     }
 
@@ -367,7 +367,7 @@ public class ClusterManager implements ClusterForwarder {
                 if (activePeers.isEmpty()) {
                     continue;
                 }
-                ClusterInterestSyncPacket sync = buildInterestSync();
+                ClusterEnvelope sync = buildInterestSync();
                 for (PeerLink link : activePeers.values()) {
                     if (link.enqueueControl(sync)) {
                         clusterMetrics.incrementInterestUpdatesSent();
@@ -687,7 +687,7 @@ public class ClusterManager implements ClusterForwarder {
 
     /**
      * Bootstraps cluster membership via a static seed: connect + HMAC handshake, build the live
-     * {@link PeerLink}, register the seed as ALIVE, then send a {@link SwimJoinPacket} over the link.
+     * {@link PeerLink}, register the seed as ALIVE, then send a {@code SwimJoinPacket} over the link.
      * The seed replies with a {@code SwimJoinAckPacket} (full member list) which the SWIM layer merges,
      * firing onAlive for every discovered member so the {@link #supervisedConnectLoop} connects out to
      * them. Once joined, this seed link is an ordinary peer link; the loop only re-arms if it drops.
@@ -770,7 +770,7 @@ public class ClusterManager implements ClusterForwarder {
 
     /**
      * Connects to {@code host:port}, performs the HMAC handshake, builds + starts the {@link PeerLink},
-     * registers the peer as ALIVE and (when {@code sendJoin}) sends a {@link SwimJoinPacket}. Returns
+     * registers the peer as ALIVE and (when {@code sendJoin}) sends a {@code SwimJoinPacket}. Returns
      * the remote node id of the established link, or {@code null} if the connection was a tie-break
      * yield / duplicate (no link built).
      */
@@ -804,7 +804,7 @@ public class ClusterManager implements ClusterForwarder {
         ClusterEvents.peerConnected(remoteNodeId, host, port);
 
         if (sendJoin && swimMembership != null) {
-            link.enqueueControl(new SwimJoinPacket(
+            link.enqueueControl(ClusterEnvelopes.swimJoin(
                     config.getNodeId(), advertisedHost(), getClusterPort(),
                     swimMembership.getLocalIncarnation()));
         }

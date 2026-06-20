@@ -4,7 +4,7 @@ package de.kyle.avenue.cluster;
  * Functional interface for forwarding a local publish event to cluster peers.
  * <p>
  * The implementation (provided by {@link ClusterManager}) is responsible for stamping the
- * {@code originNodeId} and building the {@link de.kyle.avenue.packet.cluster.ClusterPublishPacket}.
+ * {@code originNodeId} and building the {@code ClusterPublish}.
  * The caller (the publish handler) only supplies the message fields it already knows.
  * <p>
  * The NOOP singleton is used when clustering is disabled, so the publish handler never

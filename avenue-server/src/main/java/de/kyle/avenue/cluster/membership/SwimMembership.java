@@ -1,15 +1,10 @@
 package de.kyle.avenue.cluster.membership;
 
+import de.kyle.avenue.cluster.ClusterEnvelopes;
 import de.kyle.avenue.cluster.PeerLink;
 import de.kyle.avenue.cluster.events.ClusterEvents;
 import de.kyle.avenue.config.ClusterTuning;
 import de.kyle.avenue.metrics.ClusterMetrics;
-import de.kyle.avenue.packet.cluster.SwimAckPacket;
-import de.kyle.avenue.packet.cluster.SwimJoinAckPacket;
-import de.kyle.avenue.packet.cluster.SwimLeavePacket;
-import de.kyle.avenue.packet.cluster.SwimPingPacket;
-import de.kyle.avenue.packet.cluster.SwimPingReqAckPacket;
-import de.kyle.avenue.packet.cluster.SwimPingReqPacket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -39,7 +34,7 @@ import java.util.function.Function;
  *   <li><b>Refute</b>: a SUSPECT/DEAD gossiped about the <em>local</em> node bumps the local
  *       incarnation and re-gossips ALIVE, defeating false positives and restart ghosts.</li>
  *   <li><b>Join/Leave</b>: {@link #handleJoin}/{@link #handleJoinAck} bootstrap discovery; a graceful
- *       {@link #stop()} floods a {@link SwimLeavePacket} so peers converge to LEFT almost immediately.</li>
+ *       {@link #stop()} floods a {@code SwimLeave} so peers converge to LEFT almost immediately.</li>
  * </ul>
  * The {@link #onLinkClosed(String)} hook lets the transport's heartbeat watchdog be the first line of
  * failure detection: a broken TCP link immediately marks the peer SUSPECT.
@@ -123,7 +118,7 @@ public final class SwimMembership implements SwimMessageSink {
     }
 
     /**
-     * Graceful leave: bump incarnation, flood a {@link SwimLeavePacket} to all connected peers and
+     * Graceful leave: bump incarnation, flood a {@code SwimLeave} to all connected peers and
      * give it a brief moment to propagate before the caller tears the links down.
      */
     public void stop() {
@@ -132,7 +127,7 @@ public final class SwimMembership implements SwimMessageSink {
         }
         running = false;
         long inc = localIncarnation.incrementAndGet();
-        SwimLeavePacket leave = new SwimLeavePacket(localNodeId, inc);
+        de.kyle.avenue.proto.ClusterEnvelope leave = ClusterEnvelopes.swimLeave(localNodeId, inc);
         for (Member m : registry.aliveMembers()) {
             PeerLink link = linkLookup.apply(m.getNodeId());
             if (link != null) {
@@ -195,7 +190,7 @@ public final class SwimMembership implements SwimMessageSink {
                 pendingProbes.remove(seq);
                 return;
             }
-            link.enqueueControl(new SwimPingPacket(seq, drainGossip()));
+            link.enqueueControl(ClusterEnvelopes.swimPing(seq, drainGossip()));
             metrics.incrementGossipMessagesSent();
 
             if (awaitProbe(future, tuning.swimProbeTimeoutMs())) {
@@ -208,7 +203,7 @@ public final class SwimMembership implements SwimMessageSink {
                 for (Member helper : helpers) {
                     PeerLink hlink = linkLookup.apply(helper.getNodeId());
                     if (hlink != null) {
-                        hlink.enqueueControl(new SwimPingReqPacket(targetId, seq, drainGossip()));
+                        hlink.enqueueControl(ClusterEnvelopes.swimPingReq(targetId, seq, drainGossip()));
                         metrics.incrementIndirectProbesSent();
                         metrics.incrementGossipMessagesSent();
                     }
@@ -317,7 +312,7 @@ public final class SwimMembership implements SwimMessageSink {
         // Reply with an ack carrying our hot gossip.
         PeerLink link = linkLookup.apply(fromNodeId);
         if (link != null) {
-            link.enqueueControl(new SwimAckPacket(seqNo, drainGossip()));
+            link.enqueueControl(ClusterEnvelopes.swimAck(seqNo, drainGossip()));
             metrics.incrementGossipMessagesSent();
         }
     }
@@ -341,7 +336,7 @@ public final class SwimMembership implements SwimMessageSink {
         long helperSeq = swimSeq.incrementAndGet();
         CompletableFuture<Void> future = new CompletableFuture<>();
         pendingProbes.put(helperSeq, future);
-        targetLink.enqueueControl(new SwimPingPacket(helperSeq, drainGossip()));
+        targetLink.enqueueControl(ClusterEnvelopes.swimPing(helperSeq, drainGossip()));
         metrics.incrementGossipMessagesSent();
         // Wait for the target's ack on a short-lived virtual thread, then relay a ping-req-ack.
         Thread.ofVirtual().name("swim-pingreq-helper").start(() -> {
@@ -350,7 +345,7 @@ public final class SwimMembership implements SwimMessageSink {
                 if (ok) {
                     PeerLink back = linkLookup.apply(fromNodeId);
                     if (back != null) {
-                        back.enqueueControl(new SwimPingReqAckPacket(targetNodeId, seqNo, drainGossip()));
+                        back.enqueueControl(ClusterEnvelopes.swimPingReqAck(targetNodeId, seqNo, drainGossip()));
                         metrics.incrementGossipMessagesSent();
                     }
                 }
@@ -378,7 +373,7 @@ public final class SwimMembership implements SwimMessageSink {
         // known incarnation, if we have a stale record for it).
         PeerLink link = linkLookup.apply(fromNodeId);
         if (link != null) {
-            link.enqueueControl(new SwimJoinAckPacket(fullMemberSnapshot()));
+            link.enqueueControl(ClusterEnvelopes.swimJoinAck(fullMemberSnapshot()));
             metrics.incrementGossipMessagesSent();
         }
     }

@@ -4,24 +4,22 @@ import de.kyle.avenue.cluster.events.ClusterEvents;
 import de.kyle.avenue.cluster.membership.SwimMessageSink;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
 import de.kyle.avenue.metrics.ClusterMetrics;
-import de.kyle.avenue.packet.Packet;
-import de.kyle.avenue.packet.cluster.ClusterAckPacket;
-import de.kyle.avenue.packet.cluster.ClusterGapPacket;
-import de.kyle.avenue.packet.cluster.ClusterHeartbeatPacket;
-import de.kyle.avenue.packet.cluster.ClusterInterestPacket;
-import de.kyle.avenue.packet.cluster.ClusterInterestSyncPacket;
-import de.kyle.avenue.packet.cluster.ClusterPublishPacket;
-import de.kyle.avenue.packet.cluster.ClusterResumePacket;
-import de.kyle.avenue.packet.cluster.SwimAckPacket;
-import de.kyle.avenue.packet.cluster.SwimJoinAckPacket;
-import de.kyle.avenue.packet.cluster.SwimJoinPacket;
-import de.kyle.avenue.packet.cluster.SwimLeavePacket;
-import de.kyle.avenue.packet.cluster.SwimPingPacket;
-import de.kyle.avenue.packet.cluster.SwimPingReqAckPacket;
-import de.kyle.avenue.packet.cluster.SwimPingReqPacket;
 import de.kyle.avenue.packet.publish.PublishMessageOutboundPacket;
+import de.kyle.avenue.proto.ClusterAck;
+import de.kyle.avenue.proto.ClusterEnvelope;
+import de.kyle.avenue.proto.ClusterGap;
+import de.kyle.avenue.proto.ClusterInterest;
+import de.kyle.avenue.proto.ClusterInterestSync;
+import de.kyle.avenue.proto.ClusterPublish;
+import de.kyle.avenue.proto.ClusterResume;
+import de.kyle.avenue.proto.SwimAck;
+import de.kyle.avenue.proto.SwimJoin;
+import de.kyle.avenue.proto.SwimLeave;
+import de.kyle.avenue.proto.SwimPing;
+import de.kyle.avenue.proto.SwimPingReq;
+import de.kyle.avenue.proto.SwimPingReqAck;
 import de.kyle.avenue.serialization.PacketFraming;
-import org.json.JSONObject;
+import de.kyle.avenue.serialization.WireCodec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,8 +29,6 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketException;
-import java.nio.charset.StandardCharsets;
-import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -42,6 +38,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Manages a single peer-to-peer cluster link over a TCP socket, with Phase C at-least-once
  * delivery layered on top of the Phase A transport and Phase D interest-based routing on top of
  * that.
+ * <p>
+ * Wire format (Step 2 of the JSON-&gt;protobuf migration): the 4-byte length framing
+ * ({@link PacketFraming}) is unchanged, but each frame's payload is now a serialized
+ * {@link ClusterEnvelope} (protobuf) instead of a UTF-8 JSON {@code {"header","body"}} object.
+ * Dispatch switches on the envelope's {@code oneof} case ({@link ClusterEnvelope#getMsgCase()})
+ * rather than a {@code header.name} string.
  * <p>
  * A {@code PeerLink} is created around an already-authenticated socket (handshake performed by
  * {@link ClusterHandshake}). It owns virtual threads:
@@ -55,7 +57,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       and writes them. It also drains a small control-frame queue (heartbeat / ack / resume /
  *       gap / backfill / interest) so those interleave with live publishes.</li>
  *   <li><b>Heartbeat sender</b> – periodically enqueues a heartbeat control frame.</li>
- *   <li><b>ACK sender</b> – periodically sends a cumulative {@link ClusterAckPacket} with the
+ *   <li><b>ACK sender</b> – periodically sends a cumulative {@link ClusterAck} with the
  *       receiving-side contiguous high-water mark, but only when it advanced (no idle spam).</li>
  * </ul>
  * <h2>Phase D — per-link reliability sequence</h2>
@@ -130,7 +132,7 @@ public class PeerLink {
 
         /**
          * Applies a received interest update (delta) from a peer to the routing table. Called for
-         * {@link ClusterInterestPacket}s arriving on this link.
+         * {@link ClusterInterest} envelopes arriving on this link.
          */
         void onInterestDelta(String nodeId, long version, String op, String topic);
 
@@ -163,8 +165,8 @@ public class PeerLink {
     private final ClusterMetrics metrics;
     private final Clock clock;
     private final Runnable onClose;
-    /** Supplies the full interest-state sync to send on link-up and never block the caller. */
-    private final java.util.function.Supplier<ClusterInterestSyncPacket> interestSyncSupplier;
+    /** Supplies the full interest-state sync envelope to send on link-up and never block the caller. */
+    private final java.util.function.Supplier<ClusterEnvelope> interestSyncSupplier;
 
     /**
      * Phase E — receiving-side SWIM membership sink. Nullable (single-node / cluster-disabled). Set
@@ -190,7 +192,7 @@ public class PeerLink {
      * the contiguous frontier, awaiting their predecessors. Touched only by the single reader
      * thread, so no lock is needed. Empty (and unused) in the default non-strict mode.
      */
-    private final java.util.TreeMap<Long, ClusterPublishPacket> strictPending = new java.util.TreeMap<>();
+    private final java.util.TreeMap<Long, ClusterPublish> strictPending = new java.util.TreeMap<>();
 
     /**
      * Full constructor with an injectable {@link Clock} for the heartbeat watchdog.
@@ -210,7 +212,7 @@ public class PeerLink {
             BlockingQueue<ReplayBuffer.Entry> ingestQueue,
             ClusterMetrics metrics,
             Clock clock,
-            java.util.function.Supplier<ClusterInterestSyncPacket> interestSyncSupplier,
+            java.util.function.Supplier<ClusterEnvelope> interestSyncSupplier,
             Runnable onClose
     ) throws IOException {
         this.socket = socket;
@@ -263,12 +265,12 @@ public class PeerLink {
         return running.get();
     }
 
-    /** Enqueues an arbitrary control packet (e.g. an interest delta/sync) for the writer to send. */
-    public boolean enqueueControl(Packet packet) {
+    /** Enqueues an arbitrary control envelope (e.g. an interest delta/sync, SWIM packet) to send. */
+    public boolean enqueueControl(ClusterEnvelope envelope) {
         if (!running.get()) {
             return false;
         }
-        return controlQueue.offer(new OutboundItem.ControlFrame(packet));
+        return controlQueue.offer(new OutboundItem.ControlFrame(envelope));
     }
 
     /**
@@ -315,8 +317,11 @@ public class PeerLink {
                     log.warn("Invalid frame from peer {}: {}", remoteNodeId, e.getMessage());
                     break;
                 }
-                JSONObject envelope = safeParseJson(frame);
-                if (envelope == null) {
+                ClusterEnvelope envelope;
+                try {
+                    envelope = WireCodec.decodeCluster(frame, maxPacketSize);
+                } catch (IllegalArgumentException e) {
+                    log.warn("Malformed cluster envelope from peer {}: {}", remoteNodeId, e.getMessage());
                     continue;
                 }
                 dispatch(envelope);
@@ -330,48 +335,31 @@ public class PeerLink {
         }
     }
 
-    private JSONObject safeParseJson(byte[] frame) {
-        try {
-            return new JSONObject(new String(frame, StandardCharsets.UTF_8));
-        } catch (Exception e) {
-            log.warn("Malformed JSON frame from peer {}", remoteNodeId);
-            return null;
+    /** Dispatches a decoded envelope on its {@code oneof} case (replaces the JSON header.name switch). */
+    private void dispatch(ClusterEnvelope env) {
+        switch (env.getMsgCase()) {
+            case CLUSTER_PUBLISH -> handleClusterPublish(env.getClusterPublish());
+            case HEARTBEAT -> lastHeartbeatNanos = clock.nanoTime();
+            case CLUSTER_ACK -> handleAck(env.getClusterAck());
+            case CLUSTER_RESUME -> handleResume(env.getClusterResume());
+            case CLUSTER_GAP -> handleGap(env.getClusterGap());
+            case CLUSTER_INTEREST -> handleInterest(env.getClusterInterest());
+            case CLUSTER_INTEREST_SYNC -> handleInterestSync(env.getClusterInterestSync());
+            case SWIM_PING -> handleSwimPing(env.getSwimPing());
+            case SWIM_ACK -> handleSwimAck(env.getSwimAck());
+            case SWIM_PING_REQ -> handleSwimPingReq(env.getSwimPingReq());
+            case SWIM_PING_REQ_ACK -> handleSwimPingReqAck(env.getSwimPingReqAck());
+            case SWIM_JOIN -> handleSwimJoin(env.getSwimJoin());
+            case SWIM_JOIN_ACK -> handleSwimJoinAck(env.getSwimJoinAck());
+            case SWIM_LEAVE -> handleSwimLeave(env.getSwimLeave());
+            // Auth envelopes only occur during the handshake (handled by ClusterHandshake); on a live
+            // link they are unexpected, as is MSG_NOT_SET — ignore both rather than drop the link.
+            default -> log.debug("Ignoring cluster envelope case {} from peer {}",
+                    env.getMsgCase(), remoteNodeId);
         }
     }
 
-    private void dispatch(JSONObject envelope) {
-        JSONObject header = envelope.optJSONObject("header");
-        if (header == null) {
-            return;
-        }
-        String name = header.optString("name", "");
-        switch (name) {
-            case "ClusterPublishPacket" -> handleClusterPublish(envelope);
-            case "ClusterHeartbeatPacket" -> lastHeartbeatNanos = clock.nanoTime();
-            case "ClusterAckPacket" -> handleAck(envelope);
-            case "ClusterResumePacket" -> handleResume(envelope);
-            case "ClusterGapPacket" -> handleGap(envelope);
-            case "ClusterInterestPacket" -> handleInterest(envelope);
-            case "ClusterInterestSyncPacket" -> handleInterestSync(envelope);
-            case "SwimPingPacket" -> handleSwimPing(envelope);
-            case "SwimAckPacket" -> handleSwimAck(envelope);
-            case "SwimPingReqPacket" -> handleSwimPingReq(envelope);
-            case "SwimPingReqAckPacket" -> handleSwimPingReqAck(envelope);
-            case "SwimJoinPacket" -> handleSwimJoin(envelope);
-            case "SwimJoinAckPacket" -> handleSwimJoinAck(envelope);
-            case "SwimLeavePacket" -> handleSwimLeave(envelope);
-            default -> log.debug("Unknown cluster packet '{}' from peer {}, ignoring", name, remoteNodeId);
-        }
-    }
-
-    private void handleClusterPublish(JSONObject envelope) {
-        ClusterPublishPacket packet;
-        try {
-            packet = ClusterPublishPacket.fromJson(envelope);
-        } catch (Exception e) {
-            log.warn("Malformed ClusterPublishPacket from peer {}: {}", remoteNodeId, e.getMessage());
-            return;
-        }
+    private void handleClusterPublish(ClusterPublish packet) {
         // RELIABILITY first, over the dense per-link linkSeq: this is the contiguous wire stream the
         // ACK/backfill machinery tracks. A linkSeq we have already seen (a re-sent backfill frame, or
         // a frame already covered) is a wire duplicate and must not advance anything twice.
@@ -395,7 +383,7 @@ public class PeerLink {
     }
 
     /** Non-strict: deliver immediately; the origin tracker drops logical duplicates. */
-    private void deliverIfNew(String originKey, ClusterPublishPacket packet) {
+    private void deliverIfNew(String originKey, ClusterPublish packet) {
         if (!receiver.acceptOrigin(originKey, packet.getSeq())) {
             metrics.incrementMessagesDeduped();
             log.debug("Dropping duplicate origin={} seq={} from peer {}",
@@ -410,7 +398,7 @@ public class PeerLink {
      * the link's contiguous frontier reaches them, so subscribers see an in-order stream. Logical
      * dedup over the origin identity still applies at delivery time.
      */
-    private void handlePublishStrict(String originKey, ClusterPublishPacket packet, boolean newOnWire) {
+    private void handlePublishStrict(String originKey, ClusterPublish packet, boolean newOnWire) {
         long linkSeq = packet.getLinkSeq();
         if (!newOnWire) {
             // Already accepted on the wire (duplicate/backfill): nothing to buffer.
@@ -435,11 +423,11 @@ public class PeerLink {
     private void flushStrictPending() {
         while (true) {
             long next = receiver.contiguousLinkSeq(remoteNodeId);
-            ClusterPublishPacket head = strictPending.get(next);
+            ClusterPublish head = strictPending.get(next);
             if (head == null) {
                 // The contiguous frontier sits at `next`; the entry that fills `next` may itself be
                 // pending under its own linkSeq. Deliver any pending entry whose linkSeq <= frontier.
-                java.util.Map.Entry<Long, ClusterPublishPacket> first = strictPending.firstEntry();
+                java.util.Map.Entry<Long, ClusterPublish> first = strictPending.firstEntry();
                 if (first == null || first.getKey() > next) {
                     break;
                 }
@@ -454,7 +442,7 @@ public class PeerLink {
         }
     }
 
-    private void deliver(ClusterPublishPacket packet) {
+    private void deliver(ClusterPublish packet) {
         metrics.incrementMessagesReceived();
         PublishMessageOutboundPacket outbound = new PublishMessageOutboundPacket(
                 packet.getTopic(), packet.getData(), packet.getSource());
@@ -462,38 +450,24 @@ public class PeerLink {
     }
 
     /** Cumulative ACK from the remote: evict everything up to the acked {@code linkSeq} from our ring. */
-    private void handleAck(JSONObject envelope) {
-        ClusterAckPacket ack;
-        try {
-            ack = ClusterAckPacket.fromJson(envelope);
-        } catch (Exception e) {
-            log.warn("Malformed ClusterAckPacket from peer {}: {}", remoteNodeId, e.getMessage());
-            return;
-        }
+    private void handleAck(ClusterAck ack) {
         metrics.incrementAcksReceived();
         // The reliability identity for our outbound ring is THIS link (localNodeId -> remoteNodeId).
         // The peer echoes our local node id; any matching ack advances the ring head over linkSeq.
-        for (ClusterAckPacket.Ack a : ack.getAcks()) {
-            if (a.originNodeId().equals(localNodeId)) {
-                replayBuffer.ackUpTo(a.ackedSeq());
+        for (ClusterAck.AckEntry a : ack.getAcksList()) {
+            if (a.getOriginNodeId().equals(localNodeId)) {
+                replayBuffer.ackUpTo(a.getAckedSeq());
             }
         }
     }
 
     /** Remote (the receiver) tells us where to resume; backfill from our replay buffer over linkSeq. */
-    private void handleResume(JSONObject envelope) {
-        ClusterResumePacket resume;
-        try {
-            resume = ClusterResumePacket.fromJson(envelope);
-        } catch (Exception e) {
-            log.warn("Malformed ClusterResumePacket from peer {}: {}", remoteNodeId, e.getMessage());
-            return;
-        }
+    private void handleResume(ClusterResume resume) {
         boolean handled = false;
-        for (ClusterResumePacket.Resume r : resume.getResumes()) {
+        for (ClusterResume.ResumeEntry r : resume.getResumeList()) {
             // We only sourced frames over this link with reliability identity == localNodeId.
-            if (r.originNodeId().equals(localNodeId)) {
-                backfill(r.lastContiguousSeq());
+            if (r.getOriginNodeId().equals(localNodeId)) {
+                backfill(r.getLastContiguousSeq());
                 handled = true;
             }
         }
@@ -505,18 +479,18 @@ public class PeerLink {
 
     /**
      * Re-sends every buffered entry beyond {@code lastContiguousLinkSeq}, or signals a
-     * {@link ClusterGapPacket} when the requested range has been evicted.
+     * {@link ClusterGap} when the requested range has been evicted.
      */
     private void backfill(long lastContiguousLinkSeq) {
         ReplayBuffer.ReplayResult result = replayBuffer.replayFrom(lastContiguousLinkSeq);
         if (result.gap()) {
             ClusterEvents.gap(remoteNodeId, result.firstAvailableSeq());
             metrics.incrementClusterGapEvents();
-            controlQueue.offer(new OutboundItem.ControlFrame(new ClusterGapPacket(
+            controlQueue.offer(new OutboundItem.ControlFrame(ClusterEnvelopes.gap(
                     localNodeId, localNodeId, localEpoch, result.firstAvailableSeq())));
             return;
         }
-        List<ReplayBuffer.Entry> entries = result.entries();
+        java.util.List<ReplayBuffer.Entry> entries = result.entries();
         if (entries.isEmpty()) {
             return;
         }
@@ -529,14 +503,7 @@ public class PeerLink {
     }
 
     /** Remote signalled that frames we expected are unrecoverable; resync the link frontier forward. */
-    private void handleGap(JSONObject envelope) {
-        ClusterGapPacket gap;
-        try {
-            gap = ClusterGapPacket.fromJson(envelope);
-        } catch (Exception e) {
-            log.warn("Malformed ClusterGapPacket from peer {}: {}", remoteNodeId, e.getMessage());
-            return;
-        }
+    private void handleGap(ClusterGap gap) {
         long newContiguous = gap.getFirstAvailableSeq() - 1;
         ClusterEvents.dataLoss(remoteNodeId, newContiguous);
         receiver.resetLinkTo(remoteNodeId, newContiguous);
@@ -557,124 +524,78 @@ public class PeerLink {
     // Interest handling (Phase D, receiving side)
     // -------------------------------------------------------------------------
 
-    private void handleInterest(JSONObject envelope) {
-        ClusterInterestPacket interest;
-        try {
-            interest = ClusterInterestPacket.fromJson(envelope);
-        } catch (Exception e) {
-            log.warn("Malformed ClusterInterestPacket from peer {}: {}", remoteNodeId, e.getMessage());
-            return;
-        }
+    private void handleInterest(ClusterInterest interest) {
         metrics.incrementInterestUpdatesReceived();
         receiver.onInterestDelta(interest.getNodeId(), interest.getInterestVersion(),
                 interest.getOp(), interest.getTopic());
     }
 
-    private void handleInterestSync(JSONObject envelope) {
-        ClusterInterestSyncPacket sync;
-        try {
-            sync = ClusterInterestSyncPacket.fromJson(envelope);
-        } catch (Exception e) {
-            log.warn("Malformed ClusterInterestSyncPacket from peer {}: {}", remoteNodeId, e.getMessage());
-            return;
-        }
+    private void handleInterestSync(ClusterInterestSync sync) {
         metrics.incrementInterestUpdatesReceived();
-        receiver.onInterestSync(sync.getNodeId(), sync.getInterestVersion(), sync.getTopics());
+        receiver.onInterestSync(sync.getNodeId(), sync.getInterestVersion(),
+                new java.util.LinkedHashSet<>(sync.getTopicsList()));
     }
 
     // -------------------------------------------------------------------------
     // SWIM membership handling (Phase E, receiving side)
     // -------------------------------------------------------------------------
 
-    private void handleSwimPing(JSONObject envelope) {
+    private void handleSwimPing(SwimPing p) {
         SwimMessageSink sink = swimSink;
         if (sink == null) {
             return;
         }
-        try {
-            SwimPingPacket p = SwimPingPacket.fromJson(envelope);
-            sink.onSwimPing(remoteNodeId, p.getSeqNo(), p.getPiggyback());
-        } catch (Exception e) {
-            log.warn("Malformed SwimPingPacket from peer {}: {}", remoteNodeId, e.getMessage());
-        }
+        sink.onSwimPing(remoteNodeId, p.getSeqNo(), ClusterEnvelopes.fromProtoList(p.getPiggybackList()));
     }
 
-    private void handleSwimAck(JSONObject envelope) {
+    private void handleSwimAck(SwimAck p) {
         SwimMessageSink sink = swimSink;
         if (sink == null) {
             return;
         }
-        try {
-            SwimAckPacket p = SwimAckPacket.fromJson(envelope);
-            sink.onSwimAck(remoteNodeId, p.getSeqNo(), p.getPiggyback());
-        } catch (Exception e) {
-            log.warn("Malformed SwimAckPacket from peer {}: {}", remoteNodeId, e.getMessage());
-        }
+        sink.onSwimAck(remoteNodeId, p.getSeqNo(), ClusterEnvelopes.fromProtoList(p.getPiggybackList()));
     }
 
-    private void handleSwimPingReq(JSONObject envelope) {
+    private void handleSwimPingReq(SwimPingReq p) {
         SwimMessageSink sink = swimSink;
         if (sink == null) {
             return;
         }
-        try {
-            SwimPingReqPacket p = SwimPingReqPacket.fromJson(envelope);
-            sink.onSwimPingReq(remoteNodeId, p.getTargetNodeId(), p.getSeqNo(), p.getPiggyback());
-        } catch (Exception e) {
-            log.warn("Malformed SwimPingReqPacket from peer {}: {}", remoteNodeId, e.getMessage());
-        }
+        sink.onSwimPingReq(remoteNodeId, p.getTargetNodeId(), p.getSeqNo(),
+                ClusterEnvelopes.fromProtoList(p.getPiggybackList()));
     }
 
-    private void handleSwimPingReqAck(JSONObject envelope) {
+    private void handleSwimPingReqAck(SwimPingReqAck p) {
         SwimMessageSink sink = swimSink;
         if (sink == null) {
             return;
         }
-        try {
-            SwimPingReqAckPacket p = SwimPingReqAckPacket.fromJson(envelope);
-            sink.onSwimPingReqAck(remoteNodeId, p.getTargetNodeId(), p.getSeqNo(), p.getPiggyback());
-        } catch (Exception e) {
-            log.warn("Malformed SwimPingReqAckPacket from peer {}: {}", remoteNodeId, e.getMessage());
-        }
+        sink.onSwimPingReqAck(remoteNodeId, p.getTargetNodeId(), p.getSeqNo(),
+                ClusterEnvelopes.fromProtoList(p.getPiggybackList()));
     }
 
-    private void handleSwimJoin(JSONObject envelope) {
+    private void handleSwimJoin(SwimJoin p) {
         SwimMessageSink sink = swimSink;
         if (sink == null) {
             return;
         }
-        try {
-            SwimJoinPacket p = SwimJoinPacket.fromJson(envelope);
-            sink.onSwimJoin(remoteNodeId, p.getHost(), p.getClusterPort(), p.getIncarnation());
-        } catch (Exception e) {
-            log.warn("Malformed SwimJoinPacket from peer {}: {}", remoteNodeId, e.getMessage());
-        }
+        sink.onSwimJoin(remoteNodeId, p.getHost(), p.getClusterPort(), p.getIncarnation());
     }
 
-    private void handleSwimJoinAck(JSONObject envelope) {
+    private void handleSwimJoinAck(de.kyle.avenue.proto.SwimJoinAck p) {
         SwimMessageSink sink = swimSink;
         if (sink == null) {
             return;
         }
-        try {
-            SwimJoinAckPacket p = SwimJoinAckPacket.fromJson(envelope);
-            sink.onSwimJoinAck(remoteNodeId, p.getMemberList());
-        } catch (Exception e) {
-            log.warn("Malformed SwimJoinAckPacket from peer {}: {}", remoteNodeId, e.getMessage());
-        }
+        sink.onSwimJoinAck(remoteNodeId, ClusterEnvelopes.fromProtoList(p.getMembersList()));
     }
 
-    private void handleSwimLeave(JSONObject envelope) {
+    private void handleSwimLeave(SwimLeave p) {
         SwimMessageSink sink = swimSink;
         if (sink == null) {
             return;
         }
-        try {
-            SwimLeavePacket p = SwimLeavePacket.fromJson(envelope);
-            sink.onSwimLeave(remoteNodeId, p.getIncarnation());
-        } catch (Exception e) {
-            log.warn("Malformed SwimLeavePacket from peer {}: {}", remoteNodeId, e.getMessage());
-        }
+        sink.onSwimLeave(remoteNodeId, p.getIncarnation());
     }
 
     // -------------------------------------------------------------------------
@@ -706,7 +627,7 @@ public class PeerLink {
                     } else {
                         // Dropped under backpressure: tell the receiver to resync its contiguous
                         // link frontier forward past the lost linkSeq so it keeps ACKing.
-                        writeItem(new OutboundItem.ControlFrame(new ClusterGapPacket(
+                        writeItem(new OutboundItem.ControlFrame(ClusterEnvelopes.gap(
                                 localNodeId, localNodeId, localEpoch, entry.seq() + 1)));
                     }
                 }
@@ -730,19 +651,16 @@ public class PeerLink {
     private void writeItem(OutboundItem item) throws IOException {
         byte[] payload = switch (item) {
             case OutboundItem.PreSerializedFrame frame -> frame.payload();
-            case OutboundItem.ControlFrame control -> serializeEnvelope(control.packet());
+            case OutboundItem.ControlFrame control -> serializeEnvelope(control.envelope());
         };
         synchronized (out) {
             PacketFraming.writeFrame(out, payload);
         }
     }
 
-    /** Serializes a {@link Packet} into the {@code {"header":{...},"body":{...}}} envelope bytes. */
-    static byte[] serializeEnvelope(Packet packet) {
-        JSONObject envelope = new JSONObject();
-        envelope.put("header", new JSONObject(new String(packet.getHeader(), StandardCharsets.UTF_8)));
-        envelope.put("body", new JSONObject(new String(packet.getBody(), StandardCharsets.UTF_8)));
-        return envelope.toString().getBytes(StandardCharsets.UTF_8);
+    /** Serializes a {@link ClusterEnvelope} into its bare protobuf payload bytes (no length prefix). */
+    static byte[] serializeEnvelope(ClusterEnvelope envelope) {
+        return WireCodec.encodeCluster(envelope);
     }
 
     // -------------------------------------------------------------------------
@@ -756,8 +674,7 @@ public class PeerLink {
                 if (!running.get()) {
                     break;
                 }
-                ClusterHeartbeatPacket hb = new ClusterHeartbeatPacket(localNodeId);
-                if (!controlQueue.offer(new OutboundItem.ControlFrame(hb))) {
+                if (!controlQueue.offer(new OutboundItem.ControlFrame(ClusterEnvelopes.heartbeat(localNodeId)))) {
                     ClusterEvents.queueFull(remoteNodeId, "heartbeat");
                 }
             }
@@ -795,9 +712,8 @@ public class PeerLink {
             return; // nothing new to acknowledge
         }
         lastAckedSeqSent = contiguous;
-        ClusterAckPacket.Ack ack = new ClusterAckPacket.Ack(remoteNodeId, 0L, contiguous);
         if (controlQueue.offer(new OutboundItem.ControlFrame(
-                new ClusterAckPacket(localNodeId, List.of(ack))))) {
+                ClusterEnvelopes.ack(localNodeId, remoteNodeId, 0L, contiguous)))) {
             metrics.incrementAcksSent();
         }
     }
@@ -805,13 +721,12 @@ public class PeerLink {
     private void sendResumeRequest() {
         // Our resume point for the link the remote sends to us: last contiguous linkSeq received.
         long contiguous = receiver.linkResumePoint(remoteNodeId);
-        ClusterResumePacket.Resume point = new ClusterResumePacket.Resume(remoteNodeId, 0L, contiguous);
         controlQueue.offer(new OutboundItem.ControlFrame(
-                new ClusterResumePacket(localNodeId, List.of(point))));
+                ClusterEnvelopes.resume(localNodeId, remoteNodeId, 0L, contiguous)));
     }
 
     private void sendInitialInterestSync() {
-        ClusterInterestSyncPacket sync = interestSyncSupplier.get();
+        ClusterEnvelope sync = interestSyncSupplier.get();
         if (sync != null && controlQueue.offer(new OutboundItem.ControlFrame(sync))) {
             metrics.incrementInterestUpdatesSent();
         }
