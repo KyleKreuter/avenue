@@ -6,6 +6,8 @@ import de.kyle.avenue.handler.authentication.AuthenticationTokenHandler;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.handler.packet.InboundPacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
+import de.kyle.avenue.metrics.AvenueMetrics;
+import de.kyle.avenue.net.SocketFactoryProvider;
 import de.kyle.avenue.serialization.PacketDeserializer;
 import de.kyle.avenue.serialization.PacketSerializer;
 import org.slf4j.Logger;
@@ -38,6 +40,11 @@ import java.util.concurrent.Executors;
  * injected to share the subscription table with the cluster delivery path. When neither is
  * supplied the server operates in pure single-node mode (all existing tests are unaffected).
  * <p>
+ * Wave 5: the server enforces an optional {@code server.max-connections} limit (E16), exposes
+ * lightweight {@link AvenueMetrics} (E20) and binds a TLS {@link javax.net.ssl.SSLServerSocket}
+ * instead of a plain socket when {@code server.tls.enabled=true} (E14). All of these default to
+ * the previous behaviour (limit generous, no TLS) so the plain path is unchanged.
+ * <p>
  * The production entry point ({@link AvenueApplication#main}) keeps its previous blocking
  * behaviour.
  */
@@ -49,6 +56,8 @@ public class SingleNodeServer {
     private final ExecutorService executorService;
     private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final AvenueConfig avenueConfig;
+    private final AvenueMetrics metrics;
+    private final SocketFactoryProvider socketFactoryProvider;
 
     /** Signals that the server socket has been bound (and {@link #getPort()} is meaningful). */
     private final CountDownLatch boundLatch = new CountDownLatch(1);
@@ -93,8 +102,10 @@ public class SingleNodeServer {
             ClusterForwarder clusterForwarder
     ) {
         this.avenueConfig = avenueConfig;
+        this.metrics = new AvenueMetrics();
         AuthenticationTokenHandler authenticationTokenHandler = new AuthenticationTokenHandler(this.avenueConfig);
         this.topicSubscriptionHandler = topicSubscriptionHandler;
+        this.topicSubscriptionHandler.setMetrics(this.metrics);
         this.executorService = Executors.newVirtualThreadPerTaskExecutor();
         this.packetDeserializer = new PacketDeserializer(this.avenueConfig);
         this.packetSerializer = new PacketSerializer(this.avenueConfig);
@@ -102,7 +113,13 @@ public class SingleNodeServer {
                 authenticationTokenHandler,
                 topicSubscriptionHandler,
                 executorService,
-                clusterForwarder
+                clusterForwarder,
+                this.metrics
+        );
+        this.socketFactoryProvider = SocketFactoryProvider.forServer(
+                avenueConfig.isServerTlsEnabled(),
+                avenueConfig.getServerTlsKeystorePath(),
+                avenueConfig.getServerTlsKeystorePassword()
         );
         Runtime.getRuntime().addShutdownHook(new Thread(this::stop));
     }
@@ -122,6 +139,7 @@ public class SingleNodeServer {
      */
     public void start() {
         this.running = true;
+        this.metrics.startReporting(avenueConfig.getMetricsLogIntervalSeconds());
         this.acceptThread = new Thread(this::acceptLoop, "avenue-accept-loop");
         this.acceptThread.start();
         try {
@@ -132,20 +150,26 @@ public class SingleNodeServer {
     }
 
     private void acceptLoop() {
-        try (ServerSocket server = new ServerSocket(avenueConfig.getPort())) {
+        try (ServerSocket server = socketFactoryProvider.createServerSocket(avenueConfig.getPort())) {
             this.serverSocket = server;
-            log.info("Starting server on port {}", server.getLocalPort());
+            log.info("Starting server on port {} (TLS={})",
+                    server.getLocalPort(), socketFactoryProvider.isTlsEnabled());
             boundLatch.countDown();
             while (running) {
                 try {
                     Socket client = server.accept();
+                    if (!admit(client)) {
+                        continue;
+                    }
                     ClientConnectionHandler clientConnectionHandler = new ClientConnectionHandler(
                             client,
                             packetDeserializer,
                             packetSerializer,
                             inboundPacketHandler,
                             avenueConfig,
-                            topicSubscriptionHandler
+                            topicSubscriptionHandler,
+                            metrics,
+                            metrics::decrementActiveConnections
                     );
                     this.executorService.execute(clientConnectionHandler);
                 } catch (IOException e) {
@@ -159,6 +183,36 @@ public class SingleNodeServer {
         } finally {
             boundLatch.countDown();
             stop();
+        }
+    }
+
+    /**
+     * Enforces the configured {@code server.max-connections} limit (E16). When the limit is
+     * reached the freshly accepted socket is closed immediately and the connection is counted
+     * as rejected. A non-positive limit means unlimited.
+     *
+     * @return {@code true} if the connection was admitted (and the active gauge incremented)
+     */
+    private boolean admit(Socket client) {
+        int limit = avenueConfig.getMaxConnections();
+        long active = metrics.incrementActiveConnections();
+        if (limit > 0 && active > limit) {
+            metrics.decrementActiveConnections();
+            metrics.incrementConnectionsRejected();
+            log.warn("Max connections limit ({}) reached, rejecting connection from {}",
+                    limit, client.getRemoteSocketAddress());
+            closeQuietly(client);
+            return false;
+        }
+        metrics.incrementTotalConnectionsAccepted();
+        return true;
+    }
+
+    private void closeQuietly(Socket socket) {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // best-effort
         }
     }
 
@@ -178,6 +232,11 @@ public class SingleNodeServer {
         return getPort();
     }
 
+    /** Exposes the metrics registry (for tests and operational tooling). */
+    public AvenueMetrics getMetrics() {
+        return metrics;
+    }
+
     /** Blocks the calling thread until the accept loop has terminated. */
     private void awaitTermination() {
         try {
@@ -195,6 +254,7 @@ public class SingleNodeServer {
         }
         log.info("Stopping server");
         this.running = false;
+        this.metrics.stopReporting();
         ServerSocket socket = this.serverSocket;
         if (socket != null && !socket.isClosed()) {
             try {

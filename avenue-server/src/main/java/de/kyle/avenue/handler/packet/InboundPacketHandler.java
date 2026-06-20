@@ -9,6 +9,7 @@ import de.kyle.avenue.handler.packet.auth.AuthTokenRequestInboundPacketHandler;
 import de.kyle.avenue.handler.packet.publish.PublishMessageInboundPacketHandler;
 import de.kyle.avenue.handler.packet.subscribe.SubscribeInboundPacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
+import de.kyle.avenue.metrics.AvenueMetrics;
 import org.json.JSONObject;
 
 import java.io.IOException;
@@ -42,12 +43,12 @@ public class InboundPacketHandler {
             TopicSubscriptionHandler topicSubscriptionHandler,
             ExecutorService executorService
     ) {
-        this(authenticationTokenHandler, topicSubscriptionHandler, executorService, ClusterForwarder.NOOP);
+        this(authenticationTokenHandler, topicSubscriptionHandler, executorService,
+                ClusterForwarder.NOOP, new AvenueMetrics());
     }
 
     /**
-     * Cluster-aware constructor. The supplied {@code clusterForwarder} is injected into the
-     * {@link PublishMessageInboundPacketHandler}.
+     * Cluster-aware constructor without explicit metrics. Uses a standalone metrics registry.
      */
     public InboundPacketHandler(
             AuthenticationTokenHandler authenticationTokenHandler,
@@ -55,10 +56,25 @@ public class InboundPacketHandler {
             ExecutorService executorService,
             ClusterForwarder clusterForwarder
     ) {
+        this(authenticationTokenHandler, topicSubscriptionHandler, executorService,
+                clusterForwarder, new AvenueMetrics());
+    }
+
+    /**
+     * Full constructor. The supplied {@code clusterForwarder} and shared {@code metrics} are
+     * injected into the {@link PublishMessageInboundPacketHandler}.
+     */
+    public InboundPacketHandler(
+            AuthenticationTokenHandler authenticationTokenHandler,
+            TopicSubscriptionHandler topicSubscriptionHandler,
+            ExecutorService executorService,
+            ClusterForwarder clusterForwarder,
+            AvenueMetrics metrics
+    ) {
         this.authenticationTokenHandler = authenticationTokenHandler;
         register("AuthTokenRequestInboundPacket", new AuthTokenRequestInboundPacketHandler(authenticationTokenHandler));
         register("PublishMessageInboundPacket",
-                new PublishMessageInboundPacketHandler(topicSubscriptionHandler, executorService, clusterForwarder));
+                new PublishMessageInboundPacketHandler(topicSubscriptionHandler, executorService, clusterForwarder, metrics));
         register("SubscribeInboundPacket", new SubscribeInboundPacketHandler(topicSubscriptionHandler));
     }
 

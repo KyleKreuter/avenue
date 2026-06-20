@@ -6,6 +6,7 @@ import de.kyle.avenue.cluster.ClusterForwarder;
 import de.kyle.avenue.handler.client.ClientConnectionHandler;
 import de.kyle.avenue.handler.packet.PacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
+import de.kyle.avenue.metrics.AvenueMetrics;
 import de.kyle.avenue.packet.publish.PublishMessageOutboundPacket;
 import org.json.JSONObject;
 
@@ -31,6 +32,7 @@ public class PublishMessageInboundPacketHandler implements PacketHandler {
     private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final ExecutorService executorService;
     private final ClusterForwarder clusterForwarder;
+    private final AvenueMetrics metrics;
 
     /**
      * Single-node (no-clustering) constructor — fully backwards-compatible.
@@ -39,23 +41,38 @@ public class PublishMessageInboundPacketHandler implements PacketHandler {
             TopicSubscriptionHandler topicSubscriptionHandler,
             ExecutorService executorService
     ) {
-        this(topicSubscriptionHandler, executorService, ClusterForwarder.NOOP);
+        this(topicSubscriptionHandler, executorService, ClusterForwarder.NOOP, new AvenueMetrics());
     }
 
     /**
-     * Cluster-aware constructor.
-     *
-     * @param clusterForwarder non-blocking forwarder; use {@link ClusterForwarder#NOOP} to
-     *                         disable forwarding
+     * Cluster-aware constructor without explicit metrics.
      */
     public PublishMessageInboundPacketHandler(
             TopicSubscriptionHandler topicSubscriptionHandler,
             ExecutorService executorService,
             ClusterForwarder clusterForwarder
     ) {
+        this(topicSubscriptionHandler, executorService, clusterForwarder, new AvenueMetrics());
+    }
+
+    /**
+     * Full constructor.
+     *
+     * @param clusterForwarder non-blocking forwarder; use {@link ClusterForwarder#NOOP} to
+     *                         disable forwarding
+     * @param metrics          shared metrics registry; {@code messagesPublished} is incremented
+     *                         per accepted publish
+     */
+    public PublishMessageInboundPacketHandler(
+            TopicSubscriptionHandler topicSubscriptionHandler,
+            ExecutorService executorService,
+            ClusterForwarder clusterForwarder,
+            AvenueMetrics metrics
+    ) {
         this.topicSubscriptionHandler = topicSubscriptionHandler;
         this.executorService = executorService;
         this.clusterForwarder = clusterForwarder;
+        this.metrics = metrics;
     }
 
     @Override
@@ -68,6 +85,9 @@ public class PublishMessageInboundPacketHandler implements PacketHandler {
         String topic = header.getString("topic");
         String source = header.getString("source");
         String data = body.getString("data");
+
+        // Metric: a local client publish was accepted and is about to be fanned out.
+        metrics.incrementMessagesPublished();
 
         // Local delivery (async, as in the pre-clustering implementation).
         PublishMessageOutboundPacket outbound = new PublishMessageOutboundPacket(topic, data, source);

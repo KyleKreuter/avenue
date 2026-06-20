@@ -3,6 +3,7 @@ package de.kyle.avenue.handler.client;
 import de.kyle.avenue.config.AvenueConfig;
 import de.kyle.avenue.handler.packet.InboundPacketHandler;
 import de.kyle.avenue.handler.subscription.TopicSubscriptionHandler;
+import de.kyle.avenue.metrics.AvenueMetrics;
 import de.kyle.avenue.packet.OutboundPacket;
 import de.kyle.avenue.serialization.PacketDeserializer;
 import de.kyle.avenue.serialization.PacketFraming;
@@ -18,6 +19,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -30,6 +32,15 @@ import java.util.concurrent.TimeUnit;
  * on the socket, so one slow subscriber can no longer cause head-of-line blocking for the
  * fan-out to all other subscribers. Only the writer thread touches the {@link DataOutputStream},
  * which is why no write lock is needed any more.
+ * <p>
+ * Liveness (E16): when {@code server.client.idle-timeout-ms > 0} a {@link Socket#setSoTimeout
+ * read timeout} is applied. If no byte arrives from the client within that window the read
+ * throws a {@link SocketTimeoutException} and the connection is closed, so dead / half-open
+ * connections are reaped instead of leaking forever.
+ * <p>
+ * Backpressure (E17): the {@link BackpressurePolicy} decides what happens when the bounded
+ * outbound queue stays full beyond the offer timeout — either disconnect the slow consumer
+ * (default) or drop the individual message and keep the connection.
  */
 public class ClientConnectionHandler implements Runnable {
     private static final Logger log = LoggerFactory.getLogger(ClientConnectionHandler.class);
@@ -43,14 +54,19 @@ public class ClientConnectionHandler implements Runnable {
     private final InboundPacketHandler inboundPacketHandler;
     private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final AvenueConfig avenueConfig;
+    private final AvenueMetrics metrics;
+    private final Runnable onDisconnect;
 
     /** Bounded outbound queue. Backpressure is applied via offer() with a short timeout. */
     private final BlockingQueue<OutboundPacket> outboundQueue;
     private final long offerTimeoutMillis;
+    private final BackpressurePolicy backpressurePolicy;
+    private final long idleTimeoutMillis;
     private Thread writerThread;
 
     private volatile boolean running;
 
+    /** Backwards-compatible constructor (no metrics, no disconnect callback). */
     public ClientConnectionHandler(
             Socket client,
             PacketDeserializer packetDeserializer,
@@ -58,6 +74,27 @@ public class ClientConnectionHandler implements Runnable {
             InboundPacketHandler inboundPacketHandler,
             AvenueConfig avenueConfig,
             TopicSubscriptionHandler topicSubscriptionHandler
+    ) throws IOException {
+        this(client, packetDeserializer, packetSerializer, inboundPacketHandler, avenueConfig,
+                topicSubscriptionHandler, new AvenueMetrics(), () -> { });
+    }
+
+    /**
+     * Full constructor.
+     *
+     * @param metrics      shared metrics registry (delivery / drop / disconnect counters)
+     * @param onDisconnect callback invoked exactly once when this connection closes, so the
+     *                     server can decrement its active-connection gauge
+     */
+    public ClientConnectionHandler(
+            Socket client,
+            PacketDeserializer packetDeserializer,
+            PacketSerializer packetSerializer,
+            InboundPacketHandler inboundPacketHandler,
+            AvenueConfig avenueConfig,
+            TopicSubscriptionHandler topicSubscriptionHandler,
+            AvenueMetrics metrics,
+            Runnable onDisconnect
     ) throws IOException {
         this.client = client;
         this.inputStream = client.getInputStream();
@@ -69,16 +106,33 @@ public class ClientConnectionHandler implements Runnable {
         this.inboundPacketHandler = inboundPacketHandler;
         this.avenueConfig = avenueConfig;
         this.topicSubscriptionHandler = topicSubscriptionHandler;
+        this.metrics = metrics;
+        this.onDisconnect = onDisconnect;
         this.outboundQueue = new LinkedBlockingQueue<>(avenueConfig.getOutboundQueueCapacity());
         this.offerTimeoutMillis = avenueConfig.getOutboundQueueOfferTimeoutMillis();
+        this.backpressurePolicy = avenueConfig.getBackpressurePolicy();
+        this.idleTimeoutMillis = avenueConfig.getClientIdleTimeoutMillis();
     }
 
     private void listen() throws IOException {
+        // Liveness: apply a read idle-timeout so dead/half-open connections are reaped.
+        // 0 disables it (blocking read, original behaviour).
+        if (idleTimeoutMillis > 0) {
+            this.client.setSoTimeout((int) Math.min(idleTimeoutMillis, Integer.MAX_VALUE));
+        }
         try (DataInputStream dataInputStream = new DataInputStream(this.inputStream)) {
             // Length-prefix framing: read frames in a loop so a single connection can
             // carry many messages instead of blocking on readAllBytes() until EOF.
             while (this.running) {
-                byte[] packetBytes = PacketFraming.readFrame(dataInputStream, avenueConfig.getPacketSize());
+                byte[] packetBytes;
+                try {
+                    packetBytes = PacketFraming.readFrame(dataInputStream, avenueConfig.getPacketSize());
+                } catch (SocketTimeoutException e) {
+                    // No bytes within the idle window -> treat the connection as dead and close it.
+                    log.info("Idle timeout ({} ms) reached for {}, closing dead connection",
+                            idleTimeoutMillis, remoteAddress());
+                    break;
+                }
                 JSONObject packet = packetDeserializer.deserialize(packetBytes);
                 try {
                     inboundPacketHandler.handleInboundPacket(packet, this);
@@ -124,8 +178,13 @@ public class ClientConnectionHandler implements Runnable {
 
     /**
      * Enqueues a packet for asynchronous delivery. Never blocks the caller on the socket.
-     * If the per-client queue stays full beyond the configured offer timeout the client is
-     * considered too slow and gets disconnected (slow-consumer backpressure policy).
+     * <p>
+     * If the per-client queue stays full beyond the configured offer timeout the configured
+     * {@link BackpressurePolicy} decides the outcome:
+     * <ul>
+     *   <li>{@code DISCONNECT_SLOW_CONSUMER} (default) — the slow client is disconnected.</li>
+     *   <li>{@code DROP_MESSAGE} — the individual packet is dropped, the connection stays open.</li>
+     * </ul>
      */
     public void enqueue(OutboundPacket packet) {
         if (!this.running) {
@@ -133,9 +192,20 @@ public class ClientConnectionHandler implements Runnable {
         }
         try {
             boolean accepted = outboundQueue.offer(packet, offerTimeoutMillis, TimeUnit.MILLISECONDS);
-            if (!accepted) {
-                log.warn("Outbound queue for {} is full, dropping slow client",
-                        this.client.getInetAddress().getHostAddress());
+            if (accepted) {
+                metrics.incrementMessagesDelivered();
+                metrics.recordOutboundQueueDepth(outboundQueue.size());
+                return;
+            }
+            // Queue still full after the offer timeout: apply the configured backpressure policy.
+            if (backpressurePolicy == BackpressurePolicy.DROP_MESSAGE) {
+                metrics.incrementDroppedMessages();
+                log.warn("Outbound queue for {} is full, dropping message (DROP_MESSAGE policy)",
+                        remoteAddress());
+            } else {
+                metrics.incrementSlowConsumerDisconnects();
+                log.warn("Outbound queue for {} is full, disconnecting slow consumer "
+                        + "(DISCONNECT_SLOW_CONSUMER policy)", remoteAddress());
                 shutdown();
             }
         } catch (InterruptedException e) {
@@ -157,7 +227,7 @@ public class ClientConnectionHandler implements Runnable {
             return;
         }
         this.running = false;
-        log.info("Closing connection to {}", this.client.getInetAddress().getHostAddress());
+        log.info("Closing connection to {}", remoteAddress());
         // Wake the writer so it can observe running == false and finish promptly.
         if (this.writerThread != null) {
             this.writerThread.interrupt();
@@ -170,6 +240,16 @@ public class ClientConnectionHandler implements Runnable {
             log.warn("An error occurred while closing connection", e);
         } finally {
             this.topicSubscriptionHandler.unsubscribeFromAllTopics(this);
+            // Decrement the server's active-connection gauge exactly once.
+            this.onDisconnect.run();
+        }
+    }
+
+    private String remoteAddress() {
+        try {
+            return this.client.getInetAddress().getHostAddress();
+        } catch (Exception e) {
+            return "unknown";
         }
     }
 
@@ -177,7 +257,7 @@ public class ClientConnectionHandler implements Runnable {
     public void run() {
         // Start the dedicated outbound writer on a virtual thread before reading inbound data.
         this.writerThread = Thread.ofVirtual()
-                .name("client-writer-" + client.getInetAddress().getHostAddress())
+                .name("client-writer-" + remoteAddress())
                 .start(this::writerLoop);
         try {
             listen();
