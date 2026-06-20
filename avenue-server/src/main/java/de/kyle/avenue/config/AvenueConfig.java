@@ -1,5 +1,6 @@
 package de.kyle.avenue.config;
 
+import de.kyle.avenue.handler.client.BackpressurePolicy;
 import io.github.cdimascio.dotenv.Dotenv;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,6 +41,31 @@ public class AvenueConfig {
     private final List<String> clusterPeers;
     private final String clusterSecret;
     private final long clusterHeartbeatIntervalMs;
+
+    // -------------------------------------------------------------------------
+    // Wave 5 — Security & Ops fields (all optional, safe defaults)
+    // -------------------------------------------------------------------------
+
+    /** Socket read idle-timeout in ms for client connections. {@code 0} disables it. */
+    private final long clientIdleTimeoutMillis;
+    /** Maximum number of concurrent client connections. {@code 0} means unlimited. */
+    private final int maxConnections;
+    /** Backpressure policy applied when a client's outbound queue stays full. */
+    private final BackpressurePolicy backpressurePolicy;
+    /** Interval (seconds) for the periodic metrics log. {@code 0} disables periodic logging. */
+    private final long metricsLogIntervalSeconds;
+
+    // TLS for the client-facing port.
+    private final boolean serverTlsEnabled;
+    private final String serverTlsKeystorePath;
+    private final String serverTlsKeystorePassword;
+
+    // TLS for the cluster transport.
+    private final boolean clusterTlsEnabled;
+    private final String clusterTlsKeystorePath;
+    private final String clusterTlsKeystorePassword;
+    private final String clusterTlsTruststorePath;
+    private final String clusterTlsTruststorePassword;
 
     /**
      * Direct-value constructor used for tests (and any embedding that already holds its
@@ -103,6 +129,65 @@ public class AvenueConfig {
             String clusterSecret,
             long clusterHeartbeatIntervalMs
     ) {
+        // Delegate to the full Wave-5 constructor using safe defaults: TLS off, generous
+        // connection limit, idle-timeout off, default backpressure policy. This keeps every
+        // existing 7- and 13-argument caller (including all tests) source-compatible.
+        this(packetSize, dropUnknownPackets, authenticationSecret, authenticationToken,
+                port, outboundQueueCapacity, outboundQueueOfferTimeoutMillis,
+                clusterEnabled, nodeId, clusterPort, clusterPeers, clusterSecret,
+                clusterHeartbeatIntervalMs,
+                0L,                                  // clientIdleTimeoutMillis (0 = disabled)
+                10_000,                              // maxConnections
+                BackpressurePolicy.DISCONNECT_SLOW_CONSUMER,
+                0L,                                  // metricsLogIntervalSeconds (0 = disabled in tests)
+                false, "", "",                       // server TLS off
+                false, "", "", "", "");              // cluster TLS off
+    }
+
+    /**
+     * Full direct-value constructor including all Wave-5 security/ops settings. Used by the
+     * TLS and metrics tests to spin up nodes with known configuration without file/env loading.
+     *
+     * @param clientIdleTimeoutMillis      socket read idle-timeout in ms ({@code 0} = disabled)
+     * @param maxConnections               max concurrent client connections ({@code 0} = unlimited)
+     * @param backpressurePolicy           policy applied when an outbound queue stays full
+     * @param metricsLogIntervalSeconds    periodic metrics log interval in s ({@code 0} = disabled)
+     * @param serverTlsEnabled             enable TLS on the client port
+     * @param serverTlsKeystorePath        keystore path for the client-port TLS server socket
+     * @param serverTlsKeystorePassword    keystore password for the client-port TLS server socket
+     * @param clusterTlsEnabled            enable TLS on the cluster transport
+     * @param clusterTlsKeystorePath       keystore path for the cluster TLS server socket
+     * @param clusterTlsKeystorePassword   keystore password for the cluster TLS server socket
+     * @param clusterTlsTruststorePath     truststore path used by cluster TLS client sockets
+     * @param clusterTlsTruststorePassword truststore password used by cluster TLS client sockets
+     */
+    public AvenueConfig(
+            int packetSize,
+            boolean dropUnknownPackets,
+            String authenticationSecret,
+            String authenticationToken,
+            int port,
+            int outboundQueueCapacity,
+            long outboundQueueOfferTimeoutMillis,
+            boolean clusterEnabled,
+            String nodeId,
+            int clusterPort,
+            List<String> clusterPeers,
+            String clusterSecret,
+            long clusterHeartbeatIntervalMs,
+            long clientIdleTimeoutMillis,
+            int maxConnections,
+            BackpressurePolicy backpressurePolicy,
+            long metricsLogIntervalSeconds,
+            boolean serverTlsEnabled,
+            String serverTlsKeystorePath,
+            String serverTlsKeystorePassword,
+            boolean clusterTlsEnabled,
+            String clusterTlsKeystorePath,
+            String clusterTlsKeystorePassword,
+            String clusterTlsTruststorePath,
+            String clusterTlsTruststorePassword
+    ) {
         this.packetSize = packetSize;
         this.dropUnknownPackets = dropUnknownPackets;
         this.authenticationSecret = authenticationSecret;
@@ -116,6 +201,19 @@ public class AvenueConfig {
         this.clusterPeers = clusterPeers != null ? List.copyOf(clusterPeers) : List.of();
         this.clusterSecret = clusterSecret != null ? clusterSecret : "";
         this.clusterHeartbeatIntervalMs = clusterHeartbeatIntervalMs;
+        this.clientIdleTimeoutMillis = clientIdleTimeoutMillis;
+        this.maxConnections = maxConnections;
+        this.backpressurePolicy = backpressurePolicy != null
+                ? backpressurePolicy : BackpressurePolicy.DISCONNECT_SLOW_CONSUMER;
+        this.metricsLogIntervalSeconds = metricsLogIntervalSeconds;
+        this.serverTlsEnabled = serverTlsEnabled;
+        this.serverTlsKeystorePath = serverTlsKeystorePath != null ? serverTlsKeystorePath : "";
+        this.serverTlsKeystorePassword = serverTlsKeystorePassword != null ? serverTlsKeystorePassword : "";
+        this.clusterTlsEnabled = clusterTlsEnabled;
+        this.clusterTlsKeystorePath = clusterTlsKeystorePath != null ? clusterTlsKeystorePath : "";
+        this.clusterTlsKeystorePassword = clusterTlsKeystorePassword != null ? clusterTlsKeystorePassword : "";
+        this.clusterTlsTruststorePath = clusterTlsTruststorePath != null ? clusterTlsTruststorePath : "";
+        this.clusterTlsTruststorePassword = clusterTlsTruststorePassword != null ? clusterTlsTruststorePassword : "";
     }
 
     public AvenueConfig() throws IOException {
@@ -171,6 +269,46 @@ public class AvenueConfig {
                 dotenv.get("CLUSTER_HEARTBEAT_INTERVAL_MS",
                         properties.getProperty("cluster.heartbeat-interval-ms", "5000"))
         );
+
+        // Wave 5 — Security & Ops settings (all optional, safe defaults).
+        clientIdleTimeoutMillis = Long.parseLong(
+                dotenv.get("SERVER_CLIENT_IDLE_TIMEOUT_MS",
+                        properties.getProperty("server.client.idle-timeout-ms", "60000"))
+        );
+        maxConnections = Integer.parseInt(
+                dotenv.get("SERVER_MAX_CONNECTIONS",
+                        properties.getProperty("server.max-connections", "10000"))
+        );
+        backpressurePolicy = BackpressurePolicy.fromConfig(
+                dotenv.get("SERVER_BACKPRESSURE_POLICY",
+                        properties.getProperty("server.backpressure.policy", "DISCONNECT_SLOW_CONSUMER"))
+        );
+        metricsLogIntervalSeconds = Long.parseLong(
+                dotenv.get("SERVER_METRICS_LOG_INTERVAL_SECONDS",
+                        properties.getProperty("server.metrics.log-interval-seconds", "30"))
+        );
+
+        serverTlsEnabled = Boolean.parseBoolean(
+                dotenv.get("SERVER_TLS_ENABLED",
+                        properties.getProperty("server.tls.enabled", "false"))
+        );
+        serverTlsKeystorePath = dotenv.get("SERVER_TLS_KEYSTORE_PATH",
+                properties.getProperty("server.tls.keystore-path", ""));
+        serverTlsKeystorePassword = dotenv.get("SERVER_TLS_KEYSTORE_PASSWORD",
+                properties.getProperty("server.tls.keystore-password", ""));
+
+        clusterTlsEnabled = Boolean.parseBoolean(
+                dotenv.get("CLUSTER_TLS_ENABLED",
+                        properties.getProperty("cluster.tls.enabled", "false"))
+        );
+        clusterTlsKeystorePath = dotenv.get("CLUSTER_TLS_KEYSTORE_PATH",
+                properties.getProperty("cluster.tls.keystore-path", ""));
+        clusterTlsKeystorePassword = dotenv.get("CLUSTER_TLS_KEYSTORE_PASSWORD",
+                properties.getProperty("cluster.tls.keystore-password", ""));
+        clusterTlsTruststorePath = dotenv.get("CLUSTER_TLS_TRUSTSTORE_PATH",
+                properties.getProperty("cluster.tls.truststore-path", ""));
+        clusterTlsTruststorePassword = dotenv.get("CLUSTER_TLS_TRUSTSTORE_PASSWORD",
+                properties.getProperty("cluster.tls.truststore-password", ""));
     }
 
     /**
@@ -293,5 +431,63 @@ public class AvenueConfig {
     /** Returns the heartbeat interval in milliseconds. Default is 5 000 ms. */
     public long getClusterHeartbeatIntervalMs() {
         return clusterHeartbeatIntervalMs;
+    }
+
+    // -------------------------------------------------------------------------
+    // Getters — Wave 5 security/ops fields
+    // -------------------------------------------------------------------------
+
+    /** Socket read idle-timeout in ms for client connections. {@code 0} disables it. */
+    public long getClientIdleTimeoutMillis() {
+        return clientIdleTimeoutMillis;
+    }
+
+    /** Maximum number of concurrent client connections. {@code 0} means unlimited. */
+    public int getMaxConnections() {
+        return maxConnections;
+    }
+
+    /** The configured backpressure policy for slow consumers. */
+    public BackpressurePolicy getBackpressurePolicy() {
+        return backpressurePolicy;
+    }
+
+    /** Interval (seconds) for the periodic metrics log. {@code 0} disables periodic logging. */
+    public long getMetricsLogIntervalSeconds() {
+        return metricsLogIntervalSeconds;
+    }
+
+    /** Returns {@code true} if TLS is enabled on the client-facing port. */
+    public boolean isServerTlsEnabled() {
+        return serverTlsEnabled;
+    }
+
+    public String getServerTlsKeystorePath() {
+        return serverTlsKeystorePath;
+    }
+
+    public String getServerTlsKeystorePassword() {
+        return serverTlsKeystorePassword;
+    }
+
+    /** Returns {@code true} if TLS is enabled on the cluster transport. */
+    public boolean isClusterTlsEnabled() {
+        return clusterTlsEnabled;
+    }
+
+    public String getClusterTlsKeystorePath() {
+        return clusterTlsKeystorePath;
+    }
+
+    public String getClusterTlsKeystorePassword() {
+        return clusterTlsKeystorePassword;
+    }
+
+    public String getClusterTlsTruststorePath() {
+        return clusterTlsTruststorePath;
+    }
+
+    public String getClusterTlsTruststorePassword() {
+        return clusterTlsTruststorePassword;
     }
 }
