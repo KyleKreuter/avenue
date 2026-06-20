@@ -31,6 +31,13 @@ public class AvenueConfig {
     private final int outboundQueueCapacity;
     private final long outboundQueueOfferTimeoutMillis;
 
+    /**
+     * Whether accepted client sockets disable Nagle's algorithm ({@code TCP_NODELAY}). Defaults
+     * to {@code true} so small pub/sub frames flush immediately. Direct-value (test) constructors
+     * use the default; only the file/{@code .env} constructor reads {@code server.tcp-nodelay}.
+     */
+    private final boolean serverTcpNoDelay;
+
     // -------------------------------------------------------------------------
     // Cluster fields (all optional; cluster is disabled by default)
     // -------------------------------------------------------------------------
@@ -195,6 +202,9 @@ public class AvenueConfig {
         this.port = port;
         this.outboundQueueCapacity = outboundQueueCapacity;
         this.outboundQueueOfferTimeoutMillis = outboundQueueOfferTimeoutMillis;
+        // Direct-value (test) callers get the production default; the file/.env constructor sets
+        // this field itself from the server.tcp-nodelay property.
+        this.serverTcpNoDelay = true;
         this.clusterEnabled = clusterEnabled;
         this.nodeId = nodeId;
         this.clusterPort = clusterPort;
@@ -242,6 +252,10 @@ public class AvenueConfig {
         outboundQueueOfferTimeoutMillis = Long.parseLong(
                 dotenv.get("SERVER_OUTBOUND_QUEUE_OFFER_TIMEOUT_MS",
                         properties.getProperty("server.outbound.queue.offer-timeout-ms", "100"))
+        );
+        serverTcpNoDelay = Boolean.parseBoolean(
+                dotenv.get("SERVER_TCP_NODELAY",
+                        properties.getProperty("server.tcp-nodelay", "true"))
         );
 
         // Cluster settings — all optional, clustering is off by default.
@@ -391,6 +405,14 @@ public class AvenueConfig {
 
     public long getOutboundQueueOfferTimeoutMillis() {
         return outboundQueueOfferTimeoutMillis;
+    }
+
+    /**
+     * Whether accepted client sockets disable Nagle's algorithm ({@code TCP_NODELAY}).
+     * Defaults to {@code true}.
+     */
+    public boolean isServerTcpNoDelay() {
+        return serverTcpNoDelay;
     }
 
     // -------------------------------------------------------------------------
