@@ -92,16 +92,54 @@ public class TopicSubscriptionHandler {
         return topic.toLowerCase(Locale.ROOT).strip();
     }
 
-    public void deliverPacketToSubscribers(String topic, ClientEnvelope envelope) {
-        Set<ClientConnectionHandler> subscribers = topicSubscriptions.get(normalize(topic));
+    /**
+     * Fans a {@link ClientEnvelope} out to every subscriber of {@code topic}.
+     * <p>
+     * Encode-once fan-out: the envelope is serialized to its bare protobuf payload bytes
+     * <em>exactly once</em> here, and the same immutable {@code byte[]} is handed to every
+     * subscriber via {@link ClientConnectionHandler#enqueuePreSerialized(byte[])}. This turns the
+     * per-publish serialization cost from O(N subscribers) into O(1).
+     *
+     * @param topic    the topic the message was published on (normalized internally)
+     * @param envelope the outbound envelope to serialize once and deliver to all subscribers
+     * @param maxSize  the configured maximum payload size enforced during serialization
+     */
+    public void deliverPacketToSubscribers(String topic, ClientEnvelope envelope, int maxSize) {
+        deliverToSubscribers(normalize(topic), envelope, maxSize);
+    }
+
+    /**
+     * Variant for callers that have already normalized the topic key (the local publish hot path),
+     * so the {@code toLowerCase + strip} allocation is not repeated. Behaviour is otherwise identical
+     * to {@link #deliverPacketToSubscribers(String, ClientEnvelope, int)}.
+     *
+     * @param normalizedTopic the already-{@link #normalize(String) normalized} topic key
+     * @param envelope        the outbound envelope to serialize once and deliver to all subscribers
+     * @param maxSize         the configured maximum payload size enforced during serialization
+     */
+    /**
+     * Current number of subscribers for an already-{@link #normalize(String) normalized} topic key.
+     * Used by the publish hot path to choose inline vs. executor-based fan-out without re-normalizing
+     * or re-looking-up inside delivery. {@code 0} when the topic has no subscribers.
+     */
+    public int subscriberCount(String normalizedTopic) {
+        Set<ClientConnectionHandler> subscribers = topicSubscriptions.get(normalizedTopic);
+        return subscribers == null ? 0 : subscribers.size();
+    }
+
+    public void deliverToSubscribers(String normalizedTopic, ClientEnvelope envelope, int maxSize) {
+        Set<ClientConnectionHandler> subscribers = topicSubscriptions.get(normalizedTopic);
         if (subscribers == null || subscribers.isEmpty()) {
             log.warn("Packet was not delivered to other clients because no subscriptions are registered");
             return;
         }
+        // Encode-once: serialize the envelope a single time and share the immutable bytes with every
+        // subscriber instead of re-serializing per writer.
+        byte[] payload = ClientConnectionHandler.encodeForFanOut(envelope, maxSize);
         // The concurrent set tolerates concurrent subscribe/unsubscribe during iteration.
         // Delivery is non-blocking: each handler only enqueues onto its own outbound queue.
         for (ClientConnectionHandler clientConnectionHandler : subscribers) {
-            clientConnectionHandler.enqueue(envelope);
+            clientConnectionHandler.enqueuePreSerialized(payload);
         }
     }
 

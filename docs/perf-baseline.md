@@ -121,10 +121,27 @@ Arbeitspunkt (`rate=120000`), und die abgeleiteten ns/Nachricht (= 1e9 / Saettig
 | Stufe | 1:1 Saettigung (msg/s) | ns/msg | p99 @120k (ms) |
 | --- | --- | --- | --- |
 | 0 — Baseline | 253 556 | ~3944 | 0.114 |
-| 1 — Mechanische Hot-Path-Wins | | | |
+| 1 — Mechanische Hot-Path-Wins | 246 400 | ~4058 | 0.115 |
 | 2 — Protokoll-Pipelining / Batched Publish | | | |
 | 3 — Event-Loop-IO-Rewrite | | | |
 | 4 — Allokations-/GC-Disziplin | | | |
+
+> **Stufe 1 — ehrliche Einordnung.** Die vier Hot-Path-Optimierungen (encode-once Fan-out, Inline-
+> Delivery statt Executor-Hop, gepufferter Read, einmalige Topic-Normalisierung) sind umgesetzt und
+> alle 87 Tests bleiben gruen. Beim **Nordstern (1:1, Fan-out 1)** ist der **Saettigungs-Durchsatz
+> unveraendert**: ~246k/s nach den Aenderungen vs. **frisch auf derselben Maschine gemessener**
+> Baseline von ebenfalls ~244-250k/s (die 253k in Zeile 0 stammen von einem frueheren Lauf; tagaktuell
+> liegt die Maschine bei ~247k). Der Grund ist strukturell: bei Fan-out 1 spart encode-once nichts
+> (N=1, eine Serialisierung), und der Engpass ist die **1-Nachricht-in-flight-Ping-Pong-Latenz** des
+> Request/Response-Benchmarks, nicht Server-CPU. Messbar verbessert hat sich die **Median-Latenz**:
+> p50 @120k faellt von ~0.047 ms auf ~0.033 ms (≈ -30 %), weil die Inline-Delivery den Thread-Hop
+> ueber den Executor pro Publish entfernt. p99 @120k bleibt im Rauschband (~0.11-0.13 ms).
+>
+> Wo encode-once tatsaechlich greift, ist hoeherer Fan-out: bei **1:16-Saettigung** steigt die
+> Delivery-Rate von ~577k/s (Baseline) auf ~595k/s (Stufe 1), ~+3 % — der Gewinn skaliert mit dem
+> Fan-out, ist hier aber noch klein, weil der Per-Subscriber-Socket-Write dominiert. Der echte
+> Durchsatz-Hebel fuer den Nordstern liegt damit weiter in Stufe 2/3 (Pipelining / Event-Loop-IO),
+> nicht in mechanischen CPU-Einsparungen.
 
 > Zusatz-Diagnose (kein Erfolgskriterium): die Fan-out-4-Werte aus dem 50k-Lauf oben bleiben als
 > Sekundaermessung erhalten, um Fan-out-Skalierung zu beobachten.
