@@ -6,6 +6,8 @@ import de.kyle.avenue.packet.Packet;
 import de.kyle.avenue.packet.cluster.ClusterAckPacket;
 import de.kyle.avenue.packet.cluster.ClusterGapPacket;
 import de.kyle.avenue.packet.cluster.ClusterHeartbeatPacket;
+import de.kyle.avenue.packet.cluster.ClusterInterestPacket;
+import de.kyle.avenue.packet.cluster.ClusterInterestSyncPacket;
 import de.kyle.avenue.packet.cluster.ClusterPublishPacket;
 import de.kyle.avenue.packet.cluster.ClusterResumePacket;
 import de.kyle.avenue.packet.publish.PublishMessageOutboundPacket;
@@ -29,32 +31,40 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Manages a single peer-to-peer cluster link over a TCP socket, with Phase C at-least-once
- * delivery layered on top of the Phase A transport.
+ * delivery layered on top of the Phase A transport and Phase D interest-based routing on top of
+ * that.
  * <p>
  * A {@code PeerLink} is created around an already-authenticated socket (handshake performed by
  * {@link ClusterHandshake}). It owns virtual threads:
  * <ul>
  *   <li><b>Reader</b> – reads incoming frames and dispatches publishes / heartbeats / ACKs /
- *       resume / gap packets. Runs a heartbeat watchdog and closes the link on timeout.</li>
+ *       resume / gap / interest packets. Runs a heartbeat watchdog and closes the link on
+ *       timeout.</li>
  *   <li><b>Writer</b> – the single thread allowed to block. It pulls publish items handed over
  *       non-blockingly through the shared ingest queue, {@code append}s them to the per-target
  *       {@link ReplayBuffer} (which applies backpressure <em>here</em>, never on the local path)
  *       and writes them. It also drains a small control-frame queue (heartbeat / ack / resume /
- *       gap / backfill) so those interleave with live publishes.</li>
+ *       gap / backfill / interest) so those interleave with live publishes.</li>
  *   <li><b>Heartbeat sender</b> – periodically enqueues a heartbeat control frame.</li>
  *   <li><b>ACK sender</b> – periodically sends a cumulative {@link ClusterAckPacket} with the
  *       receiving-side contiguous high-water mark, but only when it advanced (no idle spam).</li>
  * </ul>
- * <h2>Roles</h2>
- * A link is bidirectional, so it plays both roles at once:
+ * <h2>Phase D — per-link reliability sequence</h2>
+ * Before Phase D, every peer received every origin sequence number, so the origin seq stream over a
+ * link was dense and could drive cumulative ACK / backfill directly. With interest-based routing a
+ * link only carries the publishes of the topics that peer is interested in, so the <em>origin</em>
+ * seq stream it sees is sparse (full of holes) — which would break contiguous ACK/backfill.
+ * <p>
+ * The fix: the at-least-once layer keys on a separate, dense, per-link reliability sequence
+ * ({@code linkSeq}) that the <b>sender</b> assigns per target (see
+ * {@link ClusterManager.TargetState}). ACK / resume / gap / replay all operate on {@code linkSeq}
+ * via the {@link ReceiverContext}. The publish frame still carries the
+ * {@code (originNodeId, originEpoch, originSeq)} triple, which the receiver uses purely for
+ * <b>deduplication</b> — the two sequence spaces are fully independent. So:
  * <ul>
- *   <li><b>Sender</b> of this node's publishes towards the remote: backed by the
- *       {@link ReplayBuffer} (owned by {@link ClusterManager}, keyed by the remote node id, so it
- *       survives this link). Handles backfill when the remote sends a resume request, and gap
- *       signalling when the requested range is no longer buffered.</li>
- *   <li><b>Receiver</b> of the remote's publishes: applies ordered dedup via the per-origin
- *       {@link OriginSequenceTracker}s (owned by {@link ClusterManager}), sends cumulative ACKs and,
- *       on connect, a resume request so the remote can backfill.</li>
+ *   <li><b>Reliability</b> (no lost/duplicated frames on the wire): {@code linkSeq}, contiguous.</li>
+ *   <li><b>Dedup</b> (never deliver the same logical message twice to local subscribers):
+ *       {@code (origin, seq)}, unchanged from Phase C.</li>
  * </ul>
  */
 public class PeerLink {
@@ -64,30 +74,52 @@ public class PeerLink {
     private static final int CONTROL_QUEUE_CAPACITY = 1024;
 
     /**
-     * Callbacks the link uses to reach the receiving-side state owned by {@link ClusterManager}:
-     * the per-origin dedup/ordering trackers and the resume/gap bookkeeping. Keeping these in the
-     * manager lets the trackers and replay buffers outlive any single link.
+     * Callbacks the link uses to reach state owned by {@link ClusterManager} that must outlive any
+     * single link.
+     * <p>
+     * Phase D split the receiving-side state into two concerns:
+     * <ul>
+     *   <li><b>Reliability</b> — keyed by the sending peer's node id over the dense per-link
+     *       {@code linkSeq}: {@link #acceptLink}, {@link #contiguousLinkSeq}, {@link #resetLinkTo},
+     *       {@link #linkResumePoint}. Drives cumulative ACK / resume / gap / backfill.</li>
+     *   <li><b>Dedup</b> — keyed by {@code (originNodeId, originEpoch)} over the origin seq:
+     *       {@link #acceptOrigin}. Ensures a given logical publish is delivered to local
+     *       subscribers at most once even though it may arrive on this link more than once (e.g. a
+     *       backfill re-send, or a broadcast-grace flood reaching an already-covered node).</li>
+     * </ul>
      */
     public interface ReceiverContext {
 
         /**
-         * Records a received publish and returns whether it should be delivered now. Implementations
-         * apply ordered dedup (and, in strict mode, reorder buffering) over the per-origin tracker.
+         * Records a received {@code linkSeq} from the sending peer and reports whether it is new on
+         * the wire (i.e. not a re-sent/duplicate frame). Drives the contiguous reliability frontier.
          */
-        boolean accept(String originKey, long seq);
+        boolean acceptLink(String senderNodeId, long linkSeq);
 
-        /** Returns the current contiguous high-water mark for the given origin (0 if unknown). */
-        long contiguousSeq(String originKey);
+        /** Current contiguous reliability high-water mark for the link from {@code senderNodeId}. */
+        long contiguousLinkSeq(String senderNodeId);
 
-        /** Resets the given origin's tracker to {@code newContiguous}, accepting loss below it. */
-        void resetTo(String originKey, long newContiguous);
+        /** Resets the link reliability frontier to {@code newContiguous}, accepting loss below it. */
+        void resetLinkTo(String senderNodeId, long newContiguous);
+
+        /** Our resume point for this link: last contiguous {@code linkSeq} we received from the peer. */
+        long linkResumePoint(String senderNodeId);
 
         /**
-         * Returns the resume points this node wants the remote to backfill from: one
-         * {@link ClusterResumePacket.Resume} per known origin, each carrying our last contiguous seq.
-         * Empty on a fresh node with no prior cluster state.
+         * Deduplication check on the origin identity. Returns {@code true} if this is the first time
+         * we have seen {@code (originKey, originSeq)} and it should be delivered, {@code false} if it
+         * is a duplicate to drop.
          */
-        List<ClusterResumePacket.Resume> resumePoints();
+        boolean acceptOrigin(String originKey, long originSeq);
+
+        /**
+         * Applies a received interest update (delta) from a peer to the routing table. Called for
+         * {@link ClusterInterestPacket}s arriving on this link.
+         */
+        void onInterestDelta(String nodeId, long version, String op, String topic);
+
+        /** Applies a received full interest-state sync from a peer to the routing table. */
+        void onInterestSync(String nodeId, long version, java.util.Set<String> topics);
     }
 
     private final Socket socket;
@@ -107,11 +139,16 @@ public class PeerLink {
      * Per-target publish handoff queue, owned by {@link ClusterManager} so it (like the replay
      * buffer) survives a link teardown: messages published while this target is partitioned
      * accumulate here and are drained by the next link's writer. The writer is the only consumer.
+     * <p>
+     * Phase D: entries carry the sender-assigned per-link {@code linkSeq} (see
+     * {@link ClusterManager.TargetState}); the {@link ReplayBuffer} keys on that.
      */
     private final BlockingQueue<ReplayBuffer.Entry> ingestQueue;
     private final ClusterMetrics metrics;
     private final Clock clock;
     private final Runnable onClose;
+    /** Supplies the full interest-state sync to send on link-up and never block the caller. */
+    private final java.util.function.Supplier<ClusterInterestSyncPacket> interestSyncSupplier;
 
     /** Control/backfill frames written verbatim by the writer (heartbeat, ack, resume, gap, replay). */
     private final BlockingQueue<OutboundItem> controlQueue = new LinkedBlockingQueue<>(CONTROL_QUEUE_CAPACITY);
@@ -122,16 +159,15 @@ public class PeerLink {
     /** Clock-time of the last received heartbeat; read by reader, written by reader only. */
     private long lastHeartbeatNanos;
 
-    /** Last contiguous high-water mark we ACKed to the remote, to suppress idle ACK spam. */
+    /** Last contiguous reliability high-water mark we ACKed to the remote, to suppress idle spam. */
     private long lastAckedSeqSent = -1L;
 
     /**
-     * Strict-ordering reorder buffer: per origin, the seqs received ahead of the contiguous
-     * frontier, awaiting their predecessors. Touched only by the single reader thread, so no lock
-     * is needed. Empty (and unused) in the default non-strict mode.
+     * Strict-ordering reorder buffer over the dense per-link {@code linkSeq}: seqs received ahead of
+     * the contiguous frontier, awaiting their predecessors. Touched only by the single reader
+     * thread, so no lock is needed. Empty (and unused) in the default non-strict mode.
      */
-    private final java.util.Map<String, java.util.TreeMap<Long, ClusterPublishPacket>> strictPending =
-            new java.util.HashMap<>();
+    private final java.util.TreeMap<Long, ClusterPublishPacket> strictPending = new java.util.TreeMap<>();
 
     /**
      * Full constructor with an injectable {@link Clock} for the heartbeat watchdog.
@@ -151,6 +187,7 @@ public class PeerLink {
             BlockingQueue<ReplayBuffer.Entry> ingestQueue,
             ClusterMetrics metrics,
             Clock clock,
+            java.util.function.Supplier<ClusterInterestSyncPacket> interestSyncSupplier,
             Runnable onClose
     ) throws IOException {
         this.socket = socket;
@@ -169,6 +206,7 @@ public class PeerLink {
         this.ingestQueue = ingestQueue;
         this.metrics = metrics;
         this.clock = clock;
+        this.interestSyncSupplier = interestSyncSupplier;
         this.onClose = onClose;
     }
 
@@ -180,6 +218,9 @@ public class PeerLink {
         lastHeartbeatNanos = clock.nanoTime();
         // Send our resume request first so the remote can backfill before live traffic flows.
         sendResumeRequest();
+        // Phase D: immediately push our full interest state so the new peer routes correctly from
+        // the very first publish (initial anti-entropy sync, analogous to the resume request).
+        sendInitialInterestSync();
         Thread.ofVirtual().name("cluster-writer-" + remoteNodeId).start(this::writerLoop);
         Thread.ofVirtual().name("cluster-reader-" + remoteNodeId).start(this::readerLoop);
         Thread.ofVirtual().name("cluster-hb-sender-" + remoteNodeId).start(this::heartbeatSenderLoop);
@@ -192,6 +233,14 @@ public class PeerLink {
 
     public boolean isRunning() {
         return running.get();
+    }
+
+    /** Enqueues an arbitrary control packet (e.g. an interest delta/sync) for the writer to send. */
+    public boolean enqueueControl(Packet packet) {
+        if (!running.get()) {
+            return false;
+        }
+        return controlQueue.offer(new OutboundItem.ControlFrame(packet));
     }
 
     /**
@@ -274,6 +323,8 @@ public class PeerLink {
             case "ClusterAckPacket" -> handleAck(envelope);
             case "ClusterResumePacket" -> handleResume(envelope);
             case "ClusterGapPacket" -> handleGap(envelope);
+            case "ClusterInterestPacket" -> handleInterest(envelope);
+            case "ClusterInterestSyncPacket" -> handleInterestSync(envelope);
             default -> log.debug("Unknown cluster packet '{}' from peer {}, ignoring", name, remoteNodeId);
         }
     }
@@ -286,22 +337,31 @@ public class PeerLink {
             log.warn("Malformed ClusterPublishPacket from peer {}: {}", remoteNodeId, e.getMessage());
             return;
         }
-        // ORDERING: cross-origin is intentionally unordered — each origin has an independent
-        // sequence space, so there is no defined order between messages from different origins.
-        // Within one origin, FIFO is naturally preserved in the lossless path by the monotonic seq
-        // over FIFO TCP. The strict-ordering flag additionally holds back forward gaps until the
-        // missing seqs fill (or are declared lost via a gap), at the cost of a small reorder buffer.
+        // RELIABILITY first, over the dense per-link linkSeq: this is the contiguous wire stream the
+        // ACK/backfill machinery tracks. A linkSeq we have already seen (a re-sent backfill frame, or
+        // a frame already covered) is a wire duplicate and must not advance anything twice.
+        boolean newOnWire = receiver.acceptLink(remoteNodeId, packet.getLinkSeq());
+
+        // DEDUP over the origin identity, independent of linkSeq: even a wire-new frame may carry a
+        // logical message we already delivered (e.g. it reached us once via interest routing and once
+        // via a broadcast-grace flood from a different code path). Drop those for the subscriber.
+        // ORDERING: cross-origin is intentionally unordered; within one origin FIFO holds in the
+        // lossless path. Strict mode additionally holds forward gaps in the linkSeq stream.
         String originKey = packet.getOriginNodeId() + ":" + packet.getOriginEpoch();
         if (strictOrdering) {
-            handlePublishStrict(originKey, packet);
+            handlePublishStrict(originKey, packet, newOnWire);
         } else {
+            if (!newOnWire) {
+                metrics.incrementMessagesDeduped();
+                return;
+            }
             deliverIfNew(originKey, packet);
         }
     }
 
-    /** Non-strict: deliver immediately; the tracker drops duplicates and tolerates forward gaps. */
+    /** Non-strict: deliver immediately; the origin tracker drops logical duplicates. */
     private void deliverIfNew(String originKey, ClusterPublishPacket packet) {
-        if (!receiver.accept(originKey, packet.getSeq())) {
+        if (!receiver.acceptOrigin(originKey, packet.getSeq())) {
             metrics.incrementMessagesDeduped();
             log.debug("Dropping duplicate origin={} seq={} from peer {}",
                     originKey, packet.getSeq(), remoteNodeId);
@@ -311,33 +371,51 @@ public class PeerLink {
     }
 
     /**
-     * Strict: buffer out-of-order seqs in {@link #strictPending} and only deliver once the origin's
-     * contiguous frontier reaches them, so subscribers see a per-origin in-order stream. Duplicates
-     * (seq &lt;= contiguous, or already pending) are dropped. A forward gap is filled by backfill;
-     * a declared-lost gap (via {@link ClusterGapPacket}) advances the frontier and flushes.
+     * Strict: buffer out-of-order {@code linkSeq}s in {@link #strictPending} and only deliver once
+     * the link's contiguous frontier reaches them, so subscribers see an in-order stream. Logical
+     * dedup over the origin identity still applies at delivery time.
      */
-    private void handlePublishStrict(String originKey, ClusterPublishPacket packet) {
-        long seq = packet.getSeq();
-        long contiguous = receiver.contiguousSeq(originKey);
-        var pending = strictPending.computeIfAbsent(originKey, k -> new java.util.TreeMap<>());
-
-        if (seq <= contiguous || pending.containsKey(seq)) {
+    private void handlePublishStrict(String originKey, ClusterPublishPacket packet, boolean newOnWire) {
+        long linkSeq = packet.getLinkSeq();
+        if (!newOnWire) {
+            // Already accepted on the wire (duplicate/backfill): nothing to buffer.
             metrics.incrementMessagesDeduped();
             return;
         }
-        pending.put(seq, packet);
-        // Flush every now-contiguous entry in order.
+        // acceptLink already advanced the contiguous frontier for in-order arrivals. For forward
+        // gaps it recorded the seq in its window but the frontier did not move; we still must hold
+        // delivery until the gap fills. Buffer and flush in linkSeq order.
+        long contiguous = receiver.contiguousLinkSeq(remoteNodeId);
+        if (linkSeq <= contiguous) {
+            // The frontier already covers this seq (it filled an immediate gap): deliver now.
+            deliverIfNew(originKey, packet);
+            flushStrictPending();
+            return;
+        }
+        strictPending.put(linkSeq, packet);
+        flushStrictPending();
+    }
+
+    /** Flushes every now-contiguous pending entry in linkSeq order. */
+    private void flushStrictPending() {
         while (true) {
-            long next = receiver.contiguousSeq(originKey) + 1;
-            ClusterPublishPacket head = pending.remove(next);
+            long next = receiver.contiguousLinkSeq(remoteNodeId);
+            ClusterPublishPacket head = strictPending.get(next);
             if (head == null) {
-                break;
+                // The contiguous frontier sits at `next`; the entry that fills `next` may itself be
+                // pending under its own linkSeq. Deliver any pending entry whose linkSeq <= frontier.
+                java.util.Map.Entry<Long, ClusterPublishPacket> first = strictPending.firstEntry();
+                if (first == null || first.getKey() > next) {
+                    break;
+                }
+                strictPending.pollFirstEntry();
+                String ok = first.getValue().getOriginNodeId() + ":" + first.getValue().getOriginEpoch();
+                deliverIfNew(ok, first.getValue());
+                continue;
             }
-            if (receiver.accept(originKey, next)) {
-                deliver(head);
-            } else {
-                metrics.incrementMessagesDeduped();
-            }
+            strictPending.remove(next);
+            String ok = head.getOriginNodeId() + ":" + head.getOriginEpoch();
+            deliverIfNew(ok, head);
         }
     }
 
@@ -348,7 +426,7 @@ public class PeerLink {
         topicSubscriptionHandler.deliverPacketToSubscribers(packet.getTopic(), outbound);
     }
 
-    /** Cumulative ACK from the remote: evict everything up to ackedSeq from our replay buffer. */
+    /** Cumulative ACK from the remote: evict everything up to the acked {@code linkSeq} from our ring. */
     private void handleAck(JSONObject envelope) {
         ClusterAckPacket ack;
         try {
@@ -358,17 +436,16 @@ public class PeerLink {
             return;
         }
         metrics.incrementAcksReceived();
+        // The reliability identity for our outbound ring is THIS link (localNodeId -> remoteNodeId).
+        // The peer echoes our local node id; any matching ack advances the ring head over linkSeq.
         for (ClusterAckPacket.Ack a : ack.getAcks()) {
-            // Single counter source: our outbound buffer holds only origin=self, so any ack for
-            // self applies. We accept all entries cumulatively (origin filter is the manager's job;
-            // here the buffer simply advances its head).
             if (a.originNodeId().equals(localNodeId)) {
                 replayBuffer.ackUpTo(a.ackedSeq());
             }
         }
     }
 
-    /** Remote (the receiver) tells us where to resume; backfill from our replay buffer. */
+    /** Remote (the receiver) tells us where to resume; backfill from our replay buffer over linkSeq. */
     private void handleResume(JSONObject envelope) {
         ClusterResumePacket resume;
         try {
@@ -377,48 +454,48 @@ public class PeerLink {
             log.warn("Malformed ClusterResumePacket from peer {}: {}", remoteNodeId, e.getMessage());
             return;
         }
+        boolean handled = false;
         for (ClusterResumePacket.Resume r : resume.getResumes()) {
-            // We only sourced messages with origin == self over this link.
-            if (!r.originNodeId().equals(localNodeId)) {
-                continue;
+            // We only sourced frames over this link with reliability identity == localNodeId.
+            if (r.originNodeId().equals(localNodeId)) {
+                backfill(r.lastContiguousSeq());
+                handled = true;
             }
-            backfill(r.originEpoch(), r.lastContiguousSeq());
         }
-        // If the remote sent no resume entry for us yet (fresh node), still backfill from 0 so a
-        // peer that connected after we already produced messages catches up.
-        if (resume.getResumes().stream().noneMatch(r -> r.originNodeId().equals(localNodeId))) {
-            backfill(localEpoch, 0L);
+        // Fresh peer with no resume entry for us yet: backfill from 0 so it catches up.
+        if (!handled) {
+            backfill(0L);
         }
     }
 
     /**
-     * Re-sends every buffered entry beyond {@code lastContiguousSeq}, or signals a
+     * Re-sends every buffered entry beyond {@code lastContiguousLinkSeq}, or signals a
      * {@link ClusterGapPacket} when the requested range has been evicted.
      */
-    private void backfill(long originEpoch, long lastContiguousSeq) {
-        ReplayBuffer.ReplayResult result = replayBuffer.replayFrom(lastContiguousSeq);
+    private void backfill(long lastContiguousLinkSeq) {
+        ReplayBuffer.ReplayResult result = replayBuffer.replayFrom(lastContiguousLinkSeq);
         if (result.gap()) {
-            log.info("Replay gap for origin {}:{} requested from {}, firstAvailable={} — sending gap",
-                    localNodeId, originEpoch, lastContiguousSeq, result.firstAvailableSeq());
+            log.info("Replay gap for link {} requested from {}, firstAvailable={} — sending gap",
+                    localNodeId, lastContiguousLinkSeq, result.firstAvailableSeq());
             metrics.incrementClusterGapEvents();
             controlQueue.offer(new OutboundItem.ControlFrame(new ClusterGapPacket(
-                    localNodeId, localNodeId, originEpoch, result.firstAvailableSeq())));
+                    localNodeId, localNodeId, localEpoch, result.firstAvailableSeq())));
             return;
         }
         List<ReplayBuffer.Entry> entries = result.entries();
         if (entries.isEmpty()) {
             return;
         }
-        log.info("Backfilling {} message(s) to peer {} from seq>{}",
-                entries.size(), remoteNodeId, lastContiguousSeq);
+        log.info("Backfilling {} message(s) to peer {} from linkSeq>{}",
+                entries.size(), remoteNodeId, lastContiguousLinkSeq);
         for (ReplayBuffer.Entry e : entries) {
-            // Re-send verbatim; the receiver's tracker drops anything it already delivered.
+            // Re-send verbatim; the receiver's link tracker drops anything it already accepted.
             controlQueue.offer(new OutboundItem.PreSerializedFrame(e.payload()));
         }
         metrics.addClusterBackfillMessages(entries.size());
     }
 
-    /** Remote signalled that messages we expected are unrecoverable; resync forward. */
+    /** Remote signalled that frames we expected are unrecoverable; resync the link frontier forward. */
     private void handleGap(JSONObject envelope) {
         ClusterGapPacket gap;
         try {
@@ -427,36 +504,50 @@ public class PeerLink {
             log.warn("Malformed ClusterGapPacket from peer {}: {}", remoteNodeId, e.getMessage());
             return;
         }
-        String originKey = gap.getOriginNodeId() + ":" + gap.getOriginEpoch();
         long newContiguous = gap.getFirstAvailableSeq() - 1;
-        log.info("Accepting data loss for origin {}: resync contiguousSeq -> {}", originKey, newContiguous);
-        receiver.resetTo(originKey, newContiguous);
+        log.info("Accepting data loss on link from {}: resync contiguous linkSeq -> {}",
+                remoteNodeId, newContiguous);
+        receiver.resetLinkTo(remoteNodeId, newContiguous);
         metrics.incrementClusterGapEvents();
         if (strictOrdering) {
-            flushStrictAfterGap(originKey);
+            flushStrictAfterGap();
         }
     }
 
-    /**
-     * After a declared gap advanced the frontier, drop now-stale pending entries and flush any that
-     * became contiguous, so strict-mode delivery resumes past the lost range.
-     */
-    private void flushStrictAfterGap(String originKey) {
-        var pending = strictPending.get(originKey);
-        if (pending == null) {
+    /** After a declared gap advanced the link frontier, drop stale pending entries and flush. */
+    private void flushStrictAfterGap() {
+        long contiguous = receiver.contiguousLinkSeq(remoteNodeId);
+        strictPending.headMap(contiguous + 1).clear();
+        flushStrictPending();
+    }
+
+    // -------------------------------------------------------------------------
+    // Interest handling (Phase D, receiving side)
+    // -------------------------------------------------------------------------
+
+    private void handleInterest(JSONObject envelope) {
+        ClusterInterestPacket interest;
+        try {
+            interest = ClusterInterestPacket.fromJson(envelope);
+        } catch (Exception e) {
+            log.warn("Malformed ClusterInterestPacket from peer {}: {}", remoteNodeId, e.getMessage());
             return;
         }
-        pending.headMap(receiver.contiguousSeq(originKey) + 1).clear();
-        while (true) {
-            long next = receiver.contiguousSeq(originKey) + 1;
-            ClusterPublishPacket head = pending.remove(next);
-            if (head == null) {
-                break;
-            }
-            if (receiver.accept(originKey, next)) {
-                deliver(head);
-            }
+        metrics.incrementInterestUpdatesReceived();
+        receiver.onInterestDelta(interest.getNodeId(), interest.getInterestVersion(),
+                interest.getOp(), interest.getTopic());
+    }
+
+    private void handleInterestSync(JSONObject envelope) {
+        ClusterInterestSyncPacket sync;
+        try {
+            sync = ClusterInterestSyncPacket.fromJson(envelope);
+        } catch (Exception e) {
+            log.warn("Malformed ClusterInterestSyncPacket from peer {}: {}", remoteNodeId, e.getMessage());
+            return;
         }
+        metrics.incrementInterestUpdatesReceived();
+        receiver.onInterestSync(sync.getNodeId(), sync.getInterestVersion(), sync.getTopics());
     }
 
     // -------------------------------------------------------------------------
@@ -474,16 +565,15 @@ public class PeerLink {
                     didWork = true;
                 }
                 // Then one live publish: append to the replay buffer (may block under backpressure
-                // — this is the ONLY place blocking is allowed) and send if it was buffered.
+                // — this is the ONLY place blocking is allowed) and send if it was buffered. The
+                // entry's seq() is the per-link linkSeq assigned by the sender for THIS target.
                 ReplayBuffer.Entry entry = ingestQueue.poll(didWork ? 0 : 100, TimeUnit.MILLISECONDS);
                 if (entry != null) {
                     if (replayBuffer.append(entry.seq(), entry.payload())) {
                         writeItem(new OutboundItem.PreSerializedFrame(entry.payload()));
                     } else {
-                        // The entry was dropped under backpressure (ring full past the offer
-                        // timeout, or DROP_GAP). Tell the receiver to resync its contiguous frontier
-                        // forward past the lost seq so it can keep ACKing — otherwise its
-                        // high-water mark would stall and the ring could never drain again.
+                        // Dropped under backpressure: tell the receiver to resync its contiguous
+                        // link frontier forward past the lost linkSeq so it keeps ACKing.
                         writeItem(new OutboundItem.ControlFrame(new ClusterGapPacket(
                                 localNodeId, localNodeId, localEpoch, entry.seq() + 1)));
                     }
@@ -563,29 +653,35 @@ public class PeerLink {
     }
 
     /**
-     * Sends a cumulative ACK for every origin we have received from, but only when the aggregate
-     * high-water mark advanced since the last ACK, to avoid idle spam. The remote's publishes carry
-     * origin == remoteNodeId in the single-hop topology, so we ack that origin's tracker.
+     * Sends a cumulative ACK carrying the contiguous reliability high-water mark for this link, but
+     * only when it advanced since the last ACK, to avoid idle spam. The reliability identity is the
+     * sending peer's node id (remoteNodeId) over linkSeq.
      */
     private void sendAckIfAdvanced() {
-        List<ClusterResumePacket.Resume> points = receiver.resumePoints();
-        long maxSeq = -1L;
-        java.util.List<ClusterAckPacket.Ack> acks = new java.util.ArrayList<>();
-        for (ClusterResumePacket.Resume r : points) {
-            acks.add(new ClusterAckPacket.Ack(r.originNodeId(), r.originEpoch(), r.lastContiguousSeq()));
-            maxSeq = Math.max(maxSeq, r.lastContiguousSeq());
+        long contiguous = receiver.contiguousLinkSeq(remoteNodeId);
+        if (contiguous <= lastAckedSeqSent) {
+            return; // nothing new to acknowledge
         }
-        if (acks.isEmpty() || maxSeq <= lastAckedSeqSent) {
-            return; // nothing received yet, or nothing new to acknowledge
-        }
-        lastAckedSeqSent = maxSeq;
-        if (controlQueue.offer(new OutboundItem.ControlFrame(new ClusterAckPacket(localNodeId, acks)))) {
+        lastAckedSeqSent = contiguous;
+        ClusterAckPacket.Ack ack = new ClusterAckPacket.Ack(remoteNodeId, 0L, contiguous);
+        if (controlQueue.offer(new OutboundItem.ControlFrame(
+                new ClusterAckPacket(localNodeId, List.of(ack))))) {
             metrics.incrementAcksSent();
         }
     }
 
     private void sendResumeRequest() {
-        List<ClusterResumePacket.Resume> points = receiver.resumePoints();
-        controlQueue.offer(new OutboundItem.ControlFrame(new ClusterResumePacket(localNodeId, points)));
+        // Our resume point for the link the remote sends to us: last contiguous linkSeq received.
+        long contiguous = receiver.linkResumePoint(remoteNodeId);
+        ClusterResumePacket.Resume point = new ClusterResumePacket.Resume(remoteNodeId, 0L, contiguous);
+        controlQueue.offer(new OutboundItem.ControlFrame(
+                new ClusterResumePacket(localNodeId, List.of(point))));
+    }
+
+    private void sendInitialInterestSync() {
+        ClusterInterestSyncPacket sync = interestSyncSupplier.get();
+        if (sync != null && controlQueue.offer(new OutboundItem.ControlFrame(sync))) {
+            metrics.incrementInterestUpdatesSent();
+        }
     }
 }

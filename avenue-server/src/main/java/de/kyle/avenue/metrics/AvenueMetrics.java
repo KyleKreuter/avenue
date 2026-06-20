@@ -201,13 +201,16 @@ public final class AvenueMetrics {
         if (cluster != null) {
             log.info("Avenue cluster metrics | activePeerLinks={} forwarded={} received={} "
                             + "deduped={} dropped={} | backfill={} gaps={} slowPeerStalls={} "
-                            + "acksSent={} acksReceived={} replayDepth={}",
+                            + "acksSent={} acksReceived={} replayDepth={} | interestSent={} "
+                            + "interestReceived={} routedSkipped={} routingTopics={}",
                     cluster.getActivePeerLinks(), cluster.getMessagesForwarded(),
                     cluster.getMessagesReceived(), cluster.getMessagesDeduped(),
                     cluster.getMessagesDropped(),
                     cluster.getClusterBackfillMessages(), cluster.getClusterGapEvents(),
                     cluster.getClusterSlowPeerStalls(), cluster.getAcksSent(),
-                    cluster.getAcksReceived(), cluster.getReplayBufferDepth());
+                    cluster.getAcksReceived(), cluster.getReplayBufferDepth(),
+                    cluster.getInterestUpdatesSent(), cluster.getInterestUpdatesReceived(),
+                    cluster.getInterestRoutedSkipped(), cluster.getRoutingTableTopicCount());
         }
     }
 }

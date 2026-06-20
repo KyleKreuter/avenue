@@ -116,6 +116,27 @@ class ClusterIntegrationTest {
         if (node1 != null) node1.stop();
     }
 
+    /**
+     * Phase D: a publish only reaches a remote subscriber once that node's interest has propagated
+     * to the PUBLISHER's node. Blocking on the subscribe ack alone is no longer sufficient (it only
+     * proves the subscription exists locally), so cross-node tests must additionally await interest
+     * convergence on the publisher node — deterministic, no fixed sleeps. The topic is normalized
+     * (lower-cased) the same way the server stores it.
+     */
+    private void awaitInterest(ClusterNode publisherNode, String subscriberNodeId, String topic)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + UNIT.toNanos(TIMEOUT);
+        while (System.nanoTime() < deadline) {
+            if (publisherNode.knowsInterest(subscriberNodeId, topic.toLowerCase(java.util.Locale.ROOT))) {
+                return;
+            }
+            Thread.sleep(20);
+        }
+        Assertions.assertTrue(
+                publisherNode.knowsInterest(subscriberNodeId, topic.toLowerCase(java.util.Locale.ROOT)),
+                "interest for '" + topic + "' from " + subscriberNodeId + " must converge on the publisher node");
+    }
+
     // -------------------------------------------------------------------------
     // Main cross-node pub/sub test (run 3x for determinism check)
     // -------------------------------------------------------------------------
@@ -133,6 +154,8 @@ class ClusterIntegrationTest {
             // Subscribe on node1. The ack guarantees the subscription is registered BEFORE
             // we publish on node2, eliminating any subscribe/publish race.
             clientA.subscribe("global", TOKEN, TIMEOUT, UNIT);
+            // Interest-based routing: wait until node2 (the publisher node) knows node1 wants "global".
+            awaitInterest(node2, "node-1", "global");
 
             // Publish on node2. Node2 will forward to node1 via the cluster link. Node1
             // will deliver to clientA.
@@ -165,6 +188,7 @@ class ClusterIntegrationTest {
 
             // Subscribe on node2.
             clientB.subscribe("reverse", TOKEN, TIMEOUT, UNIT);
+            awaitInterest(node1, "node-2", "reverse");
 
             // Publish on node1.
             clientA.publish("reverse", "hello-from-node1", "publisher-a", TOKEN);
@@ -188,6 +212,7 @@ class ClusterIntegrationTest {
             clientB.authenticate(SECRET, TIMEOUT, UNIT);
 
             clientA.subscribe("dedup", TOKEN, TIMEOUT, UNIT);
+            awaitInterest(node2, "node-1", "dedup");
             clientB.publish("dedup", "once", "publisher-b", TOKEN);
 
             // First delivery must arrive.

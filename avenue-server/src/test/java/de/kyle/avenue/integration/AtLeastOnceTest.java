@@ -89,6 +89,18 @@ class AtLeastOnceTest {
     }
 
     /**
+     * Phase D: a publish only flows to a remote subscriber once that node's interest has propagated
+     * to the publisher's node. These Phase C tests publish on node1 (the sender) and subscribe on
+     * node2 (the receiver), so node1 must first learn node2's interest. This is a deterministic
+     * convergence wait, not a fixed sleep.
+     */
+    private void awaitInterest(ClusterNode publisherNode, String subscriberNodeId, String topic)
+            throws InterruptedException {
+        awaitTrue(() -> publisherNode.knowsInterest(subscriberNodeId, topic.toLowerCase(java.util.Locale.ROOT)),
+                "interest for '" + topic + "' must converge on the publisher node");
+    }
+
+    /**
      * slow_peer_no_loss: with a SMALL replay ring and many in-flight messages, the writer blocks
      * (BLOCK policy) and only advances as cumulative ACKs evict the ring head. All N messages must
      * still arrive and no gap may be produced.
@@ -108,6 +120,7 @@ class AtLeastOnceTest {
             pub.authenticate(SECRET, TIMEOUT, UNIT);
             sub.authenticate(SECRET, TIMEOUT, UNIT);
             sub.subscribe("alo", TOKEN, TIMEOUT, UNIT);
+            awaitInterest(node1, "node-2", "alo");
 
             for (int i = 0; i < n; i++) {
                 pub.publish("alo", "m-" + i, "pub", TOKEN);
@@ -147,6 +160,7 @@ class AtLeastOnceTest {
             pub.authenticate(SECRET, TIMEOUT, UNIT);
             sub.authenticate(SECRET, TIMEOUT, UNIT);
             sub.subscribe("heal", TOKEN, TIMEOUT, UNIT);
+            awaitInterest(node1, "node-2", "heal");
 
             // Send half, let them arrive (so they sit un-acked in node1's buffer), then partition.
             for (int i = 0; i < m / 2; i++) {
@@ -211,6 +225,7 @@ class AtLeastOnceTest {
             pub.authenticate(SECRET, TIMEOUT, UNIT);
             sub.authenticate(SECRET, TIMEOUT, UNIT);
             sub.subscribe("ord", TOKEN, TIMEOUT, UNIT);
+            awaitInterest(node1, "node-2", "ord");
 
             for (int i = 0; i < n; i++) {
                 pub.publish("ord", Integer.toString(i), "pub", TOKEN);
@@ -251,6 +266,7 @@ class AtLeastOnceTest {
             pub.authenticate(SECRET, TIMEOUT, UNIT);
             sub.authenticate(SECRET, TIMEOUT, UNIT);
             sub.subscribe("ovf", TOKEN, TIMEOUT, UNIT);
+            awaitInterest(node1, "node-2", "ovf");
 
             int burst = 200;
             for (int i = 0; i < burst; i++) {

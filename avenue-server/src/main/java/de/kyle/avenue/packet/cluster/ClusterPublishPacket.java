@@ -18,7 +18,14 @@ import java.nio.charset.StandardCharsets;
  *       with its previous run</li>
  *   <li>{@code seq}          – strictly increasing per-origin sequence number; the
  *       {@code (originNodeId, originEpoch, seq)} triple replaces the old random {@code messageId}
- *       and is used for ordered deduplication</li>
+ *       and is the <b>deduplication</b> identity (a node never delivers the same origin seq twice)</li>
+ *   <li>{@code linkSeq}      – Phase D: the strictly-monotonic <b>per-link reliability sequence</b>
+ *       assigned by the sender for the specific target link this frame travels on. With
+ *       interest-based routing a given target only receives the publishes of the topics it is
+ *       interested in, so the {@code origin seq} stream it sees is sparse (full of holes). The
+ *       at-least-once layer (replay buffer / cumulative ACK / resume / gap) therefore keys on this
+ *       dense, gap-free {@code linkSeq} instead of the origin seq. Identity/dedup still uses the
+ *       {@code (originNodeId, originEpoch, seq)} triple — the two sequence spaces are independent.</li>
  *   <li>{@code data}         – payload (body)</li>
  * </ul>
  * Receiving nodes deliver the message locally and never re-forward it (single-hop rule in a
@@ -31,6 +38,7 @@ public class ClusterPublishPacket implements Packet {
     private final String originNodeId;
     private final long originEpoch;
     private final long seq;
+    private final long linkSeq;
     private final String data;
 
     public ClusterPublishPacket(
@@ -41,12 +49,34 @@ public class ClusterPublishPacket implements Packet {
             long seq,
             String data
     ) {
+        this(topic, source, originNodeId, originEpoch, seq, 0L, data);
+    }
+
+    public ClusterPublishPacket(
+            String topic,
+            String source,
+            String originNodeId,
+            long originEpoch,
+            long seq,
+            long linkSeq,
+            String data
+    ) {
         this.topic = topic;
         this.source = source;
         this.originNodeId = originNodeId;
         this.originEpoch = originEpoch;
         this.seq = seq;
+        this.linkSeq = linkSeq;
         this.data = data;
+    }
+
+    /**
+     * Returns a copy of this packet carrying the given per-link reliability sequence. Used by the
+     * sender to stamp the same logical publish with a target-specific {@code linkSeq} just before it
+     * is serialized for that one target link.
+     */
+    public ClusterPublishPacket withLinkSeq(long newLinkSeq) {
+        return new ClusterPublishPacket(topic, source, originNodeId, originEpoch, seq, newLinkSeq, data);
     }
 
     public String getTopic() {
@@ -69,6 +99,11 @@ public class ClusterPublishPacket implements Packet {
         return seq;
     }
 
+    /** Per-link reliability sequence (Phase D). {@code 0} on a packet that predates link-seq stamping. */
+    public long getLinkSeq() {
+        return linkSeq;
+    }
+
     public String getData() {
         return data;
     }
@@ -82,6 +117,7 @@ public class ClusterPublishPacket implements Packet {
         obj.put("originNodeId", originNodeId);
         obj.put("originEpoch", originEpoch);
         obj.put("seq", seq);
+        obj.put("linkSeq", linkSeq);
         return obj.toString().getBytes(StandardCharsets.UTF_8);
     }
 
@@ -107,6 +143,7 @@ public class ClusterPublishPacket implements Packet {
                 header.getString("originNodeId"),
                 header.getLong("originEpoch"),
                 header.getLong("seq"),
+                header.optLong("linkSeq", 0L),
                 body.getString("data")
         );
     }
