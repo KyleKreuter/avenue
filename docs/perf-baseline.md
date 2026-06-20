@@ -5,6 +5,29 @@ neuen `LoadHarness` (`avenue-server/src/test/java/de/kyle/avenue/benchmark/LoadH
 In Stufe 0 wurde **kein** Produktivcode geaendert; dies ist ausschliesslich der Nullpunkt,
 gegen den die Folgestufen gemessen werden.
 
+## Stand / Fazit (profilgefuehrte Server-Effizienz)
+
+Erreicht und JFR-/Test-belegt (Stufen 1, 1.5, 4a + Out-of-process-Harness):
+
+- **Inline-Delivery** (Executor-Hop pro Publish entfernt) → Median-Latenz p50 @120k **−30 %**.
+- **Nutzlast als `bytes`** (opaker ByteString-Passthrough) → die ~40 % Server-CPU in
+  protobuf-UTF-8-Transcoding (`String.charAt`) sind **restlos weg** (JFR).
+- **Outbound-Encode ohne Builder** (direkter `CodedOutputStream` in ein rechtsgrosses `byte[]`,
+  wire-identisch per Fuzz-Gleichheitstest) → Outbound-Builder/Message-Objektgraph **aus dem
+  Allokationsprofil verschwunden**, GC-Frequenz gesunken.
+- **encode-once Fan-out**, **buffered Read**, **single-normalize** — kleinere CPU-/Allok-Einsparungen.
+
+**Wichtigste Mess-Erkenntnis:** Der Wanduhr-Durchsatz (~250–300 k msg/s) ist auf dieser **einen
+Maschine** durch das gemeinsame CPU-/Loopback-Limit von Lastgenerator **und** Server gedeckelt —
+**nicht** durch den Server. Belegt durch out-of-process + die flache Skalierung unabhaengiger Paare
+und dadurch, dass das Entfernen von ~40 % Server-CPU den Durchsatz **nicht** bewegte. Deshalb ist die
+Erfolgsmetrik dieser Stufen **Server-CPU/Allokation pro Nachricht** (JFR), nicht die Wanduhr.
+
+**Naechste Stufe (Event-Loop-IO):** Der verbleibende strukturelle Block ist ~12–15 % in
+Virtual-Thread park/unpark (Reader→Writer-Hops). Den adressiert nur der Event-Loop-Rewrite (Stufe 3) —
+dessen eigentlicher Nutzen (Multi-Core-Skalierung Richtung 1M) sich aber erst auf einer **zweiten
+Maschine** (Lastgenerator uebers Netz) validieren laesst.
+
 ## Rahmenbedingungen
 
 | Feld | Wert |
