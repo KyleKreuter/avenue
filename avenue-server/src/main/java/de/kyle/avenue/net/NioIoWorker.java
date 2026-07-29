@@ -16,6 +16,7 @@ import java.util.Iterator;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * One NIO I/O worker: owns a {@link Selector}, a disjoint subset of client connections and a
@@ -67,6 +68,26 @@ final class NioIoWorker implements Runnable {
      */
     private final Queue<NioClientConnection> pendingWrites = new ConcurrentLinkedQueue<>();
 
+    /**
+     * Whether a cross-thread producer still has to issue a {@link Selector#wakeup()} to get this
+     * loop moving — i.e. whether the loop is about to block, or already blocked, in
+     * {@code select()}.
+     * <p>
+     * <b>Why this exists.</b> {@code wakeup()} is a real syscall (a write to the selector's self-pipe
+     * / kqueue). Calling it unconditionally in {@link #enableWrite} meant <em>one syscall per frame
+     * per foreign-owned subscriber</em>: an N-way fan-out whose subscribers live on other workers
+     * paid N syscalls per published message. JFR at fan-out 16 put {@code enableWrite} at 31,8 % of
+     * server CPU — the single hottest method, ahead of all real work.
+     * <p>
+     * <b>The protocol.</b> The loop sets this to {@code true} immediately before deciding to block
+     * and back to {@code false} once {@code select()} returns. A producer only wakes the selector if
+     * it wins the {@code true -> false} CAS, so a burst of enqueues produces at most one syscall.
+     * No wakeup can be lost: after arming the flag the loop re-checks its queues and downgrades to a
+     * non-blocking {@code selectNow()} when work arrived in the meantime, and a {@code wakeup()}
+     * issued just before {@code select()} is latched by the selector and returns immediately.
+     */
+    private final AtomicBoolean wakeupNeeded = new AtomicBoolean();
+
     private volatile Thread thread;
     private volatile boolean running = true;
     private long lastIdleSweepNanos = System.nanoTime();
@@ -104,9 +125,17 @@ final class NioIoWorker implements Runnable {
         if (connection.isClosed()) {
             return;
         }
-        SelectionKey key = keyFor(connection);
-        if (key != null && key.isValid()) {
-            key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+        // Cached key, never channel().keyFor(selector) — see NioClientConnection#key().
+        SelectionKey key = connection.key();
+        if (key == null || !key.isValid()) {
+            return;
+        }
+        int ops = key.interestOps();
+        if ((ops & SelectionKey.OP_WRITE) == 0) {
+            // Only WRITE the interest set when it actually changes. The getter is a plain field
+            // read; the setter goes through the selector's update lock and is comparatively
+            // expensive, and on a busy connection OP_WRITE is usually already armed.
+            key.interestOps(ops | SelectionKey.OP_WRITE);
         }
     }
 
@@ -155,7 +184,7 @@ final class NioIoWorker implements Runnable {
         }
         if (connection.markWriteEnableQueued()) {
             pendingWrites.add(connection);
-            selector.wakeup();
+            wakeupSelectorIfBlocked();
         }
     }
 
@@ -167,7 +196,18 @@ final class NioIoWorker implements Runnable {
     /** Enqueues a task and wakes the selector so it runs promptly. */
     private void execute(Runnable task) {
         taskQueue.add(task);
-        selector.wakeup();
+        wakeupSelectorIfBlocked();
+    }
+
+    /**
+     * Issues {@link Selector#wakeup()} only if the loop is (about to be) blocked in {@code select()},
+     * collapsing a burst of cross-thread enqueues into at most one wakeup syscall. See
+     * {@link #wakeupNeeded} for why this matters and why no wakeup can be lost.
+     */
+    private void wakeupSelectorIfBlocked() {
+        if (wakeupNeeded.compareAndSet(true, false)) {
+            selector.wakeup();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -183,7 +223,20 @@ final class NioIoWorker implements Runnable {
                 if (!running) {
                     break;
                 }
-                selector.select(SELECT_TIMEOUT_MS);
+                // Arm the wakeup flag BEFORE re-checking the queues: a producer that enqueues from
+                // here on either wins the CAS and wakes us, or lost the race to the re-check below.
+                wakeupNeeded.set(true);
+                try {
+                    if (pendingWrites.isEmpty() && taskQueue.isEmpty()) {
+                        selector.select(SELECT_TIMEOUT_MS);
+                    } else {
+                        // Work arrived while we were arming: poll without blocking so it is handled
+                        // this iteration instead of waiting out the select timeout.
+                        selector.selectNow();
+                    }
+                } finally {
+                    wakeupNeeded.set(false);
+                }
                 if (!selector.isOpen()) {
                     break;
                 }
@@ -315,10 +368,6 @@ final class NioIoWorker implements Runnable {
                 connection.close(topicSubscriptionHandler::unsubscribeFromAllTopics);
             }
         }
-    }
-
-    private SelectionKey keyFor(NioClientConnection connection) {
-        return connection.channel().keyFor(selector);
     }
 
     // ------------------------------------------------------------------

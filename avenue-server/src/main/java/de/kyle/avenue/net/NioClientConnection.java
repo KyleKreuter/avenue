@@ -129,6 +129,19 @@ public final class NioClientConnection implements ClientConnection {
         this.key = key;
     }
 
+    /**
+     * The cached selection key for this connection, or {@code null} before registration completed.
+     * <p>
+     * Callers must use this instead of {@code channel().keyFor(selector)}: the JDK's {@code keyFor}
+     * takes the channel's key lock and linearly scans its key array on every call, which on the
+     * fan-out path runs once per frame per subscriber. JFR at fan-out 16 attributed 46 % of server
+     * CPU to {@code enableWrite}, almost all of it in that lookup. The key is written once during
+     * registration and never changes, so a plain volatile read is equivalent and free.
+     */
+    SelectionKey key() {
+        return key;
+    }
+
     long lastReadNanos() {
         return lastReadNanos;
     }

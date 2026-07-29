@@ -79,10 +79,15 @@ if [[ -n "${JFR_OUT:-}" ]]; then
     echo "==> JFR enabled for BenchServer -> ${JFR_OUT}"
 fi
 
-echo "==> Starting BenchServer (separate JVM) on port ${PORT}"
+# Extra BenchServer arguments, e.g. to benchmark the selector transport:
+#   SERVER_ARGS="io-mode=nio io-threads=4" ./scripts/bench-split.sh 4180 publishers=8 ...
+read -r -a EXTRA_SERVER_ARGS <<< "${SERVER_ARGS:-}"
+
+echo "==> Starting BenchServer (separate JVM) on port ${PORT} ${SERVER_ARGS:+(${SERVER_ARGS})}"
 # ${ARR[@]+"${ARR[@]}"} so an empty array does not trip `set -u` on bash 3.2 (macOS system bash).
 "${JAVA_BIN}" ${SERVER_JVM_OPTS[@]+"${SERVER_JVM_OPTS[@]}"} \
     -cp "${FULL_CP}" de.kyle.avenue.benchmark.BenchServer "port=${PORT}" \
+    ${EXTRA_SERVER_ARGS[@]+"${EXTRA_SERVER_ARGS[@]}"} \
     >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 

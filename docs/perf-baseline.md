@@ -257,6 +257,65 @@ ein kleiner Posten.
 > ist die 5-Sekunden-Deadline der Empfangsschleife bei künstlich winzigem Replay-Ring (16 Einträge,
 > BLOCK-Policy): ein Durchsatz-gegen-Uhr-Test. Isoliert lief er mit der Änderung 3×3 Durchläufe grün.
 
+## Stufe 4c — NIO-Fan-out: Befund und Korrektur einer Fehlinterpretation
+
+### Der Befund: NIO bricht bei hohem Fan-out ein
+
+Stufe 3 hat NIO gegen Blocking nur bei **unabhängigen Paaren (Fan-out 1)** gemessen und dort Parität
+festgestellt. Bei **Fan-out 16** gilt das nicht:
+
+| Transport (1 Publisher, 16 Subscriber, 100 B, 30 s) | Zustellrate |
+| --- | --- |
+| blocking | **~729 000 msg/s** |
+| nio (io-threads=4) | **~323 000 msg/s** |
+
+NIO liefert bei hohem Fan-out also nur etwa **44 %** des Blocking-Durchsatzes. Die
+Paritäts-Aussage aus Stufe 3 ist damit auf Fan-out 1 zu beschränken.
+
+### Warum — und was daran NICHT das Problem ist
+
+Das JFR-Profil des NIO-Laufs zeigt `NioIoWorker.enableWrite` als Top-Methode mit **31,8 %**, später
+sogar 46 %. Das ist eine **Falle**, und sie ist hier dokumentiert, weil sie leicht zu einer falschen
+Optimierung führt: Der NIO-Lauf hat in 30 Sekunden nur **35–44 `ExecutionSample`s**, der
+Blocking-Lauf **469**. In absoluten Zahlen sind 46 % von 39 Samples ≈ 18 Samples — gegenüber einer
+Blocking-Last, die um ein Vielfaches darüber liegt. Die mittlere JVM-CPU bestätigt es: **~20,6 %**
+(blocking) gegenüber **~12–16 %** (nio).
+
+**Der NIO-Server ist bei Fan-out nicht CPU-limitiert, er wartet.** Er verbraucht *weniger* CPU und
+liefert *weniger* Durchsatz. Der Engpass ist strukturell die Selector-Runde: Lesen → Fan-out →
+`OP_WRITE` armen → nächste `select()`-Runde → schreiben, also ein Round-Trip pro Batch, während der
+Blocking-Writer eine ganze Charge über den `BufferedOutputStream` sammelt und mit einem Syscall
+hinausschreibt. Ein Prozentanteil auf einer 39-Sample-Stichprobe taugt nicht als Optimierungsziel;
+maßgeblich ist die absolute CPU-Zeit.
+
+### Was trotzdem umgesetzt wurde (korrekt, aber ohne Durchsatzwirkung)
+
+1. **Gecachter `SelectionKey` statt `channel().keyFor(selector)`.** Die JDK-Methode nimmt den
+   Key-Lock des Channels und scannt dessen Key-Array linear — und lief einmal pro Frame pro
+   Subscriber, obwohl die Connection ihren Key seit der Registrierung ohnehin in einem
+   `volatile`-Feld hält. Eindeutige Verbesserung ohne Nachteil.
+2. **`interestOps` nur schreiben, wenn `OP_WRITE` fehlt.** Der Getter ist ein Feldzugriff, der
+   Setter geht über den Update-Lock des Selectors; auf einer belasteten Verbindung ist `OP_WRITE`
+   meist schon gesetzt.
+3. **`selector.wakeup()` nur, wenn der Loop blockiert ist** (`wakeupNeeded`-Flag, CAS pro Burst).
+   `wakeup()` ist ein Syscall und lief bisher pro Frame pro fremdgehostetem Subscriber. Kein
+   Wakeup kann verloren gehen: der Loop armt das Flag vor der Blockierentscheidung, prüft danach
+   seine Queues erneut und degradiert auf `selectNow()`, wenn zwischenzeitlich Arbeit ankam.
+
+**Ehrliche Bewertung:** Gemessen am Durchsatz bewegt sich davon **nichts** (~323 k → ~300 k, also
+innerhalb der Streuung). Punkt 1 und 2 sind reine Aufräumarbeiten mit klarem Vorzeichen. Punkt 3
+kostet zusätzliche Nebenläufigkeitskomplexität ohne belegten Nutzen bei dieser Last — er ist als
+Vorsorge für höhere Worker-/Verbindungszahlen drin, nicht als gemessener Gewinn.
+
+### Konsequenz für die weitere Arbeit
+
+Der lohnende Angriffspunkt bleibt der **Blocking-Transport** (Default, und die einzige Konfiguration
+mit echter CPU-Last): dort dominieren im Allokationsprofil bei Fan-out 16 `LinkedBlockingQueue$Node`
+(~15,7 %) und `OutboundFrame$PreSerialized` (~10,1 %) — also genau die Objekte, die ein
+Outbound-Ringpuffer ersetzt — und im CPU-Profil über 50 % Virtual-Thread-Hop-Mechanik
+(`unparkVirtualThread`, `getAndBitwiseAndInt`, `LockSupport.unpark`, ForkJoin). Letztere adressiert
+kein Speicher-Layout, sondern nur eine Änderung daran, *wann* der Writer-Thread geweckt wird.
+
 ## Stufe 3 — Event-Loop-IO (hand-rolled NIO-Selector, `server.io-mode=nio`)
 
 > **Ehrliche Einordnung vorweg.** Auf **einer** Maschine (Loopback, Lastgenerator + Server teilen
