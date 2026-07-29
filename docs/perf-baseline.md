@@ -150,6 +150,7 @@ Arbeitspunkt (`rate=120000`), und die abgeleiteten ns/Nachricht (= 1e9 / Saettig
 | 2 — Protokoll-Pipelining / Batched Publish | | | |
 | 3 — Event-Loop-IO (nio) | ~268 000 – 296 000 (Paare P=8, io-threads=4) | n/a | s. u. |
 | 4b — Flat Fan-out: CoW-Array + gestripte Metriken (JFR: CPU-Win) | Durchsatz im Streuband, s. u. | n/a | n/a |
+| 4d — Outbound-Swap-Buffer (JFR: **-53 % Server-CPU/Nachricht**) | Durchsatz im Streuband, s. u. | n/a | n/a |
 | 4 — Allokations-/GC-Disziplin | | | |
 
 ## Stufe 4b — Flat Layout im Fan-out (Copy-on-Write-Array, gestripte Metriken)
@@ -256,6 +257,92 @@ ein kleiner Posten.
 > Interest-Transitionen wäre also dort gescheitert, nicht erst beim Empfangszähler. Was fehlschlägt,
 > ist die 5-Sekunden-Deadline der Empfangsschleife bei künstlich winzigem Replay-Ring (16 Einträge,
 > BLOCK-Policy): ein Durchsatz-gegen-Uhr-Test. Isoliert lief er mit der Änderung 3×3 Durchläufe grün.
+
+## Stufe 4d — Outbound-Swap-Buffer statt Objekt-Queue (und ein widerlegter Spin)
+
+Der Kern von Stufe 4: Auf dem Client-Outbound-Pfad wandern keine Objekte mehr. Statt einer
+`LinkedBlockingQueue<OutboundFrame>` hält jede Verbindung **zwei vorab allokierte `byte[]`-Puffer**.
+Produzenten kopieren die bereits gerahmten Bytes (4-Byte-Längenpräfix + Payload) in den Füllpuffer;
+der Writer tauscht ihn gegen seinen eigenen und schreibt die **ganze Charge mit einem einzigen
+`write`**. Enqueue ist damit ein `memcpy` plus zwei Zähler — kein Queue-Knoten, kein Frame-Wrapper,
+und der `BufferedOutputStream` entfällt ersatzlos (er hätte jedes Byte ein zweites Mal kopiert).
+
+Übergroße Frames (größer als ein Puffer) gehen in eine Overflow-Queue, die strikt FIFO an den
+Füllpuffer gekoppelt ist. Dadurch bleibt jede Nutzlast bis `server.packet.max-size` zustellbar,
+unabhängig davon, wie klein `server.outbound.ring-bytes` gesetzt ist.
+
+### Ergebnis (Fan-out 16, 30 s, out-of-process, Server isoliert)
+
+| | Queue (vorher) | Swap-Buffer (nachher) |
+| --- | --- | --- |
+| On-CPU-Samples | 469 (**15,6/s**) | 219 (**7,3/s**) |
+| davon Virtual-Thread-Hop-Mechanik, absolut | 297 | **142** |
+| Young-GCs | 13 | **9** |
+| Zustellrate | 728 601/s | 726 195/s |
+
+**Die Server-CPU pro zugestellter Nachricht halbiert sich** (15,6 → 7,3 Samples/s bei praktisch
+identischem Durchsatz), die GC-Frequenz sinkt um ein Drittel. Aus dem Allokationsprofil
+verschwinden vollständig:
+
+| Posten | vorher |
+| --- | --- |
+| `LinkedBlockingQueue$Node` | 16,4 % |
+| `OutboundFrame$PreSerialized` | 9,7 % |
+| `ArrayList$Itr` (Batch-Liste des Writers) | 5,8 % |
+
+zusammen **rund 32 Prozentpunkte der Allokation**. Die Klasse `OutboundFrame` ist damit ersatzlos
+gelöscht.
+
+> **Zur Lesart der Prozentzahlen:** Der *Anteil* der Virtual-Thread-Mechanik bleibt bei rund zwei
+> Dritteln — aber an einer halb so großen Gesamtmenge. Absolut sinkt er von 297 auf 142 Samples.
+> Anteile taugen nur zum Vergleich innerhalb eines Laufs; zwischen zwei Läufen zählt die absolute
+> Menge. (Genau diese Verwechslung hat in Stufe 4c zu einer Fehloptimierung geführt.)
+
+### Ein selbstverschuldeter Bug, festgehalten weil lehrreich
+
+Die erste Fassung signalisierte die Writer-Condition nur, wenn der Writer beobachtbar geparkt war
+(„sonst sieht er die Arbeit ohnehin selbst"). Das klingt sparsam und ist falsch: Wecksignale gingen
+verloren, und der `AtLeastOnceTest`-Cluster-Pfad brauchte statt ~13 s plötzlich 25–36 s und riss
+seine Deadline — auch isoliert, also keine Flakiness. Nachweis per A/B auf derselben Maschine:
+ohne den Umbau 3× grün in 13,6 s, mit bedingtem Signal 25–36 s und Ausfälle, mit unbedingtem Signal
+wieder 12,9–15,6 s und 3× grün.
+
+Ein `signal()` ohne wartenden Thread ist billig — der Lock wird ohnehin gehalten. Zu erraten, wann
+der Writer ein Signal *braucht*, ist diese Ersparnis nicht wert. Der Code signalisiert jetzt
+unbedingt, genau wie die `LinkedBlockingQueue`, die er ersetzt hat.
+
+### Der Spin-before-park — gebaut, gemessen, verworfen
+
+Die zweite Maßnahme war, den Writer vor dem Parken kurz auf neue Arbeit warten zu lassen, um die
+teure Park/Unpark-Runde des virtuellen Threads zu sparen. Isoliert gemessen über den neuen
+Schalter `server.outbound.writer-spins`:
+
+| Szenario | ohne Spin | mit Spin (512) |
+| --- | --- | --- |
+| Fan-out 16, On-CPU-Samples/s | **9,6** | 11,6 |
+| Fan-out 16, Zustellrate | 697 118 / 691 748 | 691 959 / 698 160 |
+| Fan-out 1, Publish-Rate | **283 754 / 281 792** | 277 627 / 259 247 |
+
+Der Spin senkt zwar den *Anteil* der Park/Unpark-Mechanik (~36 % → ~24 %), aber er senkt nicht die
+Arbeit — er ersetzt Warten durch Busy-Waiting und erhöht dabei die **absolute** CPU-Last. Beim
+Durchsatz bringt er bei Fan-out 16 nichts und kostet bei Fan-out 1 messbar. **Default ist deshalb
+`0` (aus).** Der Schalter bleibt erhalten, weil die Abwägung lastabhängig ist und auf Maschinen mit
+mehr Kernen oder mit entferntem Lastgenerator anders ausfallen kann — aber als Vorgabe ist er
+widerlegt.
+
+### Nebenwirkung: `server.batch.max-frames` ist für den Client-Writer wirkungslos
+
+Die Frame-Obergrenze pro Flush approximierte, was der Swap-Buffer jetzt exakt macht: eine Charge ist
+"alles, was seit dem letzten Flush angefallen ist". Der Schlüssel wird weiterhin geparst (bestehende
+Konfigurationen brechen nicht) und vom Getter gemeldet, aber nichts wertet ihn mehr aus. Das
+Cluster-Pendant `cluster.batch.max-frames` ist unberührt und weiterhin wirksam.
+
+### Korrektheit
+
+Neu: `OutboundBufferIntegrationTest` (3 Tests über echte Sockets) für genau die Pfade, die der
+bestehende Bestand nicht berührt, weil dort alle Nachrichten klein sind:
+Zustellung einer 200-KiB-Nutzlast über den Overflow-Pfad, FIFO-Ordnung über gemischt kleine und
+übergroße Frames hinweg, und ein Burst von 2000 kleinen Frames über mehrere Pufferwechsel.
 
 ## Stufe 4c — NIO-Fan-out: Befund und Korrektur einer Fehlinterpretation
 

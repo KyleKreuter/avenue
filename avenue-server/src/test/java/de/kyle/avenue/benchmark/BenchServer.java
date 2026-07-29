@@ -75,6 +75,10 @@ public final class BenchServer {
         // perf comparison drive the exact same BenchServer config through both transports.
         String ioMode = stringArg(args, "io-mode", "blocking");
         int ioThreads = (int) longArg(args, "io-threads", 0);
+        // Outbound writer tuning, so the effect of each knob can be isolated in a benchmark rather
+        // than only asserted in theory. -1 means "leave the configured default alone".
+        int ringBytes = (int) longArg(args, "ring-bytes", 0);
+        int writerSpins = (int) longArg(args, "writer-spins", -1);
 
         // Direct-value (test) config. The 26-arg overload is the one that lets us pin
         // clientIdleTimeoutMillis=0 (no reaping) and maxConnections=0 (unlimited). serverTcpNoDelay
@@ -103,8 +107,12 @@ public final class BenchServer {
         // Flip the transport via the copy constructor (direct-value configs always default to
         // blocking). io-mode=blocking leaves the config untouched.
         config = new AvenueConfig(config, ioMode, ioThreads);
-        System.out.printf(Locale.ROOT, "BenchServer io-mode=%s nioIoThreads=%d%n",
-                config.getServerIoMode(), config.getServerNioIoThreads());
+        // Outbound buffer size / writer spin override (blocking transport).
+        config = new AvenueConfig(config, ringBytes, writerSpins);
+        System.out.printf(Locale.ROOT,
+                "BenchServer io-mode=%s nioIoThreads=%d ringBytes=%d writerSpins=%d%n",
+                config.getServerIoMode(), config.getServerNioIoThreads(),
+                config.getServerOutboundRingBytes(), config.getServerWriterSpins());
 
         SingleNodeServer server = new SingleNodeServer(config);
         // Clean shutdown on Ctrl-C / process kill (SIGTERM). SingleNodeServer also registers its own

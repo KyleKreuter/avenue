@@ -158,7 +158,9 @@ Highlights:
 | `server.io-mode` | `blocking` | `blocking` (thread-per-connection) or `nio` (selector event loop). |
 | `server.tls.enabled` | `false` | TLS on the client port (PKCS12 keystore). |
 | `server.backpressure.policy` | `DISCONNECT_SLOW_CONSUMER` | Slow-consumer handling. |
-| `server.batch.max-frames` | `64` | Write-coalescing batch size (`1` = flush per frame). |
+| `server.outbound.ring-bytes` | `65536` | Per-client outbound buffer size. Two are allocated per connection. |
+| `server.outbound.writer-spins` | `0` | Writer spin-before-park iterations. Off by default (measured slower). |
+| `server.batch.max-frames` | `64` | *No longer in effect for the client writer* (batching is implicit now); still applies to `cluster.batch.max-frames`. |
 | `cluster.enabled` | `false` | Master switch for cluster mode. |
 | `cluster.node-id` | *(required when enabled)* | Stable node identity. |
 | `cluster.secret` | *(empty)* | Shared HMAC secret for the peer handshake. |

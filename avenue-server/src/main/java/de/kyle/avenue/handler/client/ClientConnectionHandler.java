@@ -11,19 +11,17 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Handles a single client connection.
@@ -34,14 +32,27 @@ import java.util.concurrent.TimeUnit;
  * fan-out to all other subscribers. Only the writer thread touches the {@link DataOutputStream},
  * which is why no write lock is needed any more.
  * <p>
- * Wire format: the queue carries {@link OutboundFrame}s. High-rate publish fan-out enqueues a
- * {@link OutboundFrame.PreSerialized} whose payload bytes were serialized <em>once</em> in
- * {@link TopicSubscriptionHandler#deliverPacketToSubscribers} and shared across every subscriber
- * (encode-once fan-out, O(1) instead of O(N) serialization); the writer just frames the bytes via
- * {@link PacketFraming#writeFrameNoFlush}. Low-rate request/response answers (auth-token response,
- * subscribe-ack) enqueue a {@link OutboundFrame.Envelope} via {@link #enqueue(ClientEnvelope)};
- * the writer serializes those lazily via {@link WireCodec#encodeClient}. Inbound frames are read
- * raw and handed to the {@link InboundPacketHandler}, which decodes and dispatches them.
+ * <h2>Outbound path: swap buffers instead of a queue of frame objects</h2>
+ * Outbound bytes do not travel as objects. Producers append the <em>already framed</em> bytes
+ * (4-byte length prefix + payload) straight into a pre-allocated {@code byte[]} fill buffer; the
+ * writer swaps that buffer for its own and flushes the whole batch with a single
+ * {@code write}/{@code flush}. Enqueueing is therefore a {@code memcpy} plus two counter updates —
+ * no {@code LinkedBlockingQueue$Node}, no per-frame wrapper object, no {@code BufferedOutputStream}
+ * copy in between.
+ * <p>
+ * This replaced a bounded {@code LinkedBlockingQueue<OutboundFrame>}, whose node and
+ * {@code PreSerialized} wrapper together accounted for ~26 % of server allocation at fan-out 16
+ * (JFR). The publish fan-out still serializes each envelope exactly once and shares the same
+ * immutable {@code byte[]} across all subscribers (encode-once, O(1) instead of O(N)); each
+ * subscriber connection merely copies those bytes into its own buffer.
+ * <p>
+ * Frames larger than one buffer are never rejected: they go to an {@link #overflow} queue that is
+ * strictly FIFO-coupled with the fill buffer, so a payload up to {@code server.packet.max-size}
+ * stays deliverable whatever {@code server.outbound.ring-bytes} is set to. Low-rate
+ * request/response answers ({@link #enqueue(ClientEnvelope)}) are serialized via
+ * {@link WireCodec#encodeClient} at enqueue time and travel the same path, preserving FIFO order
+ * with the publish stream. Inbound frames are read raw and handed to the
+ * {@link InboundPacketHandler}, which decodes and dispatches them.
  * <p>
  * Liveness (E16): when {@code server.client.idle-timeout-ms > 0} a {@link Socket#setSoTimeout
  * read timeout} is applied. If no byte arrives from the client within that window the read
@@ -56,12 +67,6 @@ public class ClientConnectionHandler implements ClientConnection, Runnable {
     private static final Logger log = LoggerFactory.getLogger(ClientConnectionHandler.class);
 
     /**
-     * Size of the {@link BufferedOutputStream} the writer flushes once per batch. Large enough that a
-     * full coalesced batch of small fan-out frames accumulates without an intermediate auto-flush.
-     */
-    private static final int OUTPUT_BUFFER_BYTES = 64 * 1024;
-
-    /**
      * Size of the {@link BufferedInputStream} layered under the {@link DataInputStream}. Symmetric to
      * the buffered write side: it coalesces many small length-prefixed frames into far fewer read
      * syscalls under load, while still surfacing the {@link SocketTimeoutException} that drives the
@@ -73,23 +78,66 @@ public class ClientConnectionHandler implements ClientConnection, Runnable {
     private final Socket client;
     private final InputStream inputStream;
     private final OutputStream outputStream;
-    private final DataOutputStream dataOutputStream;
     private final InboundPacketHandler inboundPacketHandler;
     private final TopicSubscriptionHandler topicSubscriptionHandler;
     private final AvenueConfig avenueConfig;
     private final AvenueMetrics metrics;
     private final Runnable onDisconnect;
 
-    /** Bounded outbound queue. Backpressure is applied via offer() with a short timeout. */
-    private final BlockingQueue<OutboundFrame> outboundQueue;
     private final long offerTimeoutMillis;
     private final BackpressurePolicy backpressurePolicy;
     private final long idleTimeoutMillis;
-    /** Max frames the writer coalesces into one buffered flush (write-batching). 1 = legacy flush-per-frame. */
-    private final int batchMaxFrames;
     private Thread writerThread;
 
     private volatile boolean running;
+
+    // ------------------------------------------------------------------
+    // Outbound swap buffers
+    // ------------------------------------------------------------------
+
+    /** Guards every field below; held only for memcpy + counter updates, never across a socket write. */
+    private final ReentrantLock outboundLock = new ReentrantLock();
+    /** Signalled when the writer has drained, i.e. buffer space became available for producers. */
+    private final Condition notFull = outboundLock.newCondition();
+    /** Signalled when a producer appended work for the writer. */
+    private final Condition notEmpty = outboundLock.newCondition();
+
+    /** Producers append framed bytes here; swapped with {@link #drainBuffer} by the writer. */
+    private byte[] fillBuffer;
+    /** The writer's buffer. Only the writer touches its contents, and only outside the lock. */
+    private byte[] drainBuffer;
+    /** Bytes currently used in {@link #fillBuffer}. */
+    private int fillLength;
+    /** Frames currently in {@link #fillBuffer}; the portion of {@link #pendingFrames} it accounts for. */
+    private int fillFrames;
+    /** Capacity of a single buffer, from {@code server.outbound.ring-bytes}. */
+    private final int bufferCapacity;
+
+    /**
+     * Payloads too large to fit in a buffer at all. Strictly FIFO-coupled with the fill buffer: once
+     * this is non-empty, ordinary frames must wait for it to drain rather than overtake it.
+     */
+    private final Deque<byte[]> overflow = new ArrayDeque<>();
+
+    /**
+     * Frames buffered but not yet handed to the socket, across fill buffer and overflow. Preserves
+     * the {@code server.outbound.queue.capacity} semantics (a bound in <em>frames</em>) that the
+     * bounded queue provided, and feeds the queue-depth metric. Written under the lock, read without
+     * it by the writer's spin phase, hence volatile.
+     */
+    private volatile int pendingFrames;
+
+    /** Frame-count bound, mirroring the previous bounded queue's capacity. */
+    private final int frameCapacity;
+
+    /**
+     * {@link Thread#onSpinWait()} iterations the writer burns looking for more work before it parks.
+     * Defaults to {@code 0} (off): spinning shifts CPU out of the park/unpark machinery but raises
+     * total CPU and costs throughput at low fan-out — see {@code AvenueConfig#serverWriterSpins} for
+     * the measurements.
+     */
+    private final int writerSpins;
+
 
     /** Backwards-compatible constructor (no metrics, no disconnect callback). */
     public ClientConnectionHandler(
@@ -119,23 +167,23 @@ public class ClientConnectionHandler implements ClientConnection, Runnable {
     ) throws IOException {
         this.client = client;
         this.inputStream = client.getInputStream();
+        // No BufferedOutputStream: the swap buffers already coalesce a whole batch, so wrapping the
+        // socket stream would only add a second copy of every byte on the way out.
         this.outputStream = client.getOutputStream();
-        // Write-batching: layer a BufferedOutputStream UNDER the DataOutputStream so the writer can
-        // accumulate many fan-out frames (writeFrameNoFlush) and push them with a single flush() per
-        // batch — far fewer write syscalls / TCP segments under load.
-        this.dataOutputStream =
-                new DataOutputStream(new BufferedOutputStream(this.outputStream, OUTPUT_BUFFER_BYTES));
         this.running = true;
         this.inboundPacketHandler = inboundPacketHandler;
         this.avenueConfig = avenueConfig;
         this.topicSubscriptionHandler = topicSubscriptionHandler;
         this.metrics = metrics;
         this.onDisconnect = onDisconnect;
-        this.outboundQueue = new LinkedBlockingQueue<>(avenueConfig.getOutboundQueueCapacity());
         this.offerTimeoutMillis = avenueConfig.getOutboundQueueOfferTimeoutMillis();
         this.backpressurePolicy = avenueConfig.getBackpressurePolicy();
         this.idleTimeoutMillis = avenueConfig.getClientIdleTimeoutMillis();
-        this.batchMaxFrames = Math.max(1, avenueConfig.getServerBatchMaxFrames());
+        this.frameCapacity = Math.max(1, avenueConfig.getOutboundQueueCapacity());
+        this.writerSpins = Math.max(0, avenueConfig.getServerWriterSpins());
+        this.bufferCapacity = Math.max(1024, avenueConfig.getServerOutboundRingBytes());
+        this.fillBuffer = new byte[bufferCapacity];
+        this.drainBuffer = new byte[bufferCapacity];
     }
 
     private void listen() throws IOException {
@@ -187,31 +235,67 @@ public class ClientConnectionHandler implements ClientConnection, Runnable {
      * first write error.
      */
     private void writerLoop() {
-        // Reused per-batch scratch list so a single iteration coalesces every already-queued frame
-        // into one buffered flush (write-batching). batchMaxFrames - 1 because the blocking poll
-        // already took the first frame of the batch.
-        List<OutboundFrame> batch = new ArrayList<>(batchMaxFrames);
         try {
-            while (this.running || !outboundQueue.isEmpty()) {
-                OutboundFrame first = outboundQueue.poll(200, TimeUnit.MILLISECONDS);
-                if (first == null) {
-                    continue;
+            while (true) {
+                // Spin before parking: under sustained load the next frame is usually microseconds
+                // away, and parking would cost a virtual-thread unmount plus an unpark from the
+                // producer. A short spin picks that frame up without ever suspending.
+                for (int i = 0; i < writerSpins && pendingFrames == 0 && running; i++) {
+                    Thread.onSpinWait();
                 }
-                // Opportunistically grab everything ALREADY waiting (FIFO, no artificial wait) so one
-                // flush amortizes the whole burst. At low load drainTo adds nothing and the batch is
-                // a single frame — identical to the legacy per-frame flush, no added latency.
-                writeFrameNoFlush(first);
-                if (batchMaxFrames > 1) {
-                    batch.clear();
-                    outboundQueue.drainTo(batch, batchMaxFrames - 1);
-                    for (OutboundFrame frame : batch) {
-                        writeFrameNoFlush(frame);
+
+                byte[] batch;
+                int batchLength;
+                byte[] oversized = null;
+                outboundLock.lock();
+                try {
+                    while (running && pendingFrames == 0) {
+                        // Bounded wait so a closing connection is noticed even without a signal.
+                        if (!notEmpty.await(200, TimeUnit.MILLISECONDS)) {
+                            break;
+                        }
                     }
+                    if (!running && pendingFrames == 0) {
+                        return;
+                    }
+                    if (pendingFrames == 0) {
+                        continue; // spurious/timed-out wake-up
+                    }
+                    if (fillLength > 0) {
+                        // Swap: the writer takes the filled buffer and hands its (now free) one back,
+                        // so producers can keep appending while this batch goes to the socket. The
+                        // frames leave the accounting right here, mirroring the old drainTo() which
+                        // also freed queue slots before the bytes reached the socket.
+                        byte[] swap = drainBuffer;
+                        drainBuffer = fillBuffer;
+                        fillBuffer = swap;
+                        batch = drainBuffer;
+                        batchLength = fillLength;
+                        fillLength = 0;
+                        pendingFrames -= fillFrames;
+                        fillFrames = 0;
+                    } else {
+                        // Nothing in the fill buffer: the pending work is an oversized frame.
+                        batch = null;
+                        batchLength = 0;
+                        oversized = overflow.pollFirst();
+                        if (oversized != null) {
+                            pendingFrames--;
+                        }
+                    }
+                    // Space freed: let producers blocked on the offer timeout continue.
+                    notFull.signalAll();
+                } finally {
+                    outboundLock.unlock();
                 }
-                // Exactly one flush per batch pushes the coalesced bytes in a single syscall. When the
-                // queue is empty the buffer ends up empty, so the next lone frame still goes out
-                // promptly.
-                PacketFraming.flush(dataOutputStream);
+
+                // Socket write happens OUTSIDE the lock, so a slow consumer never blocks producers.
+                if (oversized != null) {
+                    writeFramed(oversized);
+                } else {
+                    outputStream.write(batch, 0, batchLength);
+                }
+                outputStream.flush();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -222,20 +306,15 @@ public class ClientConnectionHandler implements ClientConnection, Runnable {
         }
     }
 
-    /**
-     * Writes one outbound frame's bytes into the buffered stream WITHOUT flushing.
-     * <p>
-     * A {@link OutboundFrame.PreSerialized} (the publish fan-out path) is written verbatim — its
-     * payload was already serialized once and shared across all subscribers. A
-     * {@link OutboundFrame.Envelope} (the low-rate auth/subscribe-ack path) is serialized lazily here.
-     */
-    private void writeFrameNoFlush(OutboundFrame frame) throws IOException {
-        byte[] payload = switch (frame) {
-            case OutboundFrame.PreSerialized pre -> pre.payload();
-            case OutboundFrame.Envelope env ->
-                    WireCodec.encodeClient(env.envelope(), avenueConfig.getPacketSize());
-        };
-        PacketFraming.writeFrameNoFlush(dataOutputStream, payload);
+    /** Writes one oversized payload (too large for a swap buffer) with its length prefix. */
+    private void writeFramed(byte[] payload) throws IOException {
+        byte[] prefix = new byte[4];
+        prefix[0] = (byte) (payload.length >>> 24);
+        prefix[1] = (byte) (payload.length >>> 16);
+        prefix[2] = (byte) (payload.length >>> 8);
+        prefix[3] = (byte) payload.length;
+        outputStream.write(prefix);
+        outputStream.write(payload);
     }
 
     /**
@@ -250,9 +329,10 @@ public class ClientConnectionHandler implements ClientConnection, Runnable {
      */
     @Override
     public void enqueue(ClientEnvelope envelope) {
-        // Low-rate path (auth response / subscribe-ack): keep the typed envelope and let the writer
-        // serialize it lazily. Per-frame serialization cost is irrelevant at this rate.
-        enqueueFrame(new OutboundFrame.Envelope(envelope));
+        // Low-rate path (auth response / subscribe-ack): serialize here so the bytes can go into the
+        // same buffer as the publish stream, which is what preserves FIFO order between them. Per-frame
+        // serialization cost is irrelevant at this rate.
+        enqueueFrame(WireCodec.encodeClient(envelope, avenueConfig.getPacketSize()));
     }
 
     /**
@@ -265,40 +345,122 @@ public class ClientConnectionHandler implements ClientConnection, Runnable {
      */
     @Override
     public void enqueuePreSerialized(byte[] payload) {
-        enqueueFrame(new OutboundFrame.PreSerialized(payload));
+        enqueueFrame(payload);
     }
 
     /**
-     * Common enqueue with the configured backpressure policy. Never blocks the caller on the socket;
-     * applies the bounded-queue offer timeout and the {@link BackpressurePolicy} on overflow, and
-     * updates the delivery / drop / disconnect metrics exactly as before.
+     * Copies one bare payload, framed, into the outbound buffer and applies the configured
+     * backpressure policy. Never blocks the caller on the socket: the lock is only ever held for a
+     * {@code memcpy} and a few counter updates, never across a socket write.
+     * <p>
+     * Capacity is bounded exactly as the previous bounded queue was — by frame count
+     * ({@code server.outbound.queue.capacity}) — plus the byte capacity of one buffer. A producer
+     * that finds no room waits up to the offer timeout for the writer to drain, then falls to the
+     * {@link BackpressurePolicy}, matching the old {@code offer(frame, timeout)} semantics including
+     * its metric updates.
      */
-    private void enqueueFrame(OutboundFrame frame) {
+    private void enqueueFrame(byte[] payload) {
         if (!this.running) {
             return;
         }
+        int needed = 4 + payload.length;
+        boolean accepted = false;
+        boolean interrupted = false;
+        int depth = 0;
+        outboundLock.lock();
         try {
-            boolean accepted = outboundQueue.offer(frame, offerTimeoutMillis, TimeUnit.MILLISECONDS);
-            if (accepted) {
-                metrics.incrementMessagesDelivered();
-                metrics.recordOutboundQueueDepth(outboundQueue.size());
+            long remainingNanos = TimeUnit.MILLISECONDS.toNanos(offerTimeoutMillis);
+            while (running && !hasRoomFor(needed)) {
+                if (remainingNanos <= 0) {
+                    break;
+                }
+                remainingNanos = notFull.awaitNanos(remainingNanos);
+            }
+            if (!running) {
                 return;
             }
-            // Queue still full after the offer timeout: apply the configured backpressure policy.
-            if (backpressurePolicy == BackpressurePolicy.DROP_MESSAGE) {
-                metrics.incrementDroppedMessages();
-                log.warn("Outbound queue for {} is full, dropping message (DROP_MESSAGE policy)",
-                        remoteAddress());
-            } else {
-                metrics.incrementSlowConsumerDisconnects();
-                log.warn("Outbound queue for {} is full, disconnecting slow consumer "
-                        + "(DISCONNECT_SLOW_CONSUMER policy)", remoteAddress());
-                shutdown();
+            if (hasRoomFor(needed)) {
+                append(payload, needed);
+                pendingFrames++;
+                depth = pendingFrames;
+                accepted = true;
+                // Signal unconditionally, exactly like the LinkedBlockingQueue this replaced.
+                // An earlier version only signalled when the writer was observably parked
+                // ("it will notice the work by itself otherwise"). That lost wake-ups: the
+                // AtLeastOnceTest cluster path went from ~13 s to 25-36 s and started failing its
+                // deadline. A signal with no waiter is cheap — the lock is already held — and
+                // guessing when the writer needs one is not worth a stalled connection.
+                notEmpty.signal();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            interrupted = true;
+        } finally {
+            outboundLock.unlock();
+        }
+
+        // shutdown() is synchronized AND takes outboundLock, so it must never be called while this
+        // thread still holds outboundLock: another thread already inside shutdown() would be waiting
+        // for that very lock while holding the monitor this thread needs — a lock-order inversion
+        // that deadlocks the connection (symptom: handshakes hang with no auth response).
+        if (interrupted) {
+            shutdown();
+            return;
+        }
+
+        if (accepted) {
+            metrics.incrementMessagesDelivered();
+            metrics.recordOutboundQueueDepth(depth);
+            return;
+        }
+        // Still no room after the offer timeout: apply the configured backpressure policy.
+        if (backpressurePolicy == BackpressurePolicy.DROP_MESSAGE) {
+            metrics.incrementDroppedMessages();
+            log.warn("Outbound queue for {} is full, dropping message (DROP_MESSAGE policy)",
+                    remoteAddress());
+        } else {
+            metrics.incrementSlowConsumerDisconnects();
+            log.warn("Outbound queue for {} is full, disconnecting slow consumer "
+                    + "(DISCONNECT_SLOW_CONSUMER policy)", remoteAddress());
             shutdown();
         }
+    }
+
+    /**
+     * Whether a framed message of {@code needed} bytes can be accepted right now. Caller holds
+     * {@link #outboundLock}.
+     * <p>
+     * Oversized frames (larger than a whole buffer) are always admissible up to the frame bound —
+     * they take the {@link #overflow} path, which is what keeps payloads up to
+     * {@code server.packet.max-size} deliverable no matter how small the buffers are. Ordinary
+     * frames must additionally wait out any oversized backlog, so ordering is never violated.
+     */
+    private boolean hasRoomFor(int needed) {
+        if (pendingFrames >= frameCapacity) {
+            return false;
+        }
+        if (needed > bufferCapacity) {
+            return true;
+        }
+        if (!overflow.isEmpty()) {
+            return false;
+        }
+        return fillLength + needed <= bufferCapacity;
+    }
+
+    /** Appends a framed payload to the fill buffer, or to the overflow queue if it cannot fit. */
+    private void append(byte[] payload, int needed) {
+        if (needed > bufferCapacity) {
+            overflow.addLast(payload);
+            return;
+        }
+        fillBuffer[fillLength] = (byte) (payload.length >>> 24);
+        fillBuffer[fillLength + 1] = (byte) (payload.length >>> 16);
+        fillBuffer[fillLength + 2] = (byte) (payload.length >>> 8);
+        fillBuffer[fillLength + 3] = (byte) payload.length;
+        System.arraycopy(payload, 0, fillBuffer, fillLength + 4, payload.length);
+        fillLength += needed;
+        fillFrames++;
     }
 
     /**
@@ -331,6 +493,15 @@ public class ClientConnectionHandler implements ClientConnection, Runnable {
         }
         this.running = false;
         log.info("Closing connection to {}", remoteAddress());
+        // Release everyone blocked on the outbound conditions so they observe running == false:
+        // the writer waiting for work, and any producer waiting out its offer timeout.
+        outboundLock.lock();
+        try {
+            notEmpty.signalAll();
+            notFull.signalAll();
+        } finally {
+            outboundLock.unlock();
+        }
         // Wake the writer so it can observe running == false and finish promptly.
         if (this.writerThread != null) {
             this.writerThread.interrupt();

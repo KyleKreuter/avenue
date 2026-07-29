@@ -39,11 +39,14 @@ public class AvenueConfig {
     private final boolean serverTcpNoDelay;
 
     /**
-     * Max frames the per-client outbound writer coalesces into a single buffered flush
-     * (write-batching). Defaults to {@value ClusterTuning#DEFAULT_BATCH_MAX_FRAMES}; {@code 1}
-     * reproduces the legacy per-frame flush. Opportunistic: at low load a batch is a single frame,
-     * so there is no added latency. Direct-value (test) constructors use the default; only the
-     * file/{@code .env} constructor reads {@code server.batch.max-frames}.
+     * Max frames the per-client outbound writer coalesced into a single buffered flush.
+     * <p>
+     * <b>No longer read by the client transport.</b> The writer now hands the socket whichever
+     * frames accumulated in the outbound buffer since the previous flush, so batching is implicit
+     * and needs no cap — a batch is exactly "everything queued so far", which is what a frame limit
+     * was approximating. The setting is retained so existing configuration files keep parsing, and
+     * {@link #getServerBatchMaxFrames()} still reports it, but nothing acts on it. The cluster
+     * writer's own {@code cluster.batch.max-frames} is unaffected and still applies.
      */
     private final int serverBatchMaxFrames;
 
@@ -62,6 +65,55 @@ public class AvenueConfig {
 
     /** Default for {@link #inlineDeliveryMaxFanout}. */
     public static final int DEFAULT_INLINE_DELIVERY_MAX_FANOUT = 1024;
+
+    /**
+     * Capacity in bytes of <em>one</em> per-client outbound byte buffer in the blocking transport.
+     * <p>
+     * The transport keeps two of these and swaps them: producers append already-framed bytes into
+     * the fill buffer while the writer flushes the other one. Enqueueing a fan-out frame is
+     * therefore a {@code memcpy} into pre-allocated memory instead of allocating a queue node plus a
+     * frame wrapper per subscriber per message, and a whole batch leaves in a single {@code write}
+     * syscall.
+     * <p>
+     * Both buffers are allocated once per connection, so the per-connection cost is
+     * <b>twice</b> this value: 1000 connections at the 64 KiB default is ~128 MiB of heap. Lower it
+     * for very high connection counts, raise it for large payloads or bursty consumers.
+     * <p>
+     * Frames too large for a buffer are not rejected — they fall back to an overflow queue that
+     * preserves FIFO order (see {@code ClientConnectionHandler}), so a payload up to
+     * {@code server.packet.max-size} is always deliverable regardless of this setting.
+     * Direct-value (test) constructors use the default; only the file/{@code .env} constructor
+     * reads {@code server.outbound.ring-bytes}.
+     */
+    private final int serverOutboundRingBytes;
+
+    /** Default for {@link #serverOutboundRingBytes}: 64 KiB per buffer, i.e. 128 KiB per connection. */
+    public static final int DEFAULT_SERVER_OUTBOUND_RING_BYTES = 64 * 1024;
+
+    /**
+     * Number of {@link Thread#onSpinWait()} iterations the per-client outbound writer spins for,
+     * looking for more work, before it blocks and thereby has to be unparked again.
+     * <p>
+     * <b>Defaults to off, because measurement said so.</b> The idea was that a virtual thread's
+     * park/unpark round trip (continuation unmount plus scheduler hop) is expensive enough — over
+     * half of server CPU at fan-out 16 before the swap buffers — that briefly spinning for the next
+     * frame would be cheaper than suspending. Spinning does cut the <em>share</em> of CPU spent in
+     * that machinery (~36 % to ~24 % at fan-out 16), but it raises <em>absolute</em> CPU: the same
+     * benchmark samples 9,6 on-CPU samples/s without spinning against 11,6 with it, at identical
+     * throughput. The park/unpark cost is not removed, it is merely traded for busy-waiting, and the
+     * trade loses. At fan-out 1 it also costs throughput outright (~284k msg/s without spinning
+     * versus ~259–278k with).
+     * <p>
+     * The knob is kept because the trade-off is load-dependent and may invert on hardware with more
+     * cores or a load generator that is not co-located. Any value must stay small: a spinning
+     * virtual thread pins its carrier, so a large one starves other connections. Direct-value (test)
+     * constructors use the default; only the file/{@code .env} constructor reads
+     * {@code server.outbound.writer-spins}.
+     */
+    private final int serverWriterSpins;
+
+    /** Default for {@link #serverWriterSpins}: spinning off — it measured slower, see the field doc. */
+    public static final int DEFAULT_SERVER_WRITER_SPINS = 0;
 
     /**
      * Transport I/O mode for the client-facing port. {@code "blocking"} (default) keeps the
@@ -364,6 +416,8 @@ public class AvenueConfig {
         // these fields itself from the server.tcp-nodelay / server.batch.max-frames properties.
         this.serverTcpNoDelay = true;
         this.serverBatchMaxFrames = DEFAULT_SERVER_BATCH_MAX_FRAMES;
+        this.serverOutboundRingBytes = DEFAULT_SERVER_OUTBOUND_RING_BYTES;
+        this.serverWriterSpins = DEFAULT_SERVER_WRITER_SPINS;
         this.inlineDeliveryMaxFanout = DEFAULT_INLINE_DELIVERY_MAX_FANOUT;
         // Direct-value (test) callers default to the historic blocking transport; only the file/.env
         // constructor opts into NIO via server.io-mode. This keeps every existing test on the blocking
@@ -413,9 +467,59 @@ public class AvenueConfig {
         this.outboundQueueOfferTimeoutMillis = base.outboundQueueOfferTimeoutMillis;
         this.serverTcpNoDelay = base.serverTcpNoDelay;
         this.serverBatchMaxFrames = base.serverBatchMaxFrames;
+        this.serverOutboundRingBytes = base.serverOutboundRingBytes;
+        this.serverWriterSpins = base.serverWriterSpins;
         this.inlineDeliveryMaxFanout = base.inlineDeliveryMaxFanout;
         this.serverIoMode = normalizeIoMode(ioMode);
         this.serverNioIoThreads = nioThreads > 0 ? nioThreads : DEFAULT_SERVER_NIO_IO_THREADS;
+        this.clusterEnabled = base.clusterEnabled;
+        this.nodeId = base.nodeId;
+        this.clusterPort = base.clusterPort;
+        this.clusterPeers = base.clusterPeers;
+        this.clusterSecret = base.clusterSecret;
+        this.clusterHeartbeatIntervalMs = base.clusterHeartbeatIntervalMs;
+        this.clusterTuning = base.clusterTuning;
+        this.adminConfig = base.adminConfig;
+        this.clientIdleTimeoutMillis = base.clientIdleTimeoutMillis;
+        this.maxConnections = base.maxConnections;
+        this.backpressurePolicy = base.backpressurePolicy;
+        this.metricsLogIntervalSeconds = base.metricsLogIntervalSeconds;
+        this.serverTlsEnabled = base.serverTlsEnabled;
+        this.serverTlsKeystorePath = base.serverTlsKeystorePath;
+        this.serverTlsKeystorePassword = base.serverTlsKeystorePassword;
+        this.clusterTlsEnabled = base.clusterTlsEnabled;
+        this.clusterTlsKeystorePath = base.clusterTlsKeystorePath;
+        this.clusterTlsKeystorePassword = base.clusterTlsKeystorePassword;
+        this.clusterTlsTruststorePath = base.clusterTlsTruststorePath;
+        this.clusterTlsTruststorePassword = base.clusterTlsTruststorePassword;
+    }
+
+    /**
+     * Copy constructor that overrides only the outbound writer tuning, reusing every other setting of
+     * {@code base}. Without this the two knobs would be reachable only through a properties file,
+     * which makes their effect impossible to isolate in a benchmark — and a tuning knob whose effect
+     * cannot be measured is a knob nobody can set responsibly.
+     *
+     * @param base        the configuration to copy
+     * @param ringBytes   capacity of one outbound buffer in bytes ({@code <= 0} keeps the base value)
+     * @param writerSpins writer spin-before-park iterations ({@code < 0} keeps the base value;
+     *                    {@code 0} disables spinning)
+     */
+    public AvenueConfig(AvenueConfig base, int ringBytes, int writerSpins) {
+        this.packetSize = base.packetSize;
+        this.dropUnknownPackets = base.dropUnknownPackets;
+        this.authenticationSecret = base.authenticationSecret;
+        this.authenticationToken = base.authenticationToken;
+        this.port = base.port;
+        this.outboundQueueCapacity = base.outboundQueueCapacity;
+        this.outboundQueueOfferTimeoutMillis = base.outboundQueueOfferTimeoutMillis;
+        this.serverTcpNoDelay = base.serverTcpNoDelay;
+        this.serverBatchMaxFrames = base.serverBatchMaxFrames;
+        this.serverOutboundRingBytes = ringBytes > 0 ? ringBytes : base.serverOutboundRingBytes;
+        this.serverWriterSpins = writerSpins >= 0 ? writerSpins : base.serverWriterSpins;
+        this.inlineDeliveryMaxFanout = base.inlineDeliveryMaxFanout;
+        this.serverIoMode = base.serverIoMode;
+        this.serverNioIoThreads = base.serverNioIoThreads;
         this.clusterEnabled = base.clusterEnabled;
         this.nodeId = base.nodeId;
         this.clusterPort = base.clusterPort;
@@ -490,6 +594,21 @@ public class AvenueConfig {
         );
         serverBatchMaxFrames = parsedServerBatchMaxFrames > 0
                 ? parsedServerBatchMaxFrames : DEFAULT_SERVER_BATCH_MAX_FRAMES;
+        // Per-connection outbound ring capacity in bytes (framed bytes are memcpy'd into it).
+        int parsedOutboundRingBytes = Integer.parseInt(
+                dotenv.get("SERVER_OUTBOUND_RING_BYTES",
+                        properties.getProperty("server.outbound.ring-bytes",
+                                Integer.toString(DEFAULT_SERVER_OUTBOUND_RING_BYTES)))
+        );
+        serverOutboundRingBytes = parsedOutboundRingBytes > 0
+                ? parsedOutboundRingBytes : DEFAULT_SERVER_OUTBOUND_RING_BYTES;
+        // Writer spin-before-park iterations; 0 disables spinning entirely.
+        int parsedWriterSpins = Integer.parseInt(
+                dotenv.get("SERVER_OUTBOUND_WRITER_SPINS",
+                        properties.getProperty("server.outbound.writer-spins",
+                                Integer.toString(DEFAULT_SERVER_WRITER_SPINS)))
+        );
+        serverWriterSpins = Math.max(0, parsedWriterSpins);
         // Inline-delivery fan-out guard: above this subscriber count a publish is delivered via the
         // executor instead of inline on the reader thread.
         int parsedInlineDeliveryMaxFanout = Integer.parseInt(
@@ -798,6 +917,23 @@ public class AvenueConfig {
      */
     public int getServerBatchMaxFrames() {
         return serverBatchMaxFrames;
+    }
+
+    /**
+     * Capacity in bytes of the per-client outbound ring buffer (blocking transport). Allocated once
+     * per connection, so this is a direct per-connection memory cost. Defaults to
+     * {@value #DEFAULT_SERVER_OUTBOUND_RING_BYTES}.
+     */
+    public int getServerOutboundRingBytes() {
+        return serverOutboundRingBytes;
+    }
+
+    /**
+     * {@link Thread#onSpinWait()} iterations the outbound writer spins before parking. Defaults to
+     * {@value #DEFAULT_SERVER_WRITER_SPINS}; {@code 0} disables spinning.
+     */
+    public int getServerWriterSpins() {
+        return serverWriterSpins;
     }
 
     /**
