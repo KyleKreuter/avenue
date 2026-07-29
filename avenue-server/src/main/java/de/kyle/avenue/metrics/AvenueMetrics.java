@@ -8,14 +8,33 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAccumulator;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * Lightweight, dependency-free metrics registry for the Avenue server (E20).
  *
- * <p>All counters and gauges are {@link AtomicLong}s so they can be updated from any of the
- * many virtual threads handling connections, deliveries and cluster I/O without locking.
- * Counters only ever increase; gauges (e.g. {@link #activeConnections}, {@link #subscriptionCount},
- * {@link #maxOutboundQueueDepth}) are set/adjusted in place.
+ * <p>All counters and gauges are lock-free so they can be updated from any of the many virtual
+ * threads handling connections, deliveries and cluster I/O. Counters only ever increase; gauges
+ * (e.g. {@link #activeConnections}, {@link #subscriptionCount}, {@link #maxOutboundQueueDepth})
+ * are set/adjusted in place.
+ *
+ * <h2>Why the hot-path counters are striped</h2>
+ * {@link #incrementMessagesDelivered()} and {@link #recordOutboundQueueDepth(int)} are called
+ * <em>once per subscriber per message</em> — on an N-way fan-out that is 2N updates per publish,
+ * from as many threads as the fan-out touches connections. Backing those two with a single
+ * {@link AtomicLong} put every delivering thread onto one contended cache line: a plain CAS for the
+ * counter, and a full CAS <em>retry loop</em> ({@code accumulateAndGet}) for the running maximum.
+ * Both are now striped — a {@link LongAdder} and a {@link LongAccumulator} — so concurrent updaters
+ * hit different cells and only the (rare) read aggregates them.
+ *
+ * <p>The trade-off is deliberate and harmless here: a striped read is not an atomic snapshot across
+ * cells, so a getter called <em>during</em> concurrent updates may miss an in-flight increment. All
+ * readers are the periodic reporter, the admin endpoint and tests that read after the traffic has
+ * settled, none of which need linearizability. The remaining {@link AtomicLong}s are the
+ * per-connection gauges: they change once per connect/disconnect (not per message), so they are
+ * uncontended, and {@link #incrementActiveConnections()} needs its exact return value to enforce
+ * the max-connections limit — something a {@link LongAdder} cannot provide.
  *
  * <p>A single daemon scheduler periodically logs a snapshot so operators get visibility without
  * any external monitoring stack. Every value also has a public getter so tests can assert on
@@ -25,18 +44,26 @@ public final class AvenueMetrics {
 
     private static final Logger log = LoggerFactory.getLogger(AvenueMetrics.class);
 
-    // Counters (monotonic).
-    private final AtomicLong messagesPublished = new AtomicLong();
-    private final AtomicLong messagesDelivered = new AtomicLong();
-    private final AtomicLong droppedMessages = new AtomicLong();
-    private final AtomicLong slowConsumerDisconnects = new AtomicLong();
-    private final AtomicLong totalConnectionsAccepted = new AtomicLong();
-    private final AtomicLong connectionsRejected = new AtomicLong();
+    // Counters (monotonic). Striped: updated from many threads, read rarely.
+    private final LongAdder messagesPublished = new LongAdder();
+    private final LongAdder messagesDelivered = new LongAdder();
+    private final LongAdder droppedMessages = new LongAdder();
+    private final LongAdder slowConsumerDisconnects = new LongAdder();
+    private final LongAdder totalConnectionsAccepted = new LongAdder();
+    private final LongAdder connectionsRejected = new LongAdder();
 
-    // Gauges (current value).
+    // Gauges (current value). AtomicLong on purpose: per-connection rate, and the active-connection
+    // gauge must return its exact post-increment value for the max-connections check.
     private final AtomicLong activeConnections = new AtomicLong();
     private final AtomicLong subscriptionCount = new AtomicLong();
-    private final AtomicLong maxOutboundQueueDepth = new AtomicLong();
+
+    /**
+     * Running maximum observed outbound queue depth. Striped like the counters because it is
+     * recorded on the per-subscriber delivery path; {@link LongAccumulator} gives the same
+     * "keep the maximum" semantics as the previous {@code accumulateAndGet(depth, Math::max)}
+     * without funnelling every delivering thread through one CAS retry loop.
+     */
+    private final LongAccumulator maxOutboundQueueDepth = new LongAccumulator(Math::max, 0L);
 
     private volatile ScheduledExecutorService reporter;
 
@@ -49,32 +76,32 @@ public final class AvenueMetrics {
 
     /** Records that a local client publish was accepted and fanned out. */
     public void incrementMessagesPublished() {
-        messagesPublished.incrementAndGet();
+        messagesPublished.increment();
     }
 
     /** Records that a single outbound packet was enqueued for delivery to a subscriber. */
     public void incrementMessagesDelivered() {
-        messagesDelivered.incrementAndGet();
+        messagesDelivered.increment();
     }
 
     /** Records that a message was dropped due to a full outbound queue (DROP_MESSAGE policy). */
     public void incrementDroppedMessages() {
-        droppedMessages.incrementAndGet();
+        droppedMessages.increment();
     }
 
     /** Records that a slow consumer was disconnected (DISCONNECT_SLOW_CONSUMER policy). */
     public void incrementSlowConsumerDisconnects() {
-        slowConsumerDisconnects.incrementAndGet();
+        slowConsumerDisconnects.increment();
     }
 
-    /** Records and returns the new count of accepted connections. */
-    public long incrementTotalConnectionsAccepted() {
-        return totalConnectionsAccepted.incrementAndGet();
+    /** Records an accepted connection. */
+    public void incrementTotalConnectionsAccepted() {
+        totalConnectionsAccepted.increment();
     }
 
     /** Records that an inbound connection was rejected (e.g. max-connections limit reached). */
     public void incrementConnectionsRejected() {
-        connectionsRejected.incrementAndGet();
+        connectionsRejected.increment();
     }
 
     // ------------------------------------------------------------------
@@ -101,7 +128,7 @@ public final class AvenueMetrics {
      * Gives operators a cheap aggregate view of buffering pressure without per-connection state.
      */
     public void recordOutboundQueueDepth(int depth) {
-        maxOutboundQueueDepth.accumulateAndGet(depth, Math::max);
+        maxOutboundQueueDepth.accumulate(depth);
     }
 
     // ------------------------------------------------------------------
@@ -109,27 +136,27 @@ public final class AvenueMetrics {
     // ------------------------------------------------------------------
 
     public long getMessagesPublished() {
-        return messagesPublished.get();
+        return messagesPublished.sum();
     }
 
     public long getMessagesDelivered() {
-        return messagesDelivered.get();
+        return messagesDelivered.sum();
     }
 
     public long getDroppedMessages() {
-        return droppedMessages.get();
+        return droppedMessages.sum();
     }
 
     public long getSlowConsumerDisconnects() {
-        return slowConsumerDisconnects.get();
+        return slowConsumerDisconnects.sum();
     }
 
     public long getTotalConnectionsAccepted() {
-        return totalConnectionsAccepted.get();
+        return totalConnectionsAccepted.sum();
     }
 
     public long getConnectionsRejected() {
-        return connectionsRejected.get();
+        return connectionsRejected.sum();
     }
 
     public long getActiveConnections() {

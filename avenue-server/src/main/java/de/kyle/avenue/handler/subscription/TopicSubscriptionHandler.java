@@ -7,21 +7,37 @@ import de.kyle.avenue.proto.ClientEnvelope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Tracks which clients are subscribed to which topics and fans packets out to them.
  * <p>
- * Concurrency model: the outer map is a {@link ConcurrentHashMap}; each topic's subscriber
- * set is a {@link ConcurrentHashMap#newKeySet() concurrent set}. Delivery iterates the set
- * while other threads may concurrently subscribe/unsubscribe without throwing
- * {@code ConcurrentModificationException} and without lost updates. Topic keys are
- * normalized in exactly one place ({@link #normalize(String)}) so subscribe, deliver and
- * unsubscribe always agree on the key.
+ * Concurrency model: the outer map is a {@link ConcurrentHashMap}; each topic's subscribers are
+ * held in a {@link Subscribers} holder as a <b>copy-on-write array</b>. Delivery reads the array
+ * reference once and iterates that immutable snapshot, so other threads may concurrently
+ * subscribe/unsubscribe without throwing {@code ConcurrentModificationException} and without lost
+ * updates. Topic keys are normalized in exactly one place ({@link #normalize(String)}) so
+ * subscribe, deliver and unsubscribe always agree on the key.
+ *
+ * <h2>Why copy-on-write instead of a concurrent set</h2>
+ * The subscriber collection is read once per subscriber per message and written only on
+ * subscribe/unsubscribe — an extremely read-skewed access pattern. The previous
+ * {@link ConcurrentHashMap#newKeySet() concurrent key-set} paid for that read with a fresh
+ * {@code KeyIterator} plus a {@code Traverser} walk over hash bins, chasing a pointer per
+ * subscriber across scattered {@code Node} objects. JFR on the fan-out path showed
+ * {@code fanOut} + {@code ConcurrentHashMap$Traverser.advance} at ~11 % of server CPU
+ * <em>even at fan-out 1</em>, with {@code ConcurrentHashMap$KeyIterator} in the allocation profile.
+ * <p>
+ * A copy-on-write {@code ClientConnection[]} makes delivery a bounds-checked walk over one
+ * contiguous, prefetch-friendly array: no iterator object, no bin traversal, one dependent load per
+ * subscriber. The cost moves to the mutation side (an array copy per subscribe/unsubscribe), which
+ * is exactly where it is affordable.
  */
 public class TopicSubscriptionHandler {
     private static final Logger log = LoggerFactory.getLogger(TopicSubscriptionHandler.class);
@@ -61,7 +77,31 @@ public class TopicSubscriptionHandler {
         this.interestListener = listener != null ? listener : InterestListener.NOOP;
     }
 
-    private final Map<String, Set<ClientConnection>> topicSubscriptions = new ConcurrentHashMap<>();
+    /** Shared empty snapshot, so a topic without subscribers never allocates. */
+    private static final ClientConnection[] EMPTY = new ClientConnection[0];
+
+    /**
+     * Per-topic subscriber holder: a copy-on-write array plus the retirement flag that keeps the
+     * holder and the map entry in lock-step.
+     * <p>
+     * Mutations synchronize on the holder itself. {@link #array} is {@code volatile} so a reader
+     * that grabs the reference always sees a fully-published, immutable snapshot — readers never
+     * lock.
+     */
+    private static final class Subscribers {
+        /** Immutable snapshot; replaced wholesale under {@code this} on every mutation. */
+        private volatile ClientConnection[] array = EMPTY;
+
+        /**
+         * Set (under {@code this}) when the holder ran empty and was removed from the map. A
+         * subscriber that raced in and still holds a reference to this dead holder must discard it
+         * and retry, otherwise its subscription would be written into an unreachable holder and
+         * silently lost.
+         */
+        private boolean retired;
+    }
+
+    private final Map<String, Subscribers> topicSubscriptions = new ConcurrentHashMap<>();
 
     /** Running total of active (client, topic) subscriptions, mirrored into the metrics gauge. */
     private final AtomicLong subscriptionTotal = new AtomicLong();
@@ -124,13 +164,12 @@ public class TopicSubscriptionHandler {
      * or re-looking-up inside delivery. {@code 0} when the topic has no subscribers.
      */
     public int subscriberCount(String normalizedTopic) {
-        Set<ClientConnection> subscribers = topicSubscriptions.get(normalizedTopic);
-        return subscribers == null ? 0 : subscribers.size();
+        return subscribersOf(normalizedTopic).length;
     }
 
     public void deliverToSubscribers(String normalizedTopic, ClientEnvelope envelope, int maxSize) {
-        Set<ClientConnection> subscribers = topicSubscriptions.get(normalizedTopic);
-        if (subscribers == null || subscribers.isEmpty()) {
+        ClientConnection[] subscribers = subscribersOf(normalizedTopic);
+        if (subscribers.length == 0) {
             log.warn("Packet was not delivered to other clients because no subscriptions are registered");
             return;
         }
@@ -156,8 +195,8 @@ public class TopicSubscriptionHandler {
      *                        prefix); must never be mutated after this call as it is shared
      */
     public void deliverPreSerializedToSubscribers(String normalizedTopic, byte[] payload) {
-        Set<ClientConnection> subscribers = topicSubscriptions.get(normalizedTopic);
-        if (subscribers == null || subscribers.isEmpty()) {
+        ClientConnection[] subscribers = subscribersOf(normalizedTopic);
+        if (subscribers.length == 0) {
             log.warn("Packet was not delivered to other clients because no subscriptions are registered");
             return;
         }
@@ -165,68 +204,147 @@ public class TopicSubscriptionHandler {
     }
 
     /**
-     * Shared fan-out tail: hand the same immutable bytes to every subscriber. The concurrent set
-     * tolerates concurrent subscribe/unsubscribe during iteration; delivery is non-blocking as each
-     * handler only enqueues onto its own outbound queue.
+     * Current subscriber snapshot for an already-{@link #normalize(String) normalized} topic key.
+     * The returned array is immutable and must never be written to; it is the live snapshot shared
+     * with every concurrent reader.
      */
-    private static void fanOut(Set<ClientConnection> subscribers, byte[] payload) {
+    private ClientConnection[] subscribersOf(String normalizedTopic) {
+        Subscribers holder = topicSubscriptions.get(normalizedTopic);
+        return holder == null ? EMPTY : holder.array;
+    }
+
+    /**
+     * Shared fan-out tail: hand the same immutable bytes to every subscriber. Iterating a
+     * copy-on-write snapshot tolerates concurrent subscribe/unsubscribe (a subscriber removed mid
+     * fan-out may still receive this message, exactly as with the previous concurrent set — its
+     * transport drops the frame once closed). Delivery is non-blocking as each handler only enqueues
+     * onto its own outbound queue.
+     */
+    private static void fanOut(ClientConnection[] subscribers, byte[] payload) {
         for (ClientConnection clientConnection : subscribers) {
             clientConnection.enqueuePreSerialized(payload);
         }
     }
 
+    /**
+     * Test seam, invoked in {@link #subscribeToTopic} between looking a holder up and locking it —
+     * precisely the window in which a concurrent unsubscribe can retire that holder out from under
+     * the subscriber. Empty in production (a single no-op call on the cold subscribe path, never on
+     * delivery); {@code TopicSubscriptionHandlerTest} overrides it to hold a thread inside that
+     * window so the retire/subscribe race is exercised deterministically rather than being left to
+     * a nanosecond-wide timing coincidence that a stress loop does not reliably hit.
+     */
+    void awaitHolderRaceWindow() {
+    }
+
+    /**
+     * Identity search over a subscriber snapshot. Subscriber membership is deliberately keyed on the
+     * live connection instance ({@link ClientConnection} overrides neither {@code equals} nor
+     * {@code hashCode}), so this mirrors the identity semantics of the previous set exactly.
+     */
+    private static int indexOf(ClientConnection[] subscribers, ClientConnection target) {
+        for (int i = 0; i < subscribers.length; i++) {
+            if (subscribers[i] == target) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     public void subscribeToTopic(String topic, ClientConnection clientConnection) {
         String normalizedTopic = normalize(topic);
-        // Detect the "first subscription for this topic" transition ATOMICALLY: the flag is set only
-        // when the computeIfAbsent mapping function actually runs, i.e. the subscriber set did not
-        // exist yet. This cannot false-positive on a concurrent subscribe to the same topic, since
-        // computeIfAbsent runs the function at most once per absent key.
-        boolean[] firstForTopic = {false};
-        boolean added = topicSubscriptions
-                .computeIfAbsent(normalizedTopic, key -> {
-                    firstForTopic[0] = true;
-                    return ConcurrentHashMap.newKeySet();
-                })
-                .add(clientConnection);
+        boolean added;
+        boolean firstForTopic;
+        while (true) {
+            Subscribers holder = topicSubscriptions.computeIfAbsent(normalizedTopic, key -> new Subscribers());
+            awaitHolderRaceWindow();
+            synchronized (holder) {
+                if (holder.retired) {
+                    // A concurrent unsubscribe emptied this holder and unmapped it. Because the
+                    // retirement and the unmapping happen under this same monitor, the next
+                    // computeIfAbsent is guaranteed to install a fresh holder — this retries once.
+                    continue;
+                }
+                ClientConnection[] current = holder.array;
+                if (indexOf(current, clientConnection) >= 0) {
+                    // Already subscribed: idempotent, exactly like the previous Set.add() == false.
+                    added = false;
+                    firstForTopic = false;
+                } else {
+                    ClientConnection[] next = Arrays.copyOf(current, current.length + 1);
+                    next[current.length] = clientConnection;
+                    holder.array = next;
+                    added = true;
+                    // An empty holder can only be a freshly created one (an emptied holder is
+                    // retired and unmapped in the same critical section), so this is exactly the
+                    // "topic gained its first subscriber" transition.
+                    firstForTopic = current.length == 0;
+                }
+                break;
+            }
+        }
         if (added) {
             metrics.setSubscriptionCount(subscriptionTotal.incrementAndGet());
         }
-        // Fire the interest-added event AFTER the map mutation (outside the computeIfAbsent lambda),
-        // so the listener never runs while holding the map's internal bin lock.
-        if (firstForTopic[0]) {
+        // Fire the interest-added event AFTER the mutation and outside the holder monitor, so the
+        // listener never runs while holding a lock the delivery path could contend on.
+        if (firstForTopic) {
             interestListener.onInterestAdded(normalizedTopic);
         }
     }
 
     public void unsubscribeFromAllTopics(ClientConnection clientConnection) {
-        // Remove the client from every topic and drop now-empty topic sets to avoid leaking
+        // Remove the client from every topic and drop now-empty topic holders to avoid leaking
         // memory for topics that no longer have any subscribers.
         long removed = 0;
         // Collect the topics whose LAST subscriber we just removed, then fire interest-removed for
-        // each AFTER the loop (outside any computeIfPresent lambda). Deferring the events keeps the
-        // listener off the map's internal bin lock and avoids re-entrancy surprises.
-        java.util.List<String> nowEmptyTopics = new java.util.ArrayList<>();
-        for (Map.Entry<String, Set<ClientConnection>> entry : topicSubscriptions.entrySet()) {
-            String topic = entry.getKey();
-            if (entry.getValue().remove(clientConnection)) {
-                removed++;
-                // computeIfPresent re-checks emptiness atomically against concurrent inserts and
-                // returns null exactly when the topic set became empty and was therefore removed.
-                // A null return == "this client removed the last subscription for this topic", which
-                // is precisely the interest-removed transition; a non-null return means another
-                // subscriber raced in, so interest is retained and no event must fire.
-                Set<ClientConnection> remaining =
-                        topicSubscriptions.computeIfPresent(topic, (key, current) -> current.isEmpty() ? null : current);
-                if (remaining == null) {
-                    nowEmptyTopics.add(topic);
+        // each AFTER the loop. Deferring the events keeps the listener off the holder monitors and
+        // avoids re-entrancy surprises.
+        List<String> nowEmptyTopics = null;
+        for (Map.Entry<String, Subscribers> entry : topicSubscriptions.entrySet()) {
+            Subscribers holder = entry.getValue();
+            boolean didRemove;
+            boolean becameEmpty = false;
+            synchronized (holder) {
+                ClientConnection[] current = holder.array;
+                int index = indexOf(current, clientConnection);
+                didRemove = index >= 0;
+                if (didRemove) {
+                    if (current.length == 1) {
+                        // Last subscriber gone: retire the holder AND unmap it in the same critical
+                        // section. Doing both under the monitor is what makes the subscribe-side
+                        // retry terminate — a racing subscriber can only observe `retired` after the
+                        // entry is already gone from the map, so its next computeIfAbsent creates a
+                        // fresh holder rather than spinning on this one.
+                        holder.array = EMPTY;
+                        holder.retired = true;
+                        topicSubscriptions.remove(entry.getKey(), holder);
+                        becameEmpty = true;
+                    } else {
+                        ClientConnection[] next = new ClientConnection[current.length - 1];
+                        System.arraycopy(current, 0, next, 0, index);
+                        System.arraycopy(current, index + 1, next, index, current.length - 1 - index);
+                        holder.array = next;
+                    }
                 }
+            }
+            if (didRemove) {
+                removed++;
+            }
+            if (becameEmpty) {
+                if (nowEmptyTopics == null) {
+                    nowEmptyTopics = new ArrayList<>();
+                }
+                nowEmptyTopics.add(entry.getKey());
             }
         }
         if (removed > 0) {
             metrics.setSubscriptionCount(subscriptionTotal.addAndGet(-removed));
         }
-        for (String topic : nowEmptyTopics) {
-            interestListener.onInterestRemoved(topic);
+        if (nowEmptyTopics != null) {
+            for (String topic : nowEmptyTopics) {
+                interestListener.onInterestRemoved(topic);
+            }
         }
     }
 }

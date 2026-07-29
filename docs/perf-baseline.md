@@ -149,7 +149,113 @@ Arbeitspunkt (`rate=120000`), und die abgeleiteten ns/Nachricht (= 1e9 / Saettig
 | 4a — Outbound-Encode ohne Builder (JFR: Alloc-Win) | ~290 000 (Paare, flach) | n/a | ~0.13 |
 | 2 — Protokoll-Pipelining / Batched Publish | | | |
 | 3 — Event-Loop-IO (nio) | ~268 000 – 296 000 (Paare P=8, io-threads=4) | n/a | s. u. |
+| 4b — Flat Fan-out: CoW-Array + gestripte Metriken (JFR: CPU-Win) | Durchsatz im Streuband, s. u. | n/a | n/a |
 | 4 — Allokations-/GC-Disziplin | | | |
+
+## Stufe 4b — Flat Layout im Fan-out (Copy-on-Write-Array, gestripte Metriken)
+
+> Hinweis: Dieser Abschnitt ist bewusst mit korrekten Umlauten geschrieben; die älteren Abschnitte
+> dieser Datei nutzen noch ASCII-Ersatzschreibweisen und bleiben unangetastet.
+
+Erster Schritt weg von objektbasierten Containern hin zu flachen Speicher-Layouts auf dem
+Zustellpfad. Zwei Änderungen, beide auf der Linie „pro Subscriber pro Nachricht":
+
+1. **Subscriber-Menge: `ConcurrentHashMap.newKeySet()` → Copy-on-Write-`ClientConnection[]`.**
+   Die Zustellung liest die Subscriber-Menge einmal pro Subscriber pro Nachricht und schreibt sie
+   nur bei Subscribe/Unsubscribe — ein extrem leselastiges Zugriffsmuster. Das Concurrent-Key-Set
+   bezahlte jeden dieser Lesevorgänge mit einem frischen `KeyIterator` und einem `Traverser`-Lauf
+   über Hash-Bins, also einem Pointer-Chase pro Subscriber über verstreute `Node`-Objekte. Der
+   Ersatz ist ein unveränderliches Array pro Topic: die Zustellung ist ein linearer Lauf über
+   zusammenhängenden Speicher, ohne Iterator-Objekt und ohne Bin-Traversierung. Die Kosten wandern
+   auf die Mutationsseite (eine Array-Kopie pro Subscribe/Unsubscribe), wo sie irrelevant sind.
+2. **Metrik-Zähler: `AtomicLong` → `LongAdder` / `LongAccumulator`.** `incrementMessagesDelivered`
+   und `recordOutboundQueueDepth` laufen ebenfalls pro Subscriber pro Nachricht, letzteres bisher
+   als CAS-Retry-Schleife (`accumulateAndGet(depth, Math::max)`) auf einer einzigen geteilten
+   Cache-Line. Beide sind jetzt gestript.
+
+### Korrektheit
+
+Der CoW-Umbau bringt handgeschriebene Synchronisation mit: ein leer gelaufener Holder wird
+**retired und unter demselben Monitor aus der Map entfernt**, damit ein gleichzeitig eintreffender
+Subscriber die tote Instanz erkennt und gegen einen frischen Holder erneut versucht. Ohne diesen
+Retry landet die Subscription in einem nicht mehr erreichbaren Holder — der Client bliebe
+angemeldet, bekäme aber nie wieder eine Nachricht.
+
+Neu: `TopicSubscriptionHandlerTest` (7 Tests, vorher gab es für diese Klasse **keinen** Unit-Test).
+Der entscheidende Test `subscriber_racing_a_holder_retirement_is_not_lost` stellt das Rennen
+**deterministisch** her, statt auf Timing zu hoffen: über den package-privaten Test-Hook
+`awaitHolderRaceWindow()` wird ein Subscriber exakt zwischen Holder-Lookup und Holder-Lock geparkt,
+während ein zweiter Thread das Topic auf null Subscriber herunterfährt.
+
+> **Warum der Hook nötig war (festgehalten, weil lehrreich):** Die erste Fassung des Tests war eine
+> Stress-Schleife (8 Threads × 500 Runden Subscribe/Unsubscribe). Gegenprobe per Mutation — Retry
+> im Produktivcode abgeschaltet — ergab: die Schleife blieb **grün**. Das Zeitfenster zwischen
+> `computeIfAbsent` und `synchronized` ist wenige Nanosekunden breit und wird von einer Stress-
+> Schleife nicht zuverlässig getroffen. Mit dem Hook schlägt derselbe Mutationstest sofort und
+> reproduzierbar fehl (`subscriberCount` 0 statt 1). Die Stress-Schleife bleibt als Konsistenz-
+> Smoke-Test erhalten, taugt aber nicht als Nachweis.
+
+Alle Tests grün (101–103 je nach Lauf; siehe Flaky-Hinweis unten).
+
+### JFR-Gegenprobe (out-of-process, Server isoliert, `settings=profile`, 30 s Messfenster)
+
+Maschine: Apple Silicon (arm64), Corretto 21.0.5, Loopback, Server und Last in getrennten JVMs.
+Reproduktion über die neue `JFR_OUT`-Option von `scripts/bench-split.sh`:
+
+```bash
+JFR_OUT=/tmp/before.jfr ./scripts/bench-split.sh 4180 \
+    publishers=8 subscribers=1 topics=8 msgSize=100 warmupSeconds=5 seconds=30
+jfr view hot-methods /tmp/before.jfr
+```
+
+Gezählt wurden **`ExecutionSample`-Stacks, die durch `TopicSubscriptionHandler.fanOut` laufen**
+(inklusive Zählung über den ganzen Stack, nicht nur den Top-Frame), sowie Stacks in der
+`ConcurrentHashMap`-Set-Iteration:
+
+| Lauf | Samples gesamt | fan-out-Stacks | CHM-Iterations-Stacks | fan-out-Anteil |
+| --- | --- | --- | --- | --- |
+| Paare P=8 (Fan-out 1), **vorher** | 178 | 28 | 6 | **15,7 %** |
+| Paare P=8 (Fan-out 1), **nachher** | 142 | 4 | **0** | **2,8 %** |
+| 1:16 (Fan-out 16), **vorher** | 392 | 26 | 17 | **6,6 %** |
+| 1:16 (Fan-out 16), **nachher** | 469 | 7 | **0** | **1,4 %** |
+
+Allokationsseite, `jfr view allocation-by-class`: `ConcurrentHashMap$KeyIterator` lag vorher bei
+**2,46 %** (Fan-out 16) bzw. **4,30 %** (Paare P=8) der Allokation und ist nachher **vollständig aus
+dem Profil verschwunden**. Die Young-GC-Anzahl bleibt praktisch gleich (12 → 13 in 30 s), was zu
+erwarten war: `byte[]` dominiert das Allokationsprofil weiterhin mit 24–54 %, der Iterator war nur
+ein kleiner Posten.
+
+### Ehrliche Einordnung
+
+- **Der CoW-Umbau ist belegt:** die Set-Iteration verschwindet restlos aus CPU- **und**
+  Allokationsprofil, der Fan-out-Pfad kostet nur noch etwa ein Fünftel seiner vorherigen CPU-Anteile.
+- **Die Metrik-Umstellung ist NICHT als Gewinn belegt.** Die Metrik-Atomics tauchen in keinem der
+  vier Profile im On-CPU-Sampling auf — weder vorher noch nachher. Die erwartete CAS-Contention war
+  bei dieser Last (8 Publisher, 16 Verbindungen, eine Maschine) offenbar zu gering, und CAS-Stalls
+  bilden sich im Sampling ohnehin schlecht als eigener Frame ab. Die Änderung bleibt strukturell
+  richtig (die geteilte Cache-Line ist vom Pro-Zustellung-Pfad verschwunden), aber sie ist hier eine
+  **begründete Vorsichtsmaßnahme, keine gemessene Verbesserung**. Ihr Nutzen müsste sich erst bei
+  deutlich höherer Kernzahl bzw. auf einer zweiten Lastmaschine zeigen.
+- **Der Durchsatz bleibt im Rauschen.** 1:16 liegt vorher wie nachher bei ~717–735 k Zustellungen/s;
+  bei Paaren P=8 streuen dieselben Konfigurationen über mehrere Läufe zwischen ~118 k und ~203 k
+  Publishes/s — die Nachher-Werte liegen in diesem Band, taugen also nicht als Beleg. Das ist
+  konsistent mit der Kernaussage der Baseline: auf **einer** Maschine ist der Wanduhr-Durchsatz
+  nicht die belastbare Metrik, sondern Server-CPU/Allokation pro Nachricht.
+- **Nicht adressiert (bewusst):** Der bei Fan-out 16 dominierende Block ist nach wie vor die
+  Virtual-Thread-Hop-Mechanik des Blocking-Transports (`getAndBitwiseAndInt`, `unparkVirtualThread`,
+  `LockSupport.unpark`, ForkJoin-Mechanik) — im Baseline-Profil zusammen über 50 % der Samples. Den
+  entfernt nur der NIO-Modus (Stufe 3), nicht ein Speicher-Layout. Ebenso unangetastet bleiben die
+  pro Nachricht allokierten Posten `LinkedBlockingQueue$Node` (~15,7 %) und
+  `OutboundFrame$PreSerialized` (~10 %) — das ist der nächste Schritt (Outbound-Ringpuffer).
+
+> **Flaky-Hinweis (nicht durch diese Änderung verursacht).** Die zeitlimitierten
+> Cluster-Integrationstests fallen auf dieser Maschine sporadisch: über 5 Baseline-Volläufe fiel
+> zweimal `SwimMembershipTest` (`crash_detection`, `restart_same_nodeid`), über 4 Volläufe mit der
+> Änderung zweimal `AtLeastOnceTest.slow_peer_no_loss`. Letzterer wartet **deterministisch** auf
+> Interest-Konvergenz (`awaitInterest`), bevor er publiziert — ein Fehler in den hier geänderten
+> Interest-Transitionen wäre also dort gescheitert, nicht erst beim Empfangszähler. Was fehlschlägt,
+> ist die 5-Sekunden-Deadline der Empfangsschleife bei künstlich winzigem Replay-Ring (16 Einträge,
+> BLOCK-Policy): ein Durchsatz-gegen-Uhr-Test. Isoliert lief er mit der Änderung 3×3 Durchläufe grün.
 
 ## Stufe 3 — Event-Loop-IO (hand-rolled NIO-Selector, `server.io-mode=nio`)
 

@@ -28,6 +28,13 @@
 #
 # Requires JAVA_HOME to point at a JDK 21 (Corretto on the reference machine):
 #   export JAVA_HOME=/path/to/corretto-21.0.5/Contents/Home
+#
+# Optional JFR profiling of the SERVER process (the side we actually want to profile — the load
+# generator's own allocations must never pollute the recording). Point JFR_OUT at a target file:
+#   JFR_OUT=/tmp/before.jfr ./scripts/bench-split.sh 4180 publishers=8 topics=8 subscribers=1
+# Analyse it afterwards with e.g.
+#   jfr view allocation-by-class /tmp/before.jfr
+#   jfr view hot-methods /tmp/before.jfr
 
 set -euo pipefail
 
@@ -64,8 +71,18 @@ FULL_CP="${TEST_CLASSES_DIR}:${CLASSES_DIR}:${DEP_CP}"
 SERVER_LOG="$(mktemp)"
 trap 'rm -f "${CP_FILE}" "${SERVER_LOG}"' EXIT
 
+# Optional JFR recording, server process only. dumponexit writes the file when the EXIT trap
+# SIGTERMs the server, so no fixed duration has to be guessed.
+SERVER_JVM_OPTS=()
+if [[ -n "${JFR_OUT:-}" ]]; then
+    SERVER_JVM_OPTS+=("-XX:StartFlightRecording=settings=profile,filename=${JFR_OUT},dumponexit=true")
+    echo "==> JFR enabled for BenchServer -> ${JFR_OUT}"
+fi
+
 echo "==> Starting BenchServer (separate JVM) on port ${PORT}"
-"${JAVA_BIN}" -cp "${FULL_CP}" de.kyle.avenue.benchmark.BenchServer "port=${PORT}" \
+# ${ARR[@]+"${ARR[@]}"} so an empty array does not trip `set -u` on bash 3.2 (macOS system bash).
+"${JAVA_BIN}" ${SERVER_JVM_OPTS[@]+"${SERVER_JVM_OPTS[@]}"} \
+    -cp "${FULL_CP}" de.kyle.avenue.benchmark.BenchServer "port=${PORT}" \
     >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
